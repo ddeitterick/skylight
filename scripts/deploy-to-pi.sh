@@ -16,7 +16,7 @@ PI_USER="${PI_USER:-pi}"
 PI_APPDIR="${PI_APPDIR:-/home/$PI_USER/skylight}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
 SERVICE="${SERVICE:-skylight-server}"
-SSH="ssh -i $SSH_KEY -o IdentitiesOnly=yes"
+SSH="ssh -i $SSH_KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 
