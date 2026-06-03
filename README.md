@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <a href="https://skylightceiling.com"><b>🛰️ Get notified when we launch on a crowdfunding platform → skylightceiling.com</b></a>
+  <a href="https://skylightceiling.com"><b>🛰️ Get notified when I launch on a crowdfunding platform → skylightceiling.com</b></a>
   <br><sub>A ready-made kit is coming. Join the waitlist for early access &amp; launch pricing.</sub>
 </p>
 
