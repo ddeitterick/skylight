@@ -13,6 +13,7 @@ import { RouteEnricher } from "./enrich/routes.js";
 import { Poller } from "./datasource.js";
 import { Hub } from "./hub.js";
 import { TleStore } from "./tle.js";
+import { buildHostMatcher, originHostname } from "./allowed-hosts.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = resolve(__dirname, "../data");
@@ -45,6 +46,29 @@ async function main(): Promise<void> {
   await tleStore.load();
 
   const app = express();
+
+  // DNS-rebinding gate. Untrusted browsers can resolve attacker.com to the
+  // user's loopback / LAN IP and reach this server with the attacker's Host
+  // header still attached; the CORS check is bypassed because the browser
+  // treats the response as same-origin with attacker.com. We reject any
+  // request whose Host header is not in the operator's allowlist before any
+  // body parsing or routing runs.
+  const hostMatcher = buildHostMatcher(process.env);
+  app.use((req, res, next) => {
+    const host = req.headers.host;
+    if (!hostMatcher.test(host)) {
+      res
+        .status(403)
+        .type("text/plain")
+        .send(
+          "Forbidden: Host header not in allowlist. " +
+            "Set ALLOWED_HOSTS to include your hostname.\n",
+        );
+      return;
+    }
+    next();
+  });
+
   app.use(express.json());
 
   const server = createServer(app);
@@ -52,6 +76,13 @@ async function main(): Promise<void> {
     store,
     getSnapshot: () => poller.getSnapshot(),
     getStatus: () => poller.getStatus(),
+    isOriginAllowed: (origin) => {
+      // No Origin header: not a browser (curl/scripts). Allow — the WS
+      // hijack risk is browser-only.
+      if (!origin) return true;
+      const host = originHostname(origin);
+      return host !== null && hostMatcher.test(host);
+    },
   });
 
   const poller = new Poller({
@@ -103,6 +134,7 @@ async function main(): Promise<void> {
     console.log(`[server] listening on http://${HOST}:${PORT}`);
     console.log(`[server] data source: ${SOURCE} (${SOURCE === "radio" ? RADIO_URL : API_URL})`);
     console.log(`[server] control panel: http://<this-host>:${PORT}/control`);
+    console.log(`[server] host allowlist: ${hostMatcher.describe()}`);
   });
 }
 

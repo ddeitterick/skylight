@@ -145,6 +145,25 @@ sun, moon, and satellites are computed for your coordinates automatically.
 | `AIRCRAFT_JSON_URL` | `http://localhost:8080/aircraft.json` | dump1090 feed |
 | `SUPPLEMENT_API` | `1` | When on radio, merge the API too (keeps landing aircraft alive) |
 | `PORT` / `HOST` | `3000` / `0.0.0.0` | HTTP + WebSocket |
+| `ALLOWED_HOSTS` | *(empty)* | Extra Host/Origin allowlist entries, comma-separated. Wildcards: `*.example.com`. Loopback, RFC1918 LAN, IPv6 ULA / link-local, and `*.local` are allowed by default. |
+| `ALLOW_PRIVATE_LAN` | `1` | Set `0` to lock the server to loopback + mDNS only (no LAN phone control) |
+
+### Exposing Skylight on a custom hostname
+
+Skylight binds `0.0.0.0` so the phone control panel works on your home Wi-Fi.
+To stop browsers on other origins from talking to the server (e.g. a tab on
+`evil.com` opening a WebSocket to your Pi over DNS rebinding), every request
+is rejected unless its `Host` header (and a WebSocket's `Origin` header)
+matches the allowlist.
+
+The defaults cover the documented topology — `localhost`, `127.0.0.1`,
+`[::1]`, `*.local`, and private LAN ranges (`10/8`, `192.168/16`,
+`172.16/12`, IPv6 ULA + link-local). If you publish Skylight on a public
+hostname or a tunnel, add it:
+
+```bash
+ALLOWED_HOSTS=skylight.mydomain.com,*.trycloudflare.com pnpm dev
+```
 
 ## Architecture
 
