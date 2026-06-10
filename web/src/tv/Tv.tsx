@@ -14,6 +14,7 @@ import { useStream } from "../lib/useStream.js";
 import { useTracker } from "../tracker/useTracker.js";
 import { useLiveVideo } from "../tracker/useLiveVideo.js";
 import { useMse } from "./useMse.js";
+import { useStabilize } from "./useStabilize.js";
 import { SkyPolar } from "../tracker/components/SkyPolar.js";
 
 function routeLine(ac: Aircraft | undefined): { from?: string; to?: string } {
@@ -32,6 +33,9 @@ export function Tv() {
   // Fallback: the MJPEG stream, when MSE is unsupported or keeps failing.
   const mse = useMse(stream.connected, state?.video);
   const liveVideo = useLiveVideo(stream.connected, mse.ok ? undefined : state?.video);
+  // Digital stabilization: hold the tracked plane centred in the video, cancelling
+  // the PTZ motor's stop-go (it can't pan smoothly below ~3.6°/s).
+  useStabilize(mse.videoRef, state?.vision?.detection, { enabled: mse.ok });
   const [clock, setClock] = useState("");
   const [fps, setFps] = useState<number | null>(null);
 
