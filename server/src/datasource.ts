@@ -58,6 +58,38 @@ async function fetchJson(url: string): Promise<any> {
   return res.json();
 }
 
+/**
+ * Turn a fetch failure into something a human can act on. "source fetch
+ * failed" alone is useless when the real problem is a Docker container that
+ * can't resolve a sibling's hostname or an API rate limit (#24, #32).
+ */
+function describeFetchError(e: unknown): string {
+  if (!(e instanceof Error)) return "fetch failed";
+  if (e.name === "TimeoutError" || e.name === "AbortError") return "timeout after 5s";
+  const code: string | undefined =
+    (e.cause as { code?: string } | undefined)?.code ?? (e as { code?: string }).code;
+  switch (code) {
+    case "ENOTFOUND":
+    case "EAI_AGAIN":
+      return "DNS lookup failed";
+    case "ECONNREFUSED":
+      return "connection refused";
+    case "EHOSTUNREACH":
+    case "ENETUNREACH":
+      return "host unreachable";
+    case "ETIMEDOUT":
+      return "connect timeout";
+    case "ECONNRESET":
+      return "connection reset";
+  }
+  if (code) return code;
+  return e.message || "fetch failed";
+}
+
+/** Hold off the API after an HTTP 429 — hammering through a rate limit just
+ *  extends it (the freeze/vanish/reappear cycle in #24). */
+const RATE_LIMIT_BACKOFF_MS = 15_000;
+
 export interface PollerOptions {
   source: DataSource;
   /** airplanes.live point template, {lat}/{lon}/{r} are filled from config. */
@@ -120,6 +152,11 @@ export class Poller {
   private lastApi: Aircraft[] = [];
   /** hex -> last good enrichment, so resolved routes never flicker back to "—". */
   private sticky = new Map<string, StickyEnrichment>();
+  /** Why the last poll failed, formatted for the status line. */
+  private lastError: string | null = null;
+  private lastErrorLogAt = 0;
+  /** After an HTTP 429, no API requests until this timestamp. */
+  private apiBackoffUntil = 0;
 
   constructor(private o: PollerOptions) {
     this.status = {
@@ -176,8 +213,8 @@ export class Poller {
   }
 
   private async fetchList(source: DataSource, now: number): Promise<Aircraft[] | null> {
+    const url = source === "radio" ? this.o.getConfig().radioUrl : this.buildApiUrl();
     try {
-      const url = source === "radio" ? this.o.getConfig().radioUrl : this.buildApiUrl();
       const json = await fetchJson(url);
       const rawList: RawAircraft[] = json.aircraft ?? json.ac ?? [];
       const list: Aircraft[] = [];
@@ -186,12 +223,28 @@ export class Poller {
         if (ac) list.push(ac);
       }
       return list;
-    } catch {
+    } catch (e) {
+      const reason = describeFetchError(e);
+      if (source === "api" && reason === "HTTP 429") {
+        this.apiBackoffUntil = now + RATE_LIMIT_BACKOFF_MS;
+      }
+      let host = url;
+      try {
+        host = new URL(url).host;
+      } catch {
+        // keep the raw url — a malformed one is itself the diagnosis
+      }
+      this.lastError = `${source} fetch failed: ${reason} (${host})`;
+      if (now - this.lastErrorLogAt > 30_000) {
+        this.lastErrorLogAt = now;
+        console.error(`[poller] ${source} fetch failed: ${reason} — ${url}`);
+      }
       return null;
     }
   }
 
   private async refreshApi(): Promise<void> {
+    if (Date.now() < this.apiBackoffUntil) return;
     const list = await this.fetchList("api", Date.now());
     if (list) this.lastApi = list;
   }
@@ -207,9 +260,23 @@ export class Poller {
 
   private async tick(): Promise<void> {
     const now = Date.now();
+    if (this.o.source === "api" && now < this.apiBackoffUntil) {
+      const waitS = Math.ceil((this.apiBackoffUntil - now) / 1000);
+      this.status = {
+        ...this.status,
+        ok: false,
+        message: `API rate limited — retrying in ${waitS}s`,
+      };
+      this.o.onStatus(this.status);
+      return;
+    }
     const primary = await this.fetchList(this.o.source, now);
     if (primary === null) {
-      this.status = { ...this.status, ok: false, message: "source fetch failed" };
+      this.status = {
+        ...this.status,
+        ok: false,
+        message: this.lastError ?? "source fetch failed",
+      };
       this.o.onStatus(this.status);
       return;
     }

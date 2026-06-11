@@ -138,6 +138,11 @@ export class Renderer {
   private skyComputedAt = 0;
   private skyOffsetUsed = NaN;
 
+  /** When the source went down (rAF clock), null while healthy. While down,
+   *  the staleness clock pauses so a transient fetch failure doesn't wipe the
+   *  sky and re-spawn everything seconds later (#24). */
+  private sourceDownAt: number | null = null;
+
   constructor(
     private canvas: HTMLCanvasElement,
     private getConfig: () => Config,
@@ -193,6 +198,12 @@ export class Renderer {
     this.canvas.width = Math.round(this.w * this.dpr);
     this.canvas.height = Math.round(this.h * this.dpr);
     this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+  }
+
+  /** Source health from server status messages. */
+  setSourceOk(ok: boolean): void {
+    if (ok) this.sourceDownAt = null;
+    else this.sourceDownAt ??= performance.now();
   }
 
   /** Feed a fresh snapshot. Stamps each fix with local arrival time. */
@@ -329,7 +340,18 @@ export class Renderer {
     const visible: Visible[] = [];
 
     for (const [hex, tr] of this.tracks) {
-      const stale = (now - tr.lastSeen) / 1000;
+      let stale = (now - tr.lastSeen) / 1000;
+      if (this.sourceDownAt !== null) {
+        // Outage: hold staleness at its value when the source went down, so
+        // planes dim in place instead of vanishing. A hard cap still clears
+        // the sky if the source stays dead — frozen planes stop being true.
+        const downFor = (now - this.sourceDownAt) / 1000;
+        stale = Math.max(0, stale - downFor);
+        if ((now - tr.lastSeen) / 1000 > Math.max(cfg.staleSec, 90)) {
+          this.tracks.delete(hex);
+          continue;
+        }
+      }
       if (stale > cfg.staleSec) {
         this.tracks.delete(hex);
         continue;

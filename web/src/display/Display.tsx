@@ -35,6 +35,12 @@ export function Display() {
     rendererRef.current?.update(state.aircraft);
   }, [state.now, state.aircraft]);
 
+  // Source health: during an outage the renderer holds planes instead of
+  // staling them out. A dropped WebSocket counts as an outage too.
+  useEffect(() => {
+    rendererRef.current?.setSourceOk(state.connected && (state.status?.ok ?? true));
+  }, [state.connected, state.status]);
+
   // Keyboard calibration (handy when a keyboard is plugged into the Pi).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
