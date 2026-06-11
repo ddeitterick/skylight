@@ -73,6 +73,42 @@ const MAX_OFFSET_STEP_DEG = 5;
 const MAX_GAIN_STEP = 0.08;
 /** Required improvement to swap models: rmsAfter < rmsBefore × this. */
 const IMPROVE_FACTOR = 0.85;
+/** Iterative robust trim: refit after dropping the worst 20% until the fit
+ *  converges. A busy sky feeds 30-40% mis-locked junk when the model is far
+ *  off (vision centers the WRONG plane near the expected spot) — a single
+ *  trim round can't dig through that. */
+const TRIM_TARGET_RMS = 0.5;
+const TRIM_MAX_ROUNDS = 10;
+/** REMOUNT path: the base was physically moved/re-placed, so the honest
+ *  samples all agree on one large offset step the normal guard would refuse.
+ *  Allowed only for an offsets-only fit of exceptional quality with real
+ *  support — and never for gains/level, which a re-placement barely moves. */
+const REMOUNT_MAX_OFFSET_STEP_DEG = 20;
+const REMOUNT_MAX_RMS = 0.65;
+const REMOUNT_MIN_SAMPLES = 24;
+const REMOUNT_MIN_BINS = 3;
+/** The inlier core must clearly MISFIT the current model — small shifts are
+ *  the normal path's job. */
+const REMOUNT_MIN_PRIOR_RMS = 1.0;
+/** Evidence is counted in PASSES (time-clusters of inliers separated by this
+ *  gap), not wall-span: a single 30-minute mis-tracked lock is one pass no
+ *  matter how long, while two independent locks agreeing on the same shift
+ *  are two. */
+const REMOUNT_CLUSTER_GAP_MS = 3 * 60_000;
+/** How much evidence to demand scales with how broken the incumbent is.
+ *  Unusable (inliers misfit by ≥ this): two agreeing passes suffice — locks
+ *  are rare precisely BECAUSE the model is far off, and every guarded step
+ *  is recoverable (cooldown + later solves). */
+const REMOUNT_URGENT_PRIOR_RMS = 3;
+const REMOUNT_MIN_PASSES_URGENT = 2;
+/** Merely marginal: don't move a working system >5° without sustained
+ *  multi-pass evidence. */
+const REMOUNT_MIN_PASSES = 3;
+const REMOUNT_MIN_SPAN_MS = 30 * 60_000;
+/** The normal path may only apply when the trim kept most of the buffer: a
+ *  fit that survives by discarding more was steered by its own inlier
+ *  selection and must not buy gains/level degrees of freedom with it. */
+const NORMAL_MIN_RETAINED = 0.75;
 
 export class AutoCalibrator {
   private samples: AutoCalSample[] = [];
@@ -122,6 +158,13 @@ export class AutoCalibrator {
    * Refit the mount to the buffer. Returns a model ONLY when it is clearly
    * better than `current` on the same samples and the step is sane; the
    * caller applies it (config patch) and resets any vision bias state.
+   *
+   * Two ways to apply: the NORMAL path (small steps, clear improvement) and
+   * the REMOUNT path — an offsets-only fit of exceptional quality whose step
+   * exceeds the normal guard, which is what a physically moved base looks
+   * like. The remount apply also flushes samples that don't fit the new
+   * model: they were measured against the old orientation (or are mis-locks)
+   * and would steer every later solve.
    */
   trySolve(current: MountModel, now: number): SolveOutcome | null {
     this.prune(now);
@@ -137,48 +180,113 @@ export class AutoCalibrator {
       eSpan >= GAINS_MIN_EL_SPAN;
     const solveLevel = solveGains && this.samples.length >= LEVEL_MIN_SAMPLES;
 
-    let pool = [...this.samples];
-    const rmsBefore = rmsUnder(pool, current);
-    let result = solveMount(pool, current, { solveGains, solveLevel });
-    if (!result) return null;
+    const rmsBefore = rmsUnder(this.samples, current);
+    const fit = this.robustFit(this.samples, current, { solveGains, solveLevel }, MIN_SAMPLES);
+    if (!fit) return null;
 
-    // One robust trim: a few mis-locked samples (a cloud that fooled the
-    // tracker) show up as gross outliers — drop the worst 20% and refit.
-    if (result.rmsDeg > 0.8 && pool.length >= MIN_SAMPLES + 4) {
-      const withRes = pool
-        .map((s, i) => ({ s, r: result!.residualsDeg[i] }))
-        .sort((a, b) => a.r - b.r);
-      pool = withRes.slice(0, Math.floor(withRes.length * 0.8)).map((x) => x.s);
-      const retry = solveMount(pool, current, { solveGains, solveLevel });
-      if (retry && retry.rmsDeg < result.rmsDeg) result = retry;
-    }
-
-    const m = result.model;
+    const m = fit.model;
     const dPan = Math.abs(norm180(m.panOffsetDeg - current.panOffsetDeg));
     const dTilt = Math.abs(m.tiltOffsetDeg - current.tiltOffsetDeg);
-    if (dPan > MAX_OFFSET_STEP_DEG || dTilt > MAX_OFFSET_STEP_DEG) return null;
-    if (
-      Math.abs(m.panGain - current.panGain) > MAX_GAIN_STEP ||
-      Math.abs(m.tiltGain - current.tiltGain) > MAX_GAIN_STEP
-    ) {
-      return null;
-    }
-    if (result.rmsDeg > rmsBefore * IMPROVE_FACTOR) return null;
-    // Demand a meaningful absolute gain too — refitting a model that is
-    // already good just churns the config for noise.
-    if (rmsBefore - result.rmsDeg < 0.05) return null;
-    if (result.rmsDeg > 1.2) return null; // never apply a poor fit
+    const gainsSane =
+      Math.abs(m.panGain - current.panGain) <= MAX_GAIN_STEP &&
+      Math.abs(m.tiltGain - current.tiltGain) <= MAX_GAIN_STEP;
 
-    this.lastAppliedAt = now;
-    this.save(now, true);
-    return {
-      model: m,
-      rmsBeforeDeg: rmsBefore,
-      rmsAfterDeg: result.rmsDeg,
-      n: pool.length,
-      solvedGains: solveGains,
-      solvedLevel: solveLevel,
-    };
+    if (
+      fit.pool.length >= this.samples.length * NORMAL_MIN_RETAINED &&
+      dPan <= MAX_OFFSET_STEP_DEG &&
+      dTilt <= MAX_OFFSET_STEP_DEG &&
+      gainsSane &&
+      fit.rmsDeg <= rmsBefore * IMPROVE_FACTOR &&
+      // Demand a meaningful absolute gain too — refitting a model that is
+      // already good just churns the config for noise.
+      rmsBefore - fit.rmsDeg >= 0.05 &&
+      fit.rmsDeg <= 1.2 // never apply a poor fit
+    ) {
+      this.lastAppliedAt = now;
+      this.save(now, true);
+      return {
+        model: m,
+        rmsBeforeDeg: rmsBefore,
+        rmsAfterDeg: fit.rmsDeg,
+        n: fit.pool.length,
+        solvedGains: solveGains,
+        solvedLevel: solveLevel,
+      };
+    }
+
+    // Normal path refused — check for a remount. Offsets-only: a re-placed
+    // base changes where it points, not its gear ratios; freezing gains and
+    // level keeps a contaminated buffer from buying degrees of freedom.
+    const rfit = this.robustFit(
+      this.samples, current, { solveGains: false, solveLevel: false }, REMOUNT_MIN_SAMPLES,
+    );
+    if (!rfit || rfit.pool.length < REMOUNT_MIN_SAMPLES) return null;
+    const rm = rfit.model;
+    const rdPan = Math.abs(norm180(rm.panOffsetDeg - current.panOffsetDeg));
+    const rdTilt = Math.abs(rm.tiltOffsetDeg - current.tiltOffsetDeg);
+    const ts = rfit.pool.map((s) => s.t).sort((a, b) => a - b);
+    const spanMs = ts[ts.length - 1] - ts[0];
+    let passes = 1;
+    for (let i = 1; i < ts.length; i++) {
+      if (ts[i] - ts[i - 1] > REMOUNT_CLUSTER_GAP_MS) passes++;
+    }
+    const bins = new Set(rfit.pool.map((s) => this.binKey(s.azDeg, s.elDeg))).size;
+    const priorRms = rmsUnder(rfit.pool, current);
+    const evidenceOk =
+      priorRms >= REMOUNT_URGENT_PRIOR_RMS
+        ? passes >= REMOUNT_MIN_PASSES_URGENT
+        : passes >= REMOUNT_MIN_PASSES && spanMs >= REMOUNT_MIN_SPAN_MS;
+    if (
+      rfit.rmsDeg <= REMOUNT_MAX_RMS &&
+      bins >= REMOUNT_MIN_BINS &&
+      evidenceOk &&
+      rdPan <= REMOUNT_MAX_OFFSET_STEP_DEG &&
+      rdTilt <= REMOUNT_MAX_OFFSET_STEP_DEG &&
+      priorRms >= REMOUNT_MIN_PRIOR_RMS
+    ) {
+      this.samples = [...rfit.pool]; // flush what the new model can't explain
+      this.lastAppliedAt = now;
+      this.save(now, true);
+      return {
+        model: rm,
+        rmsBeforeDeg: rmsBefore,
+        rmsAfterDeg: rfit.rmsDeg,
+        n: rfit.pool.length,
+        solvedGains: false,
+        solvedLevel: false,
+      };
+    }
+    return null;
+  }
+
+  /**
+   * Fit with iterative outlier rejection: drop the worst 20% and refit until
+   * the rms converges, the floor is reached, or a round stops helping.
+   * Returns the surviving inlier pool alongside the model.
+   */
+  private robustFit(
+    samples: AutoCalSample[],
+    init: MountModel,
+    opts: { solveGains: boolean; solveLevel: boolean },
+    floor: number,
+  ): { model: MountModel; rmsDeg: number; pool: AutoCalSample[] } | null {
+    let pool = [...samples];
+    let fit = solveMount(pool, init, opts);
+    if (!fit) return null;
+    for (let round = 0; round < TRIM_MAX_ROUNDS && fit.rmsDeg > TRIM_TARGET_RMS; round++) {
+      const keep = Math.max(floor, Math.floor(pool.length * 0.8));
+      if (keep >= pool.length) break;
+      const next = pool
+        .map((s, i) => ({ s, r: fit!.residualsDeg[i] }))
+        .sort((a, b) => a.r - b.r)
+        .slice(0, keep)
+        .map((x) => x.s);
+      const retry = solveMount(next, init, opts);
+      if (!retry || retry.rmsDeg >= fit.rmsDeg) break;
+      pool = next;
+      fit = retry;
+    }
+    return { model: fit.model, rmsDeg: fit.rmsDeg, pool };
   }
 
   // --- internals ---

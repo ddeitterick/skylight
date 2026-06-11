@@ -129,3 +129,139 @@ describe("AutoCalibrator", () => {
     expect(rmsUnder(samples, CONFIGURED)).toBeGreaterThan(1.5);
   });
 });
+
+describe("AutoCalibrator remount path", () => {
+  // The 2026-06-10 real-world case: base re-placed ~5°/+5° (past the normal
+  // 5° step guard) and ~1/3 of the buffer mis-locked on the wrong target
+  // because the stale model pointed 5° off in a busy sky.
+  const REMOUNTED: MountModel = {
+    ...CONFIGURED,
+    panOffsetDeg: 174.0, // 6° from the configured 180
+    tiltOffsetDeg: 4.0,
+  };
+  /** Deterministic LCG so the junk is repeatable. */
+  function lcg(seed: number): () => number {
+    let s = seed >>> 0;
+    return () => ((s = (s * 1664525 + 1013904223) >>> 0), s / 2 ** 32);
+  }
+
+  /** Pass-shaped feed: 6 distinct passes 8 min apart, 15 samples each at 10 s
+   *  spacing; every third sample is junk (the pose centered something degrees
+   *  away from the ADS-B truth). Evidence guards count these time-clusters. */
+  function feedContaminated(cal: AutoCalibrator, t0: number, model: MountModel): void {
+    const rnd = lcg(42);
+    for (let pass = 0; pass < 6; pass++) {
+      for (let i = 0; i < 15; i++) {
+        const t = t0 + pass * 8 * 60_000 + i * 10_000;
+        const az = (pass * 61 + i * 9) % 360;
+        const el = 10 + ((pass * 23 + i * 4) % 55);
+        const pt = mountFromWorld(az, el, model);
+        if (i % 3 === 2) {
+          cal.add({
+            panDeg: pt.panDeg + (rnd() - 0.5) * 30,
+            tiltDeg: pt.tiltDeg + (rnd() - 0.5) * 20,
+            azDeg: az,
+            elDeg: el,
+            t,
+          });
+        } else {
+          cal.add({ panDeg: pt.panDeg, tiltDeg: pt.tiltDeg, azDeg: az, elDeg: el, t });
+        }
+      }
+    }
+  }
+
+  it("digs the new orientation out of a heavily contaminated buffer", () => {
+    const cal = new AutoCalibrator(file);
+    const t0 = 1_000_000_000;
+    feedContaminated(cal, t0, REMOUNTED);
+    const before = cal.status(CONFIGURED).samples;
+    const out = cal.trySolve(CONFIGURED, t0 + 50 * 60_000);
+    expect(out).not.toBeNull();
+    expect(norm180(out!.model.panOffsetDeg - REMOUNTED.panOffsetDeg)).toBeCloseTo(0, 1);
+    expect(out!.model.tiltOffsetDeg).toBeCloseTo(REMOUNTED.tiltOffsetDeg, 1);
+    // Remount applies are offsets-only — gains/level must not move.
+    expect(out!.solvedGains).toBe(false);
+    expect(out!.model.panGain).toBe(CONFIGURED.panGain);
+    expect(out!.rmsAfterDeg).toBeLessThan(0.65);
+    // The junk was flushed; only the inlier core remains.
+    expect(cal.status(out!.model).samples).toBeLessThan(before);
+    expect(cal.status(out!.model).rmsDeg).toBeLessThan(0.65);
+  });
+
+  it("heavy contamination forces offsets-only + flush even for small steps", () => {
+    // The exact 2026-06-10 real-buffer shape: the offsets step squeaks UNDER
+    // the normal 5° caps, but the fit only survives by discarding ~1/3 of the
+    // buffer — it must not be allowed to move gains/level on those few
+    // self-selected inliers, and the junk must be flushed.
+    const SMALL_SHIFT: MountModel = { ...CONFIGURED, panOffsetDeg: 176.0, tiltOffsetDeg: 3.0 };
+    const cal = new AutoCalibrator(file);
+    const t0 = 1_000_000_000;
+    feedContaminated(cal, t0, SMALL_SHIFT);
+    const before = cal.status(CONFIGURED).samples;
+    const out = cal.trySolve(CONFIGURED, t0 + 50 * 60_000);
+    expect(out).not.toBeNull();
+    expect(norm180(out!.model.panOffsetDeg - SMALL_SHIFT.panOffsetDeg)).toBeCloseTo(0, 1);
+    expect(out!.solvedGains).toBe(false);
+    expect(out!.model.panGain).toBe(CONFIGURED.panGain);
+    expect(out!.model.levelTiltDeg).toBe(CONFIGURED.levelTiltDeg);
+    expect(cal.status(out!.model).samples).toBeLessThan(before);
+  });
+
+  it("refuses a large step when even the trimmed fit is mediocre", () => {
+    const cal = new AutoCalibrator(file);
+    const rnd = lcg(7);
+    const t0 = 1_000_000_000;
+    // Same 6° shift across pass-shaped clusters, but every sample is ±3°
+    // sloppy — never trims clean enough to clear REMOUNT_MAX_RMS.
+    for (let pass = 0; pass < 6; pass++) {
+      for (let i = 0; i < 15; i++) {
+        const az = (pass * 61 + i * 9) % 360;
+        const el = 10 + ((pass * 23 + i * 4) % 55);
+        const pt = mountFromWorld(az, el, REMOUNTED);
+        cal.add({
+          panDeg: pt.panDeg + (rnd() - 0.5) * 6,
+          tiltDeg: pt.tiltDeg + (rnd() - 0.5) * 6,
+          azDeg: az,
+          elDeg: el,
+          t: t0 + pass * 8 * 60_000 + i * 10_000,
+        });
+      }
+    }
+    expect(cal.trySolve(CONFIGURED, t0 + 50 * 60_000)).toBeNull();
+  });
+
+  it("refuses a confident fit from a single pass (no independent evidence)", () => {
+    const cal = new AutoCalibrator(file);
+    const t0 = 1_000_000_000;
+    // Clean remount signature but ONE contiguous lock — could be a single
+    // consistently mis-tracked target. Even the urgent tier wants a second
+    // pass that agrees.
+    for (let i = 0; i < 60; i++) {
+      const az = (i * 5) % 360;
+      const el = 10 + ((i * 4) % 55);
+      const pt = mountFromWorld(az, el, REMOUNTED);
+      cal.add({ panDeg: pt.panDeg, tiltDeg: pt.tiltDeg, azDeg: az, elDeg: el, t: t0 + i * 2000 });
+    }
+    expect(cal.trySolve(CONFIGURED, t0 + 3 * 60_000)).toBeNull();
+  });
+
+  it("a second agreeing pass unlocks the urgent tier", () => {
+    const cal = new AutoCalibrator(file);
+    const t0 = 1_000_000_000;
+    // Two independent locks 20 min apart agreeing on the same large shift,
+    // incumbent misfit ≥3° -> urgent tier applies (the 2026-06-10 case).
+    for (const passT0 of [t0, t0 + 20 * 60_000]) {
+      for (let i = 0; i < 20; i++) {
+        const az = (Math.round((passT0 - t0) / 60000) * 3 + i * 7) % 360;
+        const el = 10 + ((i * 5) % 55);
+        const pt = mountFromWorld(az, el, REMOUNTED);
+        cal.add({ panDeg: pt.panDeg, tiltDeg: pt.tiltDeg, azDeg: az, elDeg: el, t: passT0 + i * 5000 });
+      }
+    }
+    const out = cal.trySolve(CONFIGURED, t0 + 25 * 60_000);
+    expect(out).not.toBeNull();
+    expect(norm180(out!.model.panOffsetDeg - REMOUNTED.panOffsetDeg)).toBeCloseTo(0, 1);
+    expect(out!.solvedGains).toBe(false);
+  });
+});
