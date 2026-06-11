@@ -4,15 +4,26 @@
 // a video frame that is already detection.ageMs old by the time it arrives.
 // The previous stabilizer eased toward that stale sample, so between samples
 // the crop sat still while the plane drifted, then caught up — a 10 Hz judder
-// with built-in lag. This module instead estimates the plane's in-frame pixel
-// velocity from consecutive samples and extrapolates it forward to the
-// display frame's timestamp, so the crop transform can ride a continuous
-// predicted path at 60 fps and the EMA downstream only has jitter to remove.
+// with built-in lag. This module instead runs an alpha-beta filter on the
+// samples — each detection corrects a predicted (position, velocity) state by
+// a fraction of its innovation — and extrapolates that state forward to the
+// display frame's timestamp, so the crop transform rides a continuous
+// predicted path at 60 fps without replaying detector pixel noise as 10 Hz
+// micro-jumps.
 //
 // Pure and time-injected (no Date.now/DOM) so it unit-tests deterministically.
 
-/** EMA factor applied per fresh sample to the velocity estimate. */
-const VEL_EMA = 0.4;
+/** Alpha-beta gains: each fresh sample corrects the predicted state by a
+ *  FRACTION of its innovation instead of re-anchoring to the raw sample —
+ *  re-anchoring replayed the detector's pixel noise as a visible 10 Hz
+ *  micro-jump at tele zoom. Constant-velocity targets track with zero
+ *  steady-state lag; noise is averaged over ~1/ALPHA samples. */
+const ALPHA = 0.45;
+/** Velocity gain stays low: velocity noise is amplified by the ~0.3 s
+ *  latency-extrapolation horizon (×β·horizon/dt per sample), so β=0.1 keeps
+ *  a single noisy sample's total effect at ~0.75× its error vs ~2.2× for
+ *  the old raw re-anchor. Costs ~1 s to acquire velocity on a new target. */
+const BETA = 0.1;
 /** |velocity| cap, frame-fractions/s — nothing real crosses faster. */
 const V_MAX = 0.6;
 /** New-sample gap above this resets velocity (vision dropout / new pass). */
@@ -56,19 +67,27 @@ export class CropFollow {
     }
     const dtMs = t - this.sampleAt;
     if (dtMs < MIN_SAMPLE_GAP_MS) return; // rebroadcast, not a new detection
-    const jump = Math.hypot(s.cx - this.px, s.cy - this.py);
+    const dt = dtMs / 1000;
+    // Propagate the filter state to the sample's capture time, then judge
+    // the sample against the PREDICTION (not the stale anchor).
+    const predX = this.px + this.vx * dt;
+    const predY = this.py + this.vy * dt;
+    const jump = Math.hypot(s.cx - predX, s.cy - predY);
     if (dtMs > MAX_GAP_MS || jump > MAX_JUMP) {
       // Dropout or a different plane: position is trustworthy, velocity isn't.
+      this.px = s.cx;
+      this.py = s.cy;
       this.vx = 0;
       this.vy = 0;
     } else {
-      const dt = dtMs / 1000;
       const clamp = (v: number) => Math.max(-V_MAX, Math.min(V_MAX, v));
-      this.vx = clamp(this.vx + ((s.cx - this.px) / dt - this.vx) * VEL_EMA);
-      this.vy = clamp(this.vy + ((s.cy - this.py) / dt - this.vy) * VEL_EMA);
+      const rx = s.cx - predX;
+      const ry = s.cy - predY;
+      this.px = predX + ALPHA * rx;
+      this.py = predY + ALPHA * ry;
+      this.vx = clamp(this.vx + (BETA * rx) / dt);
+      this.vy = clamp(this.vy + (BETA * ry) / dt);
     }
-    this.px = s.cx;
-    this.py = s.cy;
     this.sampleAt = t;
   }
 

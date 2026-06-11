@@ -84,4 +84,20 @@ describe("CropFollow", () => {
     expect(f.predict(0)).toEqual({ cx: 0.5, cy: 0.5 });
     expect(f.sampleAgeMs(0)).toBe(Number.POSITIVE_INFINITY);
   });
+
+  it("attenuates detector noise instead of replaying it (no 10 Hz re-anchor)", () => {
+    const f = new CropFollow();
+    const t = feedPass(f, { vx: 0.1, n: 20 });
+    const before = f.predict(t).cx;
+    // One noisy sample, 0.05 off the true track (within MAX_JUMP): the
+    // prediction may move by at most ~ALPHA of the error — never the full
+    // jump a raw re-anchor would produce.
+    const trueCx = 0.2 + 0.1 * 1.9;
+    f.feed({ cx: trueCx + 0.05, cy: 0.5, ageMs: 300 }, t + 100);
+    const after = f.predict(t + 100).cx;
+    const moved = after - (before + 0.1 * 0.1); // vs the noise-free path
+    // Total single-sample influence ≈ (ALPHA + BETA·horizon/dt)·error ≈ 0.75e
+    // here; the old raw re-anchor replayed ~2.2e. Assert clearly sub-replay.
+    expect(Math.abs(moved)).toBeLessThan(0.05 * 0.85);
+  });
 });
