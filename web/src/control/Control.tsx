@@ -25,7 +25,7 @@ const FIELD_LABELS: Record<keyof ShowFields, string> = {
   altitude: "Altitude",
   speed: "Speed",
   verticalRate: "Vert. rate",
-  destination: "Destination",
+  destination: "Departing / Arriving",
   registration: "Registration",
 };
 
@@ -399,11 +399,20 @@ export function Control() {
               ))}
             </div>
 
+            <Row label="Departing / Arriving display">
+              <Segmented value={cfg.locationDisplay}
+                options={[
+                  { value: "name", label: "Name" },
+                  { value: "iata", label: "IATA" },
+                ]}
+                onChange={(v) => set({ locationDisplay: v })} />
+            </Row>
+
             <h3 className="plane-preview-title">Preview</h3>
             <div className="plane-preview-card">
               {
                 planePreview.map(
-                  (row) => {
+                  (row, index) => {
                     const text = row?.text?.split(/\s{2,}/);
 
                     if (!text) {
@@ -411,7 +420,7 @@ export function Control() {
                     }
 
                     return (
-                      <div className={`plane-preview-card-row plane-preview-card-row-${row?.kind}`}>
+                      <div key={`plane-preview-row-${index}`} className={`plane-preview-card-row plane-preview-card-row-${row?.kind}`}>
                         {text.map((t) => (<span key={t}>{t}</span>))}
                       </div>
                     );

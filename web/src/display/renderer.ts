@@ -105,7 +105,7 @@ function altRamp(alt: number): [number, number, number] {
 export function labelLines(cfg: Config, ac: Aircraft): { text: string; kind: "title" | "sub" }[] {
   const f = cfg.showFields;
   const out: { text: string; kind: "title" | "sub" }[] = [];
-  const title = f.flight ? ac.flight ?? ac.hex.toUpperCase() : ac.airline;
+  const title = f.flight ? ac.flight ?? ac.hex.toUpperCase() : f.airline ? ac.airline : null;
   if (title) out.push({ text: title, kind: "title" });
 
   const sub: string[] = [];
@@ -119,8 +119,10 @@ export function labelLines(cfg: Config, ac: Aircraft): { text: string; kind: "ti
   if (sub.length) out.push({ text: sub.join("   "), kind: "sub" });
 
   if (f.destination && ac.destination && routePlausible(ac, cfg)) {
-    const head = ac.origin ? `${ac.origin} → ${ac.destination}` : `→ ${ac.destination}`;
-    out.push({ text: ac.destName ? `${head}   ${ac.destName}` : head, kind: "sub" });
+    const origin = cfg?.locationDisplay === "name" && ac.originName ? ac.originName : ac.origin ?? "";
+    const destination = cfg?.locationDisplay === "name" && ac.destName ? ac.destName : ac.destination ?? "";
+    out.push({ text: [origin, destination].join(' → '), kind: "sub" });
+
     if (cfg.showRouteDetail && ac.destLat != null && ac.destLon != null) {
       const bits: string[] = [`${localTimeAt(ac.destLat, ac.destLon)} local`];
       if (ac.lat != null && ac.lon != null) {

@@ -331,13 +331,17 @@ main {
 .plane-preview {
   display: flex;
   flex-direction: column;
-  padding: 12px;
+  padding: 13px 14px;
   gap: 10px;
   border-top: 1px solid var(--line);
 }
 .plane-preview .chips {
   border-top: 0;
   padding: 0 0 7px 0;
+}
+.plane-preview .row {
+  padding-left: 0;
+  padding-right: 0;
 }
 .plane-preview-title {
   font-size: 12px;
@@ -349,7 +353,7 @@ main {
 .plane-preview-card {
   display: flex;
   flex-direction: column;
-  padding: 12px;
+  padding: 13px 14px;
   gap: 5px;
   border: 1px solid var(--line);
   border-radius: 10px;
