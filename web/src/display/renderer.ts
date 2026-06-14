@@ -1006,6 +1006,7 @@ export class Renderer {
     if (a < 0.04) return;
 
     const { w, lh, h } = this.measureLabel(cfg, lines);
+
     const gap = cfg.glyphSizePx * 0.7 + 9;
     const onScreen = (b: { x: number; y: number; w: number; h: number }) =>
       b.x >= 6 && b.x + b.w <= this.w - 6 && b.y >= 6 && b.y + b.h <= this.h - 6;
@@ -1054,7 +1055,9 @@ export class Renderer {
       ctx.textBaseline = "top";
       ctx.shadowColor = "rgba(0,0,0,0.9)";
       ctx.shadowBlur = 6;
+
       let y = box.y;
+      let lastLineKind;
       for (const ln of lines) {
         if (ln.kind === "title") {
           ctx.font = `500 14px ${cfg.fonts.label}`;
@@ -1073,9 +1076,15 @@ export class Renderer {
             /* noop */
           }
         }
+
+        // after drawing the title we need a to draw further down for the following line (due to the larger font size of the title)
+        y += lastLineKind === "title" ? lh + 2 : lh;
+
         ctx.fillText(ln.text, box.x, y);
-        y += lh;
+
+        lastLineKind = ln.kind;
       }
+
       try {
         ctx.letterSpacing = "0px";
       } catch {
