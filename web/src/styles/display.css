@@ -60,3 +60,29 @@ body,
   font: 12px "JetBrains Mono", ui-monospace, monospace;
   color: #6b7280;
 }
+.ambient-toggle {
+  position: fixed;
+  bottom: 12px;
+  left: 12px;
+  font: 12px "JetBrains Mono", ui-monospace, monospace;
+  color: #c9cdd6;
+  background: rgba(10, 12, 16, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  padding: 6px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  opacity: 0.12; /* stay out of the way; reveal on hover */
+  transition: opacity 0.2s ease;
+}
+.ambient-toggle:hover,
+.ambient-toggle:focus-visible {
+  opacity: 0.9;
+  outline: none;
+}
+.ambient-toggle.on {
+  border-color: rgba(74, 222, 128, 0.5);
+  color: #4ade80;
+}
+.ambient-warn {
+  color: #e0a23d;
+}

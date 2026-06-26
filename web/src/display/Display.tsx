@@ -2,18 +2,25 @@ import { useEffect, useRef } from "react";
 import type { Config, Theme } from "@shared/index.js";
 import { DEFAULT_CONFIG } from "@shared/index.js";
 import { useStream } from "../lib/useStream.js";
+import { useAmbientMode, kioskRequested } from "../lib/useAmbientMode.js";
 import { Renderer } from "./renderer.js";
 
 const THEMES: Theme[] = ["ambient", "telemetry", "focus"];
 
 export function Display() {
   const { state, conn } = useStream("display");
+  const ambient = useAmbientMode();
+  const isKiosk = kioskRequested();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rendererRef = useRef<Renderer | null>(null);
 
   // Keep the latest config in a ref so the RAF loop always reads fresh values.
   const configRef = useRef<Config>(state.config ?? DEFAULT_CONFIG);
   configRef.current = state.config ?? DEFAULT_CONFIG;
+
+  // Latest ambient toggle in a ref so the keydown listener stays subscribed once.
+  const ambientToggleRef = useRef(ambient.toggle);
+  ambientToggleRef.current = ambient.toggle;
 
   // Create renderer once.
   useEffect(() => {
@@ -72,6 +79,9 @@ export function Display() {
         case "h":
           conn.patchConfig({ showHud: !c.showHud });
           break;
+        case "f":
+          ambientToggleRef.current();
+          break;
       }
     };
     window.addEventListener("keydown", onKey);
@@ -93,6 +103,22 @@ export function Display() {
         </div>
       )}
       {!state.connected && <div className="reconnect">connecting…</div>}
+      {!isKiosk && (
+        <button
+          type="button"
+          className={`ambient-toggle ${ambient.active ? "on" : ""}`}
+          onClick={() => ambient.toggle()}
+          title={
+            ambient.active
+              ? "Exit ambient mode (fullscreen + keep awake) — press f"
+              : "Ambient mode: fullscreen + keep screen awake — press f"
+          }
+          aria-label="Toggle ambient fullscreen mode"
+        >
+          {ambient.active ? "◱ exit ambient" : "◳ ambient"}
+          {ambient.active && !ambient.wakeLocked && <span className="ambient-warn"> · no wake-lock</span>}
+        </button>
+      )}
     </div>
   );
 }
