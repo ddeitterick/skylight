@@ -1,0 +1,43 @@
+name: Sync with upstream
+
+# Keeps this fork's `main` branch in sync with the original repo
+# (cpaczek/skylight). Runs on a schedule and can be triggered manually.
+on:
+  schedule:
+    # Daily at 06:00 UTC. Adjust the cron as you like (https://crontab.guru).
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+# Avoid overlapping syncs.
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+
+      - name: Sync `main` from upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # `gh repo sync` uses GitHub's merge-upstream API. It fast-forwards when
+        # possible; if local `main` has diverged, add `--force` to hard-reset to
+        # upstream (this discards local commits on `main`, so leave it off unless
+        # you keep your changes on a separate branch).
+        run: |
+          gh repo sync "${{ github.repository }}" \
+            --source cpaczek/skylight \
+            --branch main
+
+      - name: Trigger Docker image build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # The sync above updates `main` via the API, which does not emit a `push`
+        # event, so we explicitly kick off the image build for the new code.
+        run: gh workflow run docker-image.yml --ref main
