@@ -25,6 +25,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Sync `main` from upstream
+        id: sync
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         # `gh repo sync` uses GitHub's merge-upstream API. It fast-forwards when
@@ -32,11 +33,23 @@ jobs:
         # upstream (this discards local commits on `main`, so leave it off unless
         # you keep your changes on a separate branch).
         run: |
+          before=$(gh api "repos/${{ github.repository }}/branches/main" --jq '.commit.sha')
           gh repo sync "${{ github.repository }}" \
             --source cpaczek/skylight \
             --branch main
+          after=$(gh api "repos/${{ github.repository }}/branches/main" --jq '.commit.sha')
+
+          if [ "$before" != "$after" ]; then
+            echo "main updated: $before -> $after"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "main already up to date ($before); skipping build."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Trigger Docker image build
+        # Only build when the sync actually advanced `main`.
+        if: steps.sync.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         # The sync above updates `main` via the API, which does not emit a `push`
