@@ -1,6 +1,7 @@
 // Data acquisition: poll the active source (radio | api), normalize records
-// into our Aircraft shape, enrich them, and emit snapshots. dump1090-fa and
-// airplanes.live both use the readsb JSON schema, so one normalizer covers both.
+// into our Aircraft shape, enrich them, and emit snapshots. dump1090-fa and the
+// ADS-B aggregators (adsb.lol, adsb.fi, airplanes.live) all speak the readsb
+// JSON schema, so one normalizer covers every source.
 
 import type { Aircraft, Config, DataSource } from "@shared/index.js";
 import type { SourceStatus } from "@shared/index.js";
@@ -51,9 +52,29 @@ function normalize(raw: RawAircraft, ts: number): Aircraft | null {
   };
 }
 
+/**
+ * Aggregators want to know who is calling. adsb.lol answers 403 to anything
+ * without a descriptive User-Agent — including Node's default — so this is not
+ * just courtesy, it's the difference between the api source working and not.
+ * (Same ask Nominatim makes of the geocoder.)
+ */
+export const API_USER_AGENT = "skylight/0.1 (+https://github.com/cpaczek/skylight)";
+
+/** A non-2xx response, carrying the status so callers can branch on it rather
+ *  than parse a message. */
+class HttpError extends Error {
+  constructor(readonly status: number) {
+    super(`HTTP ${status}`);
+    this.name = "HttpError";
+  }
+}
+
 async function fetchJson(url: string): Promise<any> {
-  const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const res = await fetch(url, {
+    headers: { "User-Agent": API_USER_AGENT },
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!res.ok) throw new HttpError(res.status);
   return res.json();
 }
 
@@ -62,9 +83,18 @@ async function fetchJson(url: string): Promise<any> {
  * failed" alone is useless when the real problem is a Docker container that
  * can't resolve a sibling's hostname or an API rate limit (#24, #32).
  */
-function describeFetchError(e: unknown): string {
+function describeFetchError(e: unknown, source: DataSource): string {
   if (!(e instanceof Error)) return "fetch failed";
   if (e.name === "TimeoutError" || e.name === "AbortError") return "timeout after 5s";
+  // An aggregator that goes feeder-only answers 401/403 forever, and the status
+  // code alone reads like a bug in Skylight. Name the knob instead — this is
+  // how airplanes.live stranded every no-radio install (#66).
+  if (source === "api" && e instanceof HttpError && (e.status === 401 || e.status === 403)) {
+    return (
+      `${e.message} — the aggregator refused the request; it likely serves ` +
+      "feeders only now, so try a different API URL"
+    );
+  }
   const code: string | undefined =
     (e.cause as { code?: string } | undefined)?.code ?? (e as { code?: string }).code;
   switch (code) {
@@ -89,16 +119,68 @@ function describeFetchError(e: unknown): string {
  *  extends it (the freeze/vanish/reappear cycle in #24). */
 const RATE_LIMIT_BACKOFF_MS = 15_000;
 
+/**
+ * Never ask an aggregator for the feed more often than this, whatever the
+ * radio poll rate is. adsb.fi documents 1 request/second per IP and adsb.lol's
+ * dynamic limit is tighter still: polled at the 1s radio rate, with the ground
+ * panel on top, both answered 429 to the request after each success, and the
+ * 15s backoff then left the display with one fix every ~16s (#66). The
+ * renderer interpolates between fixes, so 2s still draws smoothly.
+ */
+export const API_MIN_POLL_MS = 2000;
+/** setInterval fires a few ms either side of its period; without slack a tick
+ *  landing at 1999ms would skip and stretch the cadence to 3s. */
+const TIMER_SLACK_MS = 100;
+
+/** Smallest gap between any two requests to the aggregator. */
+const AGGREGATOR_MIN_GAP_MS = 1100;
+
+/**
+ * Hands out aggregator request slots at least AGGREGATOR_MIN_GAP_MS apart.
+ * The feed, the radio supplement and the SFO ground panel run on independent
+ * timers but share one per-IP rate limit, so two of them landing in the same
+ * second gets one refused — and when the loser is the feed, that is a 15s
+ * hole in the display.
+ */
+export class AggregatorGate {
+  private nextSlotAt = 0;
+
+  async wait(): Promise<void> {
+    const now = Date.now();
+    const at = Math.max(now, this.nextSlotAt);
+    this.nextSlotAt = at + AGGREGATOR_MIN_GAP_MS;
+    if (at > now) await new Promise((r) => setTimeout(r, at - now));
+  }
+}
+
+/**
+ * Fill an aggregator URL template from a location and radius. Providers differ
+ * in path shape — adsb.lol takes /v2/point/{lat}/{lon}/{r}, adsb.fi takes
+ * /lat/{lat}/lon/{lon}/dist/{r} — so the whole URL is the unit of config.
+ */
+export function buildPointUrl(
+  template: string,
+  lat: number,
+  lon: number,
+  radiusNm: number,
+): string {
+  return template
+    .replace("{lat}", String(lat))
+    .replace("{lon}", String(lon))
+    .replace("{r}", String(radiusNm));
+}
+
 export interface PollerOptions {
   source: DataSource;
-  /** airplanes.live point template, {lat}/{lon}/{r} are filled from config. */
-  apiUrlTemplate: string;
   pollMs: number;
   /** When source is "radio", also poll the API and merge (keeps landing
    *  aircraft alive when local ADS-B drops them). */
   supplementApi: boolean;
   /** API poll cadence when supplementing (slower, to respect rate limits). */
   apiPollMs: number;
+  /** Shared with anything else that calls the aggregator (the SFO ground
+   *  panel); defaults to a gate of its own. */
+  gate?: AggregatorGate;
   getConfig: () => Config;
   enricher: RouteEnricher;
   onSnapshot: (now: number, aircraft: Aircraft[]) => void;
@@ -156,8 +238,14 @@ export class Poller {
   private lastErrorLogAt = 0;
   /** After an HTTP 429, no API requests until this timestamp. */
   private apiBackoffUntil = 0;
+  /** The apiUrl that earned the backoff — it doesn't carry over to another. */
+  private apiBackoffFor: string | null = null;
+  /** When the api source was last asked for the primary feed. */
+  private lastApiPollAt = 0;
+  private gate: AggregatorGate;
 
   constructor(private o: PollerOptions) {
+    this.gate = o.gate ?? new AggregatorGate();
     this.status = {
       source: o.source,
       ok: false,
@@ -195,7 +283,7 @@ export class Poller {
    * The supplement timer should only run when the radio is primary — it exists
    * to keep landing aircraft alive when local ADS-B drops them. When the API is
    * itself the primary source, `tick()` already polls it, so a second timer just
-   * doubles the request rate into airplanes.live's rate limit (429s there make
+   * doubles the request rate into the aggregator's rate limit (429s there make
    * polls fail, the display extrapolates, then drops aircraft — the "planes
    * disappearing and reappearing" in #15). Reconcile it against the live source.
    */
@@ -203,7 +291,10 @@ export class Poller {
     const want = this.o.source === "radio" && this.o.supplementApi;
     if (want && !this.apiTimer && this.timer) {
       void this.refreshApi();
-      this.apiTimer = setInterval(() => void this.refreshApi(), this.o.apiPollMs);
+      this.apiTimer = setInterval(
+        () => void this.refreshApi(),
+        Math.max(this.o.apiPollMs, API_MIN_POLL_MS),
+      );
     } else if (!want && this.apiTimer) {
       clearInterval(this.apiTimer);
       this.apiTimer = null;
@@ -227,9 +318,10 @@ export class Poller {
       // radiusMiles * 1.08 cutoff). The radio feed is already local-only.
       return source === "api" ? this.withinRadius(list) : list;
     } catch (e) {
-      const reason = describeFetchError(e);
-      if (source === "api" && reason === "HTTP 429") {
+      const reason = describeFetchError(e, source);
+      if (source === "api" && e instanceof HttpError && e.status === 429) {
         this.apiBackoffUntil = now + RATE_LIMIT_BACKOFF_MS;
+        this.apiBackoffFor = this.o.getConfig().apiUrl;
       }
       let host = url;
       try {
@@ -248,9 +340,16 @@ export class Poller {
 
   private async refreshApi(): Promise<void> {
     if (this.o.getConfig().planetariumMode) return;
-    if (Date.now() < this.apiBackoffUntil) return;
+    if (this.apiBackedOff(Date.now())) return;
+    await this.gate.wait();
     const list = await this.fetchList("api", Date.now());
     if (list) this.lastApi = list;
+  }
+
+  /** Still inside a 429 backoff? One provider's rate limit says nothing about
+   *  the next, so a new API URL from the control panel is tried right away. */
+  private apiBackedOff(now: number): boolean {
+    return now < this.apiBackoffUntil && this.apiBackoffFor === this.o.getConfig().apiUrl;
   }
 
   /** Keep only aircraft within the configured display radius. Position-less
@@ -268,14 +367,11 @@ export class Poller {
   private buildApiUrl(): string {
     const c = this.o.getConfig();
     const r = Math.min(250, Math.ceil(c.radiusMiles * NM_PER_MILE) + 1);
-    return this.o.apiUrlTemplate
-      .replace("{lat}", String(c.centerLat))
-      .replace("{lon}", String(c.centerLon))
-      .replace("{r}", String(r));
+    return buildPointUrl(c.apiUrl, c.centerLat, c.centerLon, r);
   }
 
   private async tick(): Promise<void> {
-    const now = Date.now();
+    let now = Date.now();
 
     if (this.o.getConfig().planetariumMode) {
       this.last = [];
@@ -291,7 +387,7 @@ export class Poller {
       return;
     }
 
-    if (this.o.source === "api" && now < this.apiBackoffUntil) {
+    if (this.o.source === "api" && this.apiBackedOff(now)) {
       const waitS = Math.ceil((this.apiBackoffUntil - now) / 1000);
       this.status = {
         ...this.status,
@@ -300,6 +396,13 @@ export class Poller {
       };
       this.o.onStatus(this.status);
       return;
+    }
+    if (this.o.source === "api") {
+      // The timer ticks at the radio rate; the aggregator gets every other one.
+      if (now - this.lastApiPollAt < API_MIN_POLL_MS - TIMER_SLACK_MS) return;
+      this.lastApiPollAt = now;
+      await this.gate.wait();
+      now = Date.now();
     }
     const primary = await this.fetchList(this.o.source, now);
     if (primary === null) {
