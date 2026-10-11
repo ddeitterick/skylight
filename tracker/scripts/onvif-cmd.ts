@@ -2,6 +2,7 @@
 // auth. Used to recover the camera when its RTSP server wedges (rapid repeated
 // ffmpeg connects during measurement runs can do this; VISCA keeps working).
 //
+// When: the video (RTSP) is dead but VISCA still answers.
 //   pnpm exec tsx scripts/onvif-cmd.ts info                 # GetDeviceInformation (auth test, harmless)
 //   pnpm exec tsx scripts/onvif-cmd.ts reboot               # SystemReboot
 //   ONVIF_USER=admin ONVIF_PASS=admin ...                   # creds (defaults admin/admin)

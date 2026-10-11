@@ -123,13 +123,7 @@ function meanStd(map: Uint8Array, w: number, h: number): { mean: number; std: nu
   return { mean, std: Math.sqrt(varr) };
 }
 
-/**
- * Find the strongest compact residual blob, preferring those near the predicted
- * position (frame fractions). Returns null if nothing rises clearly above the
- * residual noise floor. A simple flood from the best-scoring peak — the plane
- * is small and bright in the residual, so this is enough; the world-velocity
- * tracker downstream still arbitrates between competing candidates.
- */
+/** Blob search options; the expectation is in frame fractions. */
 export interface FindOptions {
   expectedX?: number;
   expectedY?: number;
@@ -139,7 +133,13 @@ export interface FindOptions {
   minPeakSigma?: number;
 }
 
-/** Strongest single moving blob (best near the expectation), or null. */
+/**
+ * The strongest compact residual blob, preferring those near the expected
+ * position, or null if nothing rises clearly above the residual noise floor.
+ * The plane is small and bright in the residual, so a flood from the best
+ * peak is enough; the world-velocity tracker downstream still arbitrates
+ * between competing candidates. (The loop uses findMovingBlobs.)
+ */
 export function findMovingBlob(
   residual: Uint8Array,
   w: number,

@@ -24,7 +24,7 @@ import type {
   CameraPose,
   ViscaUnitScale,
 } from "@shared/index.js";
-import type { CameraDriver } from "./driver.js";
+import type { CameraDriver, TrackRateOptions } from "./driver.js";
 import {
   clampPose,
   panDegToUnits,
@@ -35,7 +35,6 @@ import {
 
 const PT_COMMAND = 0x0100;
 const PT_INQUIRY = 0x0110;
-const PT_REPLY = 0x0111;
 const PT_CONTROL = 0x0200;
 const PT_CONTROL_REPLY = 0x0201;
 
@@ -50,56 +49,147 @@ export interface ViscaOptions {
   commandHz?: number;
 }
 
-// Drive-speed step -> SUSTAINED deg/s. Low steps (0-3) re-measured 2026-06-10
-// by RTSP background frame-shift (scripts/video-speed.ts, slow-limits.ts,
-// byte0-verify.ts) — the old two-timed-sweep table read step 1 as 3.61°/s, a
-// truncation artifact; the real byte-1 floor is ~7.9. Steps 4+ keep the sweep
-// measurements (small relative error up there, and they only matter for
-// repositioning). Steps whose repeated measurements stayed non-monotonic are
-// omitted; the dither in trackRate synthesizes anything between two entries.
+// Drive-speed step -> SUSTAINED deg/s, as a SURFACE over zoom.
 //
-// Speed byte 0x00 is a REAL slow gear (~1.47°/s pan, steady over 8 s), not a
-// no-op — it had simply never been sent because every code path clamped
-// Math.max(1, byte). "Stopped" is STOP_STEP (-1), not 0, for that reason.
-const PAN_SPEEDS: [number, number][] = [
+// This firmware scales pan/tilt drive speed with zoom ("speed by zoom",
+// measured 2026-10-10 with scripts/probe-mech.ts + probe-speed-zoom.ts): pan
+// byte 1 is ~7°/s at full wide but ~1.4°/s from zoom ≈900 up, and every byte
+// compresses toward the ~1.47°/s floor as the lens goes tele. The June tables
+// were measured wide only, so zoomed in — exactly where smoothness matters —
+// the dither's model ran ~5× hot and the loop's integrator saturated. The
+// driver therefore interpolates a per-zoom table from the rows below (linear
+// in zoom units between measured rows, linear in step within a row).
+//
+// Row 0 (wide) keeps the full June tables (two-timed-sweep; low steps
+// re-measured by video frame-shift 2026-06-10). Speed byte 0x00 is a REAL
+// slow gear (~1.47°/s), not a no-op — "stopped" is STOP_STEP (-1).
+const PAN_SPEEDS_WIDE: [number, number][] = [
   [0, 1.47], [1, 7.9], [2, 17.6], [3, 21.2], [4, 26.55], [5, 29.32], [6, 31.05],
   [7, 35.57], [9, 41.5], [11, 44.59], [12, 47.26], [13, 50.06], [16, 54.15],
   [17, 56.01], [18, 57.85], [19, 64.76], [20, 67.56], [21, 71.53],
   [22, 74.23], [24, 75.16],
 ];
-// Tilt has the 0x00 slow gear too: 1.47°/s both directions, dead steady
-// (bench-measured 2026-06-10, byte0-verify.ts) — same rate as pan, so it's a
-// motor-controller-wide gear, not a pan quirk.
-const TILT_SPEEDS: [number, number][] = [
+const TILT_SPEEDS_WIDE: [number, number][] = [
   [0, 1.47], [1, 3.0], [2, 4.5], [3, 6.2], [4, 7.67], [5, 9.29], [6, 11.86],
   [7, 13.36], [8, 13.8], [9, 16.82], [10, 17.68], [11, 20.31], [13, 23.52],
   [15, 24.78], [16, 26.14], [17, 30.45], [19, 33.5],
 ];
 
-/** Sentinel for "axis not driven" — distinct from speed byte 0, a real gear. */
-const STOP_STEP = -1;
+/** One measured zoom position of the drive-rate surface. */
+export interface SpeedRow {
+  /** Zoom units (0 = wide). */
+  zoom: number;
+  pan: [number, number][];
+  tilt: [number, number][];
+}
 
 /**
- * Closest speed step for a desired |deg/s|; 0 = below the slowest step.
- * Used only to map ABSOLUTE-move speed bytes (setPose) — byte 0x00 is skipped
- * because its behavior on the 06 02 command is unverified (callers clamp to
- * ≥1 anyway).
+ * Measured rows, wide → tele. Rows beyond the wide one list the steps that
+ * were measured at that zoom; unmeasured steps interpolate within the row.
+ * (Filled from probe-speed-zoom.ts RESULTS_JSON — see speedSurface below.)
  */
-function speedStep(table: [number, number][], dps: number): number {
-  const want = Math.abs(dps);
-  if (want < table[0][1] * 0.5) return 0;
-  let best = 0;
-  let bestErr = Infinity;
-  for (const [step, rate] of table) {
-    if (step === 0) continue;
-    const err = Math.abs(rate - want);
-    if (err < bestErr) {
-      bestErr = err;
-      best = step;
+export const SPEED_SURFACE: SpeedRow[] = [
+  { zoom: 0, pan: PAN_SPEEDS_WIDE, tilt: TILT_SPEEDS_WIDE },
+  // Measured 2026-10-10 (probe-speed-zoom.ts, pose two-timed sweep, zoom read
+  // back from the lens). Byte 0 is the 1.47°/s floor gear at every zoom
+  // (probe-mech.ts: 1.53 @900, 1.46 @1437). Up to ~zoom 300 nothing changes;
+  // from ~600 the firmware remaps bytes onto progressively slower native
+  // speeds, until at 1200+ bytes 1-2 sit on the floor and 3-4 on ~2.9°/s.
+  {
+    zoom: 300,
+    pan: [[0, 1.47], [1, 7.43], [2, 14.77], [3, 20.92], [4, 28.55], [6, 32.71], [8, 38.7], [12, 41.95], [18, 61.08]],
+    tilt: [[0, 1.47], [1, 3.4], [2, 4.91], [3, 5.46], [5, 9.84], [8, 12.28]],
+  },
+  {
+    zoom: 600,
+    pan: [[0, 1.47], [1, 2.78], [2, 7.48], [3, 7.79], [4, 15.63], [6, 20.83], [8, 28.24], [12, 33.6], [18, 44.41]],
+    tilt: [[0, 1.47], [1, 1.7], [2, 3.25], [3, 4.12], [5, 7.76], [8, 11.63]],
+  },
+  {
+    zoom: 900,
+    pan: [[0, 1.47], [1, 1.49], [2, 3.12], [3, 6.6], [4, 7.82], [6, 13.98], [8, 22.11], [12, 23.67], [18, 35.73]],
+    tilt: [[0, 1.47], [1, 1.7], [2, 3.26], [3, 5.13], [5, 6.51], [8, 10.12]],
+  },
+  {
+    zoom: 1200,
+    // Bytes 12-18 / tilt 10 re-measured 2026-10-10 17:55 (probe-speed-zoom.ts).
+    pan: [[0, 1.47], [1, 1.32], [2, 1.39], [3, 2.8], [4, 2.97], [6, 7.0], [8, 7.0], [12, 14.84], [16, 21.11], [18, 23.19]],
+    tilt: [[0, 1.47], [1, 1.36], [2, 1.61], [3, 2.93], [5, 3.08], [8, 4.32], [10, 6.15]],
+  },
+  // Full tele (measured 2026-10-10 15:17, probe-speed-zoom.ts): bytes 0-4
+  // are ALL the ~1.5°/s floor gear on both axes (pan 1.56/1.48/1.47/1.32/
+  // 1.41, tilt 1.61/1.55/1.44/1.71/1.43). Bytes ≥5 still carried over from
+  // the 1200 row until measured. (The earlier guess of 2.9°/s at bytes 3-4
+  // made the dither "deliver" a rate the motor never produced — the loop's
+  // integrator wound up and hunted at tele.)
+  // Second probe 15:25: bytes 5-6 are still the floor; byte 8 = 2.63 (pan) /
+  // 2.93 (tilt); byte 12 = 2.97 (pan). Byte 18 unmeasured (kept from 1200).
+  {
+    zoom: 1437,
+    // Third probe 2026-10-10 17:52 (bytes 12-18 pan, 8-20 tilt): the fast
+    // pan gear at full tele is ~7.4°/s (bytes 16-18), NOT the 22°/s carried
+    // over from the 1200 row — bytes 12-15 are all ~3°/s. Tilt tops out at
+    // ~4.6°/s (byte 20). So at tele the only gears are ~1.5 / ~3 / ~7.4°/s.
+    pan: [[0, 1.47], [6, 1.5], [8, 2.63], [12, 2.97], [14, 3.14], [16, 7.06], [18, 7.39]],
+    tilt: [[0, 1.5], [6, 1.6], [8, 2.93], [12, 3.06], [14, 3.25], [16, 4.09], [20, 4.62]],
+  },
+];
+
+/** Rate at `step` within one row: linear between neighbouring measured steps. */
+function rateInRow(row: [number, number][], step: number): number {
+  if (step <= row[0][0]) return row[0][1];
+  for (let i = 1; i < row.length; i++) {
+    if (step <= row[i][0]) {
+      const [s0, r0] = row[i - 1];
+      const [s1, r1] = row[i];
+      return r0 + ((step - s0) / (s1 - s0)) * (r1 - r0);
     }
   }
-  return best;
+  return row[row.length - 1][1];
 }
+
+/**
+ * The speed table that applies at `zoomUnits`: every step of the wide table,
+ * each rate interpolated between the bracketing measured rows. Entries that
+ * fail to rise ≥0.05°/s over the previous one are dropped so the dither's
+ * bracket never divides by a zero-width gap (at tele most bytes collapse onto
+ * the floor and only the rising ones remain).
+ */
+export function speedTableAt(
+  axis: "pan" | "tilt",
+  zoomUnits: number,
+  rows: SpeedRow[] = SPEED_SURFACE,
+): [number, number][] {
+  const wide = rows[0][axis];
+  if (rows.length === 1) return wide;
+  const z = Math.max(rows[0].zoom, Math.min(rows[rows.length - 1].zoom, zoomUnits));
+  let lo = rows[0];
+  let hi = rows[rows.length - 1];
+  for (let i = 1; i < rows.length; i++) {
+    if (z <= rows[i].zoom) {
+      lo = rows[i - 1];
+      hi = rows[i];
+      break;
+    }
+  }
+  const f = hi.zoom === lo.zoom ? 0 : (z - lo.zoom) / (hi.zoom - lo.zoom);
+  const out: [number, number][] = [];
+  let last = -Infinity;
+  for (const [step] of wide) {
+    const r = rateInRow(lo[axis], step) * (1 - f) + rateInRow(hi[axis], step) * f;
+    if (r >= last + 0.05) {
+      out.push([step, r]);
+      last = r;
+    }
+  }
+  return out;
+}
+
+/** Sentinel for "axis not driven" — distinct from speed byte 0, a real gear. */
+const STOP_STEP = -1;
+/** Absolute moves always run flat out (pan 0x18 / tilt 0x14, the maxima). */
+const ABS_PAN_SPEED = 0x18;
+const ABS_TILT_SPEED = 0x14;
 
 /** Sustained deg/s of a discrete speed step (nearest table entry). */
 function stepRate(table: [number, number][], step: number): number {
@@ -188,11 +278,6 @@ export class ViscaCamera implements CameraDriver {
   private lastSentZoom: number | null = null;
   /** Last velocity-drive command key (dedupe). */
   private lastDrive: string | null = null;
-  /** Speed bytes for the pending absolute move. */
-  private wantedPanVV = 0x18;
-  private wantedTiltWW = 0x14;
-  /** Pending absolute move is speed-matched (carrot) — bypass the gate. */
-  private wantedMatched = false;
 
   constructor(private o: ViscaOptions) {}
 
@@ -270,20 +355,11 @@ export class ViscaCamera implements CameraDriver {
 
   // --- public command surface ---
 
-  gotoAbsolute(pose: CameraPose, speeds?: { panDps?: number; tiltDps?: number }): void {
+  gotoAbsolute(pose: CameraPose): void {
     this.lastDrive = null; // absolute move supersedes velocity pursuit
     this.cmdPanDps = 0; // dead reckoning only models velocity drives
     this.cmdTiltDps = 0;
     this.wanted = clampPose(pose, this.o.limits, this.o.units);
-    // Map requested deg/s to the camera's speed-step bytes (same motor
-    // controller as the drive table). Default: flat out.
-    this.wantedPanVV = speeds?.panDps != null
-      ? Math.max(1, speedStep(PAN_SPEEDS, speeds.panDps) || 1)
-      : 0x18;
-    this.wantedTiltWW = speeds?.tiltDps != null
-      ? Math.max(1, speedStep(TILT_SPEEDS, speeds.tiltDps) || 1)
-      : 0x14;
-    this.wantedMatched = speeds != null;
   }
 
   /** Max position ripple budget contributed by rate dithering, deg.
@@ -318,22 +394,23 @@ export class ViscaCamera implements CameraDriver {
     table: [number, number][],
     want: number,
     now: number,
+    rippleDeg: number = ViscaCamera.DITHER_RIPPLE_DEG,
   ): number {
     const w = Math.abs(want);
     const dt = st.lastAt ? Math.min(0.2, (now - st.lastAt) / 1000) : 0;
     st.lastAt = now;
-    if (w < table[0][1] * 0.15) {
+    if (w < table[0][1] * 0.05) {
       st.acc = 0;
       st.onHi = false;
       return STOP_STEP; // too slow even to duty-cycle
     }
     const { loStep, hiStep, duty } = bracket(table, w);
-    if (duty >= 0.93) {
+    if (duty >= 0.88) {
       st.acc = 0;
       st.onHi = true;
       return hiStep; // don't dither for a sliver
     }
-    if (duty <= 0.07) {
+    if (duty <= 0.12) {
       st.acc = 0;
       st.onHi = false;
       return loStep;
@@ -341,7 +418,7 @@ export class ViscaCamera implements CameraDriver {
     const loRate = loStep === STOP_STEP ? 0 : stepRate(table, loStep);
     const hiRate = stepRate(table, hiStep);
     st.acc += (w - (st.onHi ? hiRate : loRate)) * dt;
-    const R = ViscaCamera.DITHER_RIPPLE_DEG;
+    const R = Math.max(0.1, rippleDeg);
     const dwellOk = now - st.since >= ViscaCamera.DITHER_MIN_DWELL_MS;
     if (st.onHi && st.acc <= -R / 2 && dwellOk) {
       st.onHi = false;
@@ -354,6 +431,9 @@ export class ViscaCamera implements CameraDriver {
     return st.onHi ? hiStep : loStep;
   }
 
+  /** Stop velocity drives this far before a mechanical limit, deg. */
+  private static readonly LIMIT_MARGIN_DEG = 2.5;
+
   /**
    * Velocity pursuit: continuous drive at ~the requested rate per axis.
    *
@@ -365,10 +445,7 @@ export class ViscaCamera implements CameraDriver {
    * (~15 Hz), which clocks the dither; actual datagrams go out only when
    * the discrete command changes.
    */
-  /** Stop velocity drives this far before a mechanical limit, deg. */
-  private static readonly LIMIT_MARGIN_DEG = 2.5;
-
-  trackRate(panDps: number, tiltDps: number): void {
+  trackRate(panDps: number, tiltDps: number, opts?: TrackRateOptions): void {
     this.wanted = null; // velocity mode supersedes any queued absolute move
     this.lastSent = null; // velocity moves make the last absolute goal moot
     this.lastSentAt = 0;
@@ -386,18 +463,29 @@ export class ViscaCamera implements CameraDriver {
       pd = 0; // blind — never velocity-drive without a pose
       td = 0;
     } else {
+      // Rate-aware stop margin: what the head can still travel in ~0.8 s of
+      // command latency at the wanted rate, never less than 0.4°. A fixed
+      // 2.5° band left a 2.5° strip at each pan stop unreachable under
+      // velocity drive — a plane at pan −174.9 sat a fifth of the frame off
+      // centre for 8 s while the head waited at −173 (NUM721).
       const M = ViscaCamera.LIMIT_MARGIN_DEG;
-      if (est.panDeg >= this.o.limits.panMaxDeg - M && pd > 0) pd = 0;
-      if (est.panDeg <= this.o.limits.panMinDeg + M && pd < 0) pd = 0;
-      if (est.tiltDeg >= this.o.limits.tiltMaxDeg - M && td > 0) td = 0;
-      if (est.tiltDeg <= this.o.limits.tiltMinDeg + M && td < 0) td = 0;
+      const mP = Math.min(M, Math.max(0.4, Math.abs(pd) * 0.8));
+      const mT = Math.min(M, Math.max(0.4, Math.abs(td) * 0.8));
+      if (est.panDeg >= this.o.limits.panMaxDeg - mP && pd > 0) pd = 0;
+      if (est.panDeg <= this.o.limits.panMinDeg + mP && pd < 0) pd = 0;
+      if (est.tiltDeg >= this.o.limits.tiltMaxDeg - mT && td > 0) td = 0;
+      if (est.tiltDeg <= this.o.limits.tiltMinDeg + mT && td < 0) td = 0;
     }
     this.cmdPanDps = pd;
     this.cmdTiltDps = td;
 
     const now = Date.now();
-    const panStep = this.pickDithered(this.panDither, PAN_SPEEDS, pd, now);
-    const tiltStep = this.pickDithered(this.tiltDither, TILT_SPEEDS, td, now);
+    // Speed-by-zoom: the step→rate map depends on where the lens IS.
+    const z = this.currentZoom();
+    const R = opts?.rippleDeg ?? ViscaCamera.DITHER_RIPPLE_DEG;
+    const RT = opts?.rippleTiltDeg ?? R;
+    const panStep = this.pickDithered(this.panDither, speedTableAt("pan", z), pd, now, R);
+    const tiltStep = this.pickDithered(this.tiltDither, speedTableAt("tilt", z), td, now, RT);
     // Pan units increase to the RIGHT (02); tilt units increase UP (01).
     const panDir = panStep === STOP_STEP ? 0x03 : pd > 0 ? 0x02 : 0x01;
     const tiltDir = tiltStep === STOP_STEP ? 0x03 : td > 0 ? 0x01 : 0x02;
@@ -457,9 +545,12 @@ export class ViscaCamera implements CameraDriver {
       this.focusFarTimer = null;
     }
     this.focusMode = "onepush";
-    // Switch to AF mode, fire One Push Trigger; the camera does a single
-    // sweep on the framed subject (the plane) and holds.
-    this.sendCommand([0x81, 0x01, 0x04, 0x38, 0x02, 0xff]); // auto focus mode
+    // MANUAL focus mode, then One Push Trigger: a single sweep on the framed
+    // subject, after which the lens HOLDS. (Issuing the trigger from AUTO
+    // mode left the camera in continuous AF: at 20× on open sky it hunted,
+    // the plane went soft within seconds, detection dropped and the zoom
+    // ladder fell back to wide — the "loses focus, zooms out, zooms in" cycle.)
+    this.sendCommand([0x81, 0x01, 0x04, 0x38, 0x03, 0xff]); // manual focus mode
     this.sendCommand([0x81, 0x01, 0x04, 0x18, 0x01, 0xff]); // one-push trigger
   }
 
@@ -484,10 +575,11 @@ export class ViscaCamera implements CameraDriver {
     const panSpeed = Math.max(1, Math.round(Math.abs(pan) * 0x18));
     const tiltSpeed = Math.max(1, Math.round(Math.abs(tilt) * 0x14));
     // Dead-reckon jog motion too (the limit guard rides on these).
+    const z = this.currentZoom();
     this.cmdPanDps =
-      Math.abs(pan) > 0.05 ? Math.sign(pan) * stepRate(PAN_SPEEDS, panSpeed) : 0;
+      Math.abs(pan) > 0.05 ? Math.sign(pan) * stepRate(speedTableAt("pan", z), panSpeed) : 0;
     this.cmdTiltDps =
-      Math.abs(tilt) > 0.05 ? Math.sign(tilt) * stepRate(TILT_SPEEDS, tiltSpeed) : 0;
+      Math.abs(tilt) > 0.05 ? Math.sign(tilt) * stepRate(speedTableAt("tilt", z), tiltSpeed) : 0;
     this.sendCommand([
       0x81, 0x01, 0x06, 0x01,
       panSpeed, tiltSpeed,
@@ -514,6 +606,20 @@ export class ViscaCamera implements CameraDriver {
 
   getPose(): CameraPose | null {
     return this.pose;
+  }
+
+  /** acc integrates (wanted − delivered) |rate|: positive = behind along the
+   *  commanded direction. Signed into mount degrees by the drive direction. */
+  getDitherRipple(): { panDeg: number; tiltDeg: number } {
+    return {
+      panDeg: Math.sign(this.cmdPanDps) * this.panDither.acc,
+      tiltDeg: Math.sign(this.cmdTiltDps) * this.tiltDither.acc,
+    };
+  }
+
+  /** Zoom the lens is at (inquiry), else the last commanded, else wide. */
+  private currentZoom(): number {
+    return this.pose?.zoomUnits ?? this.lastSentZoom ?? this.o.units.zoomWideUnits;
   }
 
   /**
@@ -569,8 +675,7 @@ export class ViscaCamera implements CameraDriver {
     // and restarts the camera's acceleration ramp — streaming them at 12 Hz
     // makes a 68°/s camera crawl at ~4°/s. While the camera is still
     // traveling toward the last goal, hold off unless the goal genuinely
-    // moved (a retarget worth the restart). EXCEPTION: speed-matched carrot
-    // moves — re-issuing at the same speed resumes seamlessly by design.
+    // moved (a retarget worth the restart).
     //
     // "Traveling" must EXPIRE on a clock, not hang off the pose: replies
     // stall around moves, and comparing the pose against a goal from a
@@ -579,7 +684,7 @@ export class ViscaCamera implements CameraDriver {
     // forever — "never returns to SFO", "takes 5 s to start tracking").
     // trackRate/jog also null lastSent: velocity moves invalidate it.
     let allowPanTilt = true;
-    if (!this.wantedMatched && last && this.lastSentAt) {
+    if (last && this.lastSentAt) {
       const withinWindow = Date.now() - this.lastSentAt < this.lastSentDurMs;
       const arrived =
         this.pose != null &&
@@ -604,7 +709,7 @@ export class ViscaCamera implements CameraDriver {
       const t = nibbles(tiltDegToUnits(w.tiltDeg, this.o.units), 4);
       this.sendCommand([
         0x81, 0x01, 0x06, 0x02,
-        this.wantedPanVV, this.wantedTiltWW,
+        ABS_PAN_SPEED, ABS_TILT_SPEED,
         ...p, ...t, 0xff,
       ]);
       this.lastSent = { panDeg: w.panDeg, tiltDeg: w.tiltDeg };
@@ -666,10 +771,9 @@ export class ViscaCamera implements CameraDriver {
     const payloadType = msg.readUInt16BE(0);
     const payload = msg.subarray(8);
 
+    // Replies are classified by shape below, not by payload type: some
+    // firmwares echo them under the command type (0x0100) instead of 0x0111.
     if (payloadType === PT_CONTROL_REPLY) return;
-    if (payloadType !== PT_REPLY && payloadType !== PT_COMMAND) {
-      // Some firmwares echo replies under the command type; accept both.
-    }
 
     const y = payload[1] ?? 0;
     if ((y & 0xf0) === 0x40) {

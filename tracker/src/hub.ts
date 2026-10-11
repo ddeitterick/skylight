@@ -15,7 +15,6 @@ import type { Recorder } from "./record.js";
 import type { Upstream } from "./upstream.js";
 import type { VideoStream } from "./video/stream.js";
 import type { VideoRecorder } from "./video/recorder.js";
-import { renderDebug } from "./vision/detect.js";
 
 const STATE_HZ = 10;
 
@@ -69,15 +68,6 @@ export class TrackerHub {
       if (!frame) return res.status(503).json({ error: "no frame yet" });
       res.type("image/jpeg").send(frame);
     });
-    // The frame as the detector sees it: red = masked clutter, green = blob.
-    app.get("/vision-debug.jpg", (_req, res) => {
-      const frame = this.video.latestFrame();
-      if (!frame) return res.status(503).json({ error: "no frame yet" });
-      renderDebug(frame)
-        .then((img) => res.type("image/jpeg").send(img))
-        .catch((err) => res.status(500).json({ error: String(err) }));
-    });
-
     // --- full-quality clip recording ---
     app.post("/api/record/video", (req, res) => {
       if (req.body?.on) res.json(this.videoRec.start());

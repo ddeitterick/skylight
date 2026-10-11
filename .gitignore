@@ -31,3 +31,6 @@ tracker/models/
 # stream credentials (instance env files) — examples stay committed
 stream/.env*
 !stream/.env*.example
+
+# pass-archive ingest key (passes/.ingest-key) — never commit
+.ingest-key

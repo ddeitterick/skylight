@@ -34,9 +34,13 @@ export function Tv() {
   // Fallback: the MJPEG stream, when MSE is unsupported or keeps failing.
   const mse = useMse(stream.connected, state?.video);
   const liveVideo = useLiveVideo(stream.connected, mse.ok ? undefined : state?.video);
-  // Digital stabilization: hold the tracked plane centred in the video, cancelling
-  // the PTZ motor's stop-go (it can't pan smoothly below ~3.6°/s).
-  useStabilize(mse.videoRef, state?.vision?.detection, { enabled: mse.ok });
+  // Digital crop-follow (re-centre the video on the vision detection). OFF by
+  // default since 2026-10-10: with the motor now tracking smoothly it did more
+  // harm than good — every hop of the detection box re-centred the whole
+  // picture, which read as camera shake on the stream while the raw feed was
+  // steady. ?stab=1 re-enables it.
+  const stabOn = new URLSearchParams(window.location.search).get("stab") === "1";
+  useStabilize(mse.videoRef, state?.vision?.detection, { enabled: mse.ok && stabOn });
   const [clock, setClock] = useState("");
   const [fps, setFps] = useState<number | null>(null);
 

@@ -6,6 +6,7 @@
 
 import { computeSky } from "@shared/celestial.js";
 import {
+  fixAgeSec as fixAge,
   aircraftGeoPoint,
   azElFromSite,
   predictGeo,
@@ -45,7 +46,7 @@ export class CalibrationSession {
         if (!ac || !geo) return null;
         // Extrapolate the fix to the capture instant — a 1 s stale fix on a
         // crossing plane is degrees of error, dwarfing what we're solving.
-        const fixAgeSec = Math.max(0, (now - (ac.ts ?? now)) / 1000) + (ac.seen ?? 0);
+        const fixAgeSec = fixAge(ac, now);
         const at = predictGeo(
           {
             lat: geo.lat,

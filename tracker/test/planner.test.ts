@@ -21,6 +21,7 @@ import {
   planPass,
   zenithHold,
   ZENITH_MIN_HFOV,
+  ZENITH_PRE_SEC,
   ZENITH_REGIME_EL,
 } from "../src/pointing/planner.js";
 import { predictAim, TrackHistory } from "../src/pointing/predict.js";
@@ -29,7 +30,9 @@ import { chooseZoom } from "../src/pointing/zoom.js";
 const SITE: GeoPoint = { lat: 37.6213, lon: -122.379, altM: 0 };
 const CFG = {
   ...DEFAULT_CONFIG.tracker,
-  predict: { ...DEFAULT_CONFIG.tracker.predict, adsbLatencySec: 0 },
+  // motorLatencySec: the loop passes a per-axis latency; 0.2 s is what
+  // these simulations were tuned with.
+  predict: { ...DEFAULT_CONFIG.tracker.predict, adsbLatencySec: 0, motorLatencySec: 0.2 },
 };
 
 /** 250 kt northbound at 2500 m, dead over the site (closest approach t≈90s). */
@@ -79,8 +82,8 @@ describe("planPass", () => {
 describe("zenith crossing, end to end with a rate-limited camera", () => {
   it("keeps the plane in frame through a direct overhead pass", () => {
     const history = new TrackHistory();
-    const az = new AxisTracker(true, CFG.predict.alpha, CFG.predict.beta);
-    const el = new AxisTracker(false, CFG.predict.alpha, CFG.predict.beta);
+    const az = new AxisTracker(true);
+    const el = new AxisTracker(false);
     const dt = 1 / CFG.predict.commandHz;
 
     // Physical camera model: follows the commanded setpoint at axis limits.
@@ -94,6 +97,7 @@ describe("zenith crossing, end to end with a rate-limited camera", () => {
     let lastFixSec = -1;
     let worstSep = 0; // worst (boresight-to-plane) / (hfov/2) while el > 30°
     let usedHold = false;
+    let latched = false;
 
     for (let tMs = 30_000; tMs <= 160_000; tMs += 1000 / CFG.predict.commandHz) {
       const tSec = tMs / 1000;
@@ -106,14 +110,18 @@ describe("zenith crossing, end to end with a rate-limited camera", () => {
         lon: overheadFix(tSec).lon!,
         altM: 2500,
       });
-      const hold = zenithHold(plan, truthNow.elDeg);
+      const hold = zenithHold(plan, truthNow.elDeg, latched);
+      if (hold?.phase === "park") latched = true;
+      else if (!hold) latched = false;
 
       let cmdAz: number;
       let cmdEl: number;
       if (hold) {
         usedHold = true;
         cmdAz = hold.azDeg;
-        cmdEl = hold.elDeg;
+        // Phase "park": tilt just under vertical for the fly-through.
+        // Phase "follow": pan stays parked, tilt tracks the plane down.
+        cmdEl = hold.phase === "park" ? hold.elDeg : truthNow.elDeg;
         az.reset(cmdAz);
         el.reset(cmdEl);
         lastFixSec = -1;
@@ -145,6 +153,9 @@ describe("zenith crossing, end to end with a rate-limited camera", () => {
         let hfov = chooseZoom(ac, truthNow, CFG, 0).hfovDeg;
         if (hold) hfov = Math.max(hfov, ZENITH_MIN_HFOV);
         const sep = angularSepDeg(bore.azDeg, bore.elDeg, truthNow.azDeg, truthNow.elDeg);
+        if (sep / (hfov / 2) > worstSep && process.env.PLANNER_DEBUG) {
+          console.log(`t=${tSec.toFixed(1)} el=${truthNow.elDeg.toFixed(1)} hold=${hold?.phase ?? "-"} sep=${sep.toFixed(1)} hfov=${hfov.toFixed(0)} cam=(${camPan.toFixed(0)},${camTilt.toFixed(0)}) goal=(${goal.panDeg.toFixed(0)},${goal.tiltDeg.toFixed(0)})`);
+        }
         worstSep = Math.max(worstSep, sep / (hfov / 2));
       }
     }
@@ -153,9 +164,74 @@ describe("zenith crossing, end to end with a rate-limited camera", () => {
     expect(worstSep).toBeLessThan(1); // plane never left the frame
   });
 
-  it("regime boundary is consistent with the hold trigger", () => {
-    const plan = planPass(overheadFix(60), SITE, 60_000);
-    expect(zenithHold(plan, ZENITH_REGIME_EL + 1)).not.toBeNull();
-    expect(zenithHold(plan, ZENITH_REGIME_EL - 1)).toBeNull();
+  it("parks on time inbound, follows inside the cone outbound", () => {
+    // Far out: no hold yet, whatever the elevation says.
+    const far = planPass(overheadFix(60), SITE, 60_000);
+    expect(far?.tCaSec).toBeGreaterThan(ZENITH_PRE_SEC);
+    expect(zenithHold(far, ZENITH_REGIME_EL + 1)).toBeNull();
+    // Just before closest approach: park.
+    const tCa = far!.tCaSec;
+    const near = planPass(overheadFix(60 + Math.floor(tCa) - 2), SITE, (60 + Math.floor(tCa) - 2) * 1000);
+    expect(zenithHold(near, 50)?.phase).toBe("park");
+    // Past closest approach: follow while above the regime line, then release.
+    const past = planPass(overheadFix(60 + Math.ceil(tCa) + 3), SITE, (60 + Math.ceil(tCa) + 3) * 1000);
+    expect(past?.tCaSec).toBeLessThanOrEqual(0);
+    // (the forward-looking plan no longer sees the peak — the latch carries it)
+    expect(zenithHold(past, ZENITH_REGIME_EL + 1, true)?.phase).toBe("follow");
+    expect(zenithHold(past, ZENITH_REGIME_EL - 1, true)).toBeNull();
+    expect(zenithHold(past, ZENITH_REGIME_EL + 1, false)).toBeNull();
+  });
+});
+
+describe("planPass pan dead-zone crossing", () => {
+  const MOUNT = DEFAULT_CONFIG.tracker.mount; // panOffset 0: gap at world az 180±5
+  const WRAP = { mount: MOUNT, panMinDeg: -175, panMaxDeg: 175 };
+  /** 250 kt westbound, 5 km south of the site: azimuth sweeps through 180°. */
+  function southFix(): Aircraft {
+    const start = { lat: SITE.lat - 0.045, lon: SITE.lon + 0.25, altM: 2500 };
+    return {
+      hex: "south", typeCode: "A320", lat: start.lat, lon: start.lon,
+      altGeom: start.altM / FT_TO_M, gs: 250, track: 270, baroRate: 0, ts: 0, seen: 0,
+    };
+  }
+  it("reports entry/exit times and the far-side pan for a crossing", () => {
+    const plan = planPass(southFix(), SITE, 0, 240, 0.5, WRAP)!;
+    expect(plan.wrapInSec).not.toBeNull();
+    expect(plan.wrapOutSec).not.toBeNull();
+    expect(plan.wrapOutSec!).toBeGreaterThan(plan.wrapInSec!);
+    // Westbound south of the site: az runs 90→180→270, pan +175 → −175.
+    expect(plan.wrapExitPanDeg!).toBeLessThan(-170);
+    expect(plan.wrapExitPanDeg!).toBeGreaterThanOrEqual(-175);
+    // Entry really is the first out-of-range step.
+    const geo = { lat: southFix().lat, lon: southFix().lon, altM: 2500, gsKt: 250, trackDeg: 270 };
+    const before = mountFromWorld(
+      azElFromSite(SITE, predictGeo(geo, plan.wrapInSec! - 0.5)).azDeg, 10, MOUNT,
+    ).panDeg;
+    const at = mountFromWorld(
+      azElFromSite(SITE, predictGeo(geo, plan.wrapInSec!)).azDeg, 10, MOUNT,
+    ).panDeg;
+    expect(Math.abs(before)).toBeLessThanOrEqual(175);
+    expect(Math.abs(at)).toBeGreaterThan(175);
+  });
+  it("is null for a pass that never reaches the gap", () => {
+    const plan = planPass(overheadFix(0), SITE, 0, 120, 0.5, WRAP)!; // northbound through az 0/180? overhead: az 180→0 via zenith
+    // Overhead northbound: az jumps 180→0 through the zenith at el≈90, where
+    // pan is ±180 for an instant — but the plane is in range again at once on
+    // the SAME side only if it came back; here it does cross. Use a plane
+    // flying north well east of the site instead.
+    const eastGeo = { lat: SITE.lat - 0.3, lon: SITE.lon + 0.12, altM: 3000 };
+    const ac: Aircraft = {
+      hex: "east", typeCode: "A320", lat: eastGeo.lat, lon: eastGeo.lon,
+      altGeom: eastGeo.altM / FT_TO_M, gs: 250, track: 0, baroRate: 0, ts: 0, seen: 0,
+    };
+    const p2 = planPass(ac, SITE, 0, 240, 0.5, WRAP)!;
+    expect(p2.wrapOutSec).toBeNull();
+    expect(p2.wrapExitPanDeg).toBeNull();
+    expect(plan).toBeTruthy();
+  });
+  it("leaves the wrap fields null without wrap options", () => {
+    const plan = planPass(southFix(), SITE, 0)!;
+    expect(plan.wrapInSec).toBeNull();
+    expect(plan.wrapOutSec).toBeNull();
   });
 });

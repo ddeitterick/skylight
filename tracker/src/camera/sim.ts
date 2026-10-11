@@ -23,7 +23,6 @@ export class SimCamera implements CameraDriver {
 
   private pose: CameraPose;
   private goal: CameraPose | null = null;
-  private goalSpeeds = { panDps: Infinity, tiltDps: Infinity };
   private zoomGoal: number | null = null;
   private jogRates = { pan: 0, tilt: 0, zoom: 0 };
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -46,16 +45,12 @@ export class SimCamera implements CameraDriver {
     this.timer = null;
   }
 
-  gotoAbsolute(pose: CameraPose, speeds?: { panDps?: number; tiltDps?: number }): void {
+  gotoAbsolute(pose: CameraPose): void {
     this.commands++;
     const clamped = clampPose(pose, this.limits, this.units);
     setTimeout(() => {
       this.jogRates = { pan: 0, tilt: 0, zoom: 0 };
       this.goal = clamped;
-      this.goalSpeeds = {
-        panDps: speeds?.panDps ?? this.limits.panSpeedMaxDps,
-        tiltDps: speeds?.tiltDps ?? this.limits.tiltSpeedMaxDps,
-      };
     }, LATENCY_MS);
   }
 
@@ -65,6 +60,10 @@ export class SimCamera implements CameraDriver {
       this.goal = null;
       this.jogRates = { pan, tilt, zoom };
     }, LATENCY_MS);
+  }
+
+  getDitherRipple(): { panDeg: number; tiltDeg: number } {
+    return { panDeg: 0, tiltDeg: 0 };
   }
 
   trackRate(panDps: number, tiltDps: number): void {
@@ -123,10 +122,10 @@ export class SimCamera implements CameraDriver {
     const zoomRate = zoomSpan / ZOOM_TRAVERSE_SEC; // units/s
 
     if (this.goal) {
-      const panDps = Math.min(this.goalSpeeds.panDps, this.limits.panSpeedMaxDps);
-      const tiltDps = Math.min(this.goalSpeeds.tiltDps, this.limits.tiltSpeedMaxDps);
-      this.pose.panDeg = approach(this.pose.panDeg, this.goal.panDeg, panDps * dt);
-      this.pose.tiltDeg = approach(this.pose.tiltDeg, this.goal.tiltDeg, tiltDps * dt);
+      const panStep = this.limits.panSpeedMaxDps * dt;
+      const tiltStep = this.limits.tiltSpeedMaxDps * dt;
+      this.pose.panDeg = approach(this.pose.panDeg, this.goal.panDeg, panStep);
+      this.pose.tiltDeg = approach(this.pose.tiltDeg, this.goal.tiltDeg, tiltStep);
       this.pose.zoomUnits = approach(
         this.pose.zoomUnits, this.goal.zoomUnits, zoomRate * dt);
     } else {

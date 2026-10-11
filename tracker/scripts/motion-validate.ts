@@ -1,7 +1,11 @@
 // Offline validation of camera-motion-compensated detection on REAL clip frames.
 // Decodes consecutive frames, estimates the background shift, computes the
 // residual, and reports/visualizes the moving blob (the plane) vs the static
-// clutter (power lines, clouds, rooftops). Run: tsx tracker/scripts/motion-validate.ts <dir>
+// clutter (power lines, clouds, rooftops).
+//
+// When: tuning vision/motion.ts against frames exported from a real clip
+// (ffmpeg -i clip.mp4 <dir>/%04d.png).
+//   pnpm exec tsx scripts/motion-validate.ts <dir of .png frames>
 
 import sharp from "sharp";
 import { readdirSync } from "node:fs";

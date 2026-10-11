@@ -38,6 +38,18 @@ export interface CameraLimits {
   tiltMaxDeg: number;
   panSpeedMaxDps: number;
   tiltSpeedMaxDps: number;
+  /**
+   * Per-azimuth clear-sky horizon (world az → lowest usable elevation), from
+   * a low-elevation survey of the camera's surroundings. Interpolated around
+   * the circle; targets below it are not selected and the aim never points
+   * below it. Empty/absent = flat (minElevationDeg / tiltMinDeg only).
+   */
+  horizon?: HorizonPoint[];
+}
+
+export interface HorizonPoint {
+  azDeg: number;
+  minElDeg: number;
 }
 
 /**
@@ -182,16 +194,21 @@ export interface VisionState {
     spanAzDeg: number;
     spanElDeg: number;
   };
-  /** Neural detector status. */
-  net?: {
-    enabled: boolean;
-    /** Model loaded and inferring. */
-    ready: boolean;
-    /** Airplane detections in the most recent net frame. */
-    detections: number;
-    /** Load/inference error, if any (e.g. model not yet downloaded). */
-    error?: string;
-  };
+}
+
+/** Pass archive (automatic per-pass clip + telemetry recorder/uploader). */
+export interface PassArchiveStatus {
+  /** A pass is being recorded right now. */
+  recording: boolean;
+  /** Id of the pass being recorded (`<UTC start>-<hex>`), else null. */
+  passId: string | null;
+  /** Finished passes waiting to upload (including the one in flight). */
+  queued: number;
+  /** Pass id currently uploading, else null. */
+  uploading: string | null;
+  lastUploadedId: string | null;
+  /** Most recent recorder/upload error, else null. */
+  lastError: string | null;
 }
 
 /** Everything the debug UI needs, broadcast ~5–10 Hz. */
@@ -221,6 +238,8 @@ export interface TrackerState {
   recording: boolean;
   /** Full-quality clip recorder state (separate from the JSONL telemetry one). */
   videoRec: { recording: boolean; file?: string; startedAt?: number };
+  /** Automatic pass archive (clip + series + pass.json per tracked pass). */
+  archive: PassArchiveStatus;
   video: {
     running: boolean;
     error?: string;

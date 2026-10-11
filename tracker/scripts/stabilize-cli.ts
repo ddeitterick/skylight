@@ -1,4 +1,9 @@
-// Offline test: tsx tracker/scripts/stabilize-cli.ts <in.mp4> <out.mp4>
+// Offline run of the clip stabilizer (video/stabilize.ts — the same pass the
+// clip recorder applies to finished recordings): writes a plane-centred
+// version of a clip, using its .track.json sidecar when present.
+//
+// When: tuning the stabilizer, or re-rendering an old recording.
+//   pnpm exec tsx scripts/stabilize-cli.ts <in.mp4> <out.mp4>
 import { stabilizeClip } from "../src/video/stabilize.js";
 
 const [, , src, out] = process.argv;

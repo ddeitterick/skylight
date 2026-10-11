@@ -22,11 +22,30 @@ interface Client {
   awaitingFragment: boolean;
 }
 
+/**
+ * In-process observer of the parsed box stream (the pass recorder). Called
+ * with every top-level box in arrival order — `ftyp`/`moov` included, AFTER
+ * the init segment has been (re)assembled from them — plus the ffmpeg
+ * generation, which increments on every (re)spawn.
+ */
+export type Mp4Tap = (type: string, box: Buffer, gen: number) => void;
+
+/** The current init segment (ftyp+moov) and what it declares. */
+export interface Mp4Init {
+  segment: Buffer;
+  codec: string;
+  /** Video track timescale (ticks/s) from `mdhd`, for fragment timing. */
+  timescale: number | null;
+  gen: number;
+}
+
 export class Mp4Stream {
   private proc: ChildProcess | null = null;
   private buffer = Buffer.alloc(0);
   private initSegment: Buffer | null = null;
   private codec: string | null = null;
+  private timescale: number | null = null;
+  private taps = new Set<Mp4Tap>();
   private clients = new Set<Client>();
   private wss: WebSocketServer | null = null;
   private restartTimer: ReturnType<typeof setTimeout> | null = null;
@@ -96,12 +115,36 @@ export class Mp4Stream {
     return { running: this.proc !== null && fresh, gen: this.generation, error: this.lastError };
   }
 
+  /**
+   * Observe the box stream in-process (no extra RTSP session — a second pull
+   * from the camera visibly froze the live stream). Returns the unsubscribe.
+   * A tap that throws is dropped so it can never take the relay down.
+   */
+  tap(fn: Mp4Tap): () => void {
+    this.taps.add(fn);
+    return () => {
+      this.taps.delete(fn);
+    };
+  }
+
+  /** The init segment of the CURRENT generation, once its moov has arrived. */
+  init(): Mp4Init | null {
+    if (!this.initSegment || !this.codec) return null;
+    return {
+      segment: this.initSegment,
+      codec: this.codec,
+      timescale: this.timescale,
+      gen: this.generation,
+    };
+  }
+
   private spawnProc(): void {
     if (this.proc || this.stopped) return;
     this.generation++;
     // Fresh stream epoch: clients must rejoin at the new init segment.
     this.initSegment = null;
     this.codec = null;
+    this.timescale = null;
     this.buffer = Buffer.alloc(0);
     for (const c of this.clients) c.awaitingFragment = true;
 
@@ -142,6 +185,17 @@ export class Mp4Stream {
     this.buffer = Buffer.alloc(0);
   }
 
+  private notifyTaps(type: string, box: Buffer): void {
+    for (const fn of this.taps) {
+      try {
+        fn(type, box, this.generation);
+      } catch (err) {
+        this.taps.delete(fn);
+        console.error(`[mse] tap threw — dropped: ${String(err)}`);
+      }
+    }
+  }
+
   /** Split the byte stream into top-level MP4 boxes. */
   private onData(chunk: Buffer): void {
     this.lastDataAt = Date.now();
@@ -170,10 +224,12 @@ export class Mp4Stream {
   private onBox(type: string, box: Buffer): void {
     if (type === "ftyp") {
       this.initSegment = box;
+      this.notifyTaps(type, box);
       return;
     }
     if (type === "moov") {
       this.codec = extractAvcCodec(box) ?? "avc1.640028";
+      this.timescale = extractTimescale(box);
       this.initSegment = this.initSegment ? Buffer.concat([this.initSegment, box]) : box;
       // (Re)prime everyone with the fresh init segment.
       for (const c of this.clients) {
@@ -182,8 +238,10 @@ export class Mp4Stream {
         c.ws.send(this.initSegment);
         c.awaitingFragment = true;
       }
+      this.notifyTaps(type, box);
       return;
     }
+    this.notifyTaps(type, box);
     // Fragments: moof starts a clean join point; forward moof+mdat runs.
     for (const c of this.clients) {
       if (c.ws.readyState !== WebSocket.OPEN) continue;
@@ -198,6 +256,18 @@ export class Mp4Stream {
       c.ws.send(box);
     }
   }
+}
+
+/** Video track timescale from the first `mdhd` inside moov (null if odd). */
+export function extractTimescale(moov: Buffer): number | null {
+  const idx = moov.indexOf("mdhd");
+  if (idx < 4) return null;
+  const start = idx - 4;
+  const version = moov[idx + 4];
+  const off = start + (version === 1 ? 28 : 20);
+  if (off + 4 > moov.length) return null;
+  const ts = moov.readUInt32BE(off);
+  return ts > 0 ? ts : null;
 }
 
 /** codec string from the avcC record inside moov: avc1.PPCCLL (hex). */

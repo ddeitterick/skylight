@@ -3,6 +3,9 @@
 // would do with the same samples. Reads an autocal.json + mount model pulled
 // from the Pi — no camera, no network.
 //
+// When: auto-calibration stops improving (rms stuck high) or applies a model
+// that looks wrong — to see whether the residuals are structure the mount
+// model can fit (level, gains) or junk samples.
 //   pnpm exec tsx scripts/cal-analyze.ts /tmp/autocal.json '<mount json>'
 
 import fs from "node:fs";

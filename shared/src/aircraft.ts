@@ -31,6 +31,13 @@ export interface Aircraft {
 
   /** Seconds since the last message for this aircraft (from the source). */
   seen?: number;
+  /** Seconds since the last POSITION update (dump1090/readsb `seen_pos`).
+   *  Velocity/altitude messages keep `seen` fresh while the position can
+   *  sit unchanged for tens of seconds (observed 56 polls for a low plane
+   *  in the antenna's overhead null) — anything dead-reckoning from the fix
+   *  must age it by THIS, not by `seen`. Undefined when the source doesn't
+   *  report it (then `seen` is the best available estimate). */
+  seenPos?: number;
   /** Signal strength, dBFS (radio only). */
   rssi?: number;
 

@@ -185,6 +185,37 @@ export function aircraftGeoPoint(ac: Aircraft): GeoPoint | null {
 }
 
 /**
+ * Age of the aircraft's POSITION fix, seconds: the snapshot's age plus the
+ * source's own position age (`seen_pos`), falling back to the message age.
+ * This is the time the fix must be dead-reckoned forward by.
+ */
+export function fixAgeSec(ac: Aircraft, now: number): number {
+  const snapAge = Math.max(0, (now - (ac.ts ?? now)) / 1000);
+  return snapAge + (ac.seenPos ?? ac.seen ?? 0);
+}
+
+/**
+ * Age of the last message of ANY kind, seconds — "is the plane still being
+ * heard?" (position staleness is fixAgeSec).
+ */
+export function msgAgeSec(ac: Aircraft, now: number): number {
+  const snapAge = Math.max(0, (now - (ac.ts ?? now)) / 1000);
+  return snapAge + (ac.seen ?? 0);
+}
+
+/**
+ * Epoch ms at which the position was actually measured. Stable (to the
+ * source's ~0.1 s resolution) across polls that merely repeat a stale fix,
+ * so filters can recognise "same fix again" — compare with SAME_FIX_MS
+ * tolerance, never for equality.
+ */
+export function fixTimeMs(ac: Aircraft, now: number): number {
+  return (ac.ts ?? now) - (ac.seenPos ?? ac.seen ?? 0) * 1000;
+}
+/** Two fix times closer than this are the same fix re-reported. */
+export const SAME_FIX_MS = 300;
+
+/**
  * Dead-reckon a target dtSec into the future: along-track at ground speed
  * (arc integration when turning), vertical rate held. Mirrors geo.ts
  * deadReckon conventions, but in geodetic coordinates and with altitude.
@@ -291,7 +322,7 @@ export class AxisTracker {
    * analytically by the predictor), passing it as `rateHint` eliminates the
    * filter's acceleration lag — the residual only trims the remainder.
    */
-  observe(target: number, dtFixSec: number, rateHint?: number): void {
+  observe(target: number, dtFixSec: number, rateHint?: number, maxStepDeg = Infinity): void {
     if (!this.initialized) {
       this.pos = target;
       this.rate = rateHint ?? 0;
@@ -299,7 +330,12 @@ export class AxisTracker {
       return;
     }
     const resid = this.wrap ? norm180(target - this.pos) : target - this.pos;
-    this.pos += this.alpha * resid;
+    // `maxStepDeg` bounds the positional jump per observation: a far plane
+    // heard every ~5 s dead-reckons 5 s and then snaps 1.6° when the fix
+    // lands — 40% of a 4° frame (SKW4632). The remainder is folded in by
+    // the following observations; the rate term still sees the full residual.
+    const step = Math.max(-maxStepDeg, Math.min(maxStepDeg, this.alpha * resid));
+    this.pos += step;
     if (this.wrap) this.pos = norm360(this.pos);
     if (rateHint != null) {
       this.rate = rateHint + (dtFixSec > 0.05 ? (this.beta / dtFixSec) * resid : 0);
@@ -580,4 +616,37 @@ export function requiredHfovDeg(
   const framing = (angularSize / fillFrac) * (16 / 9);
   const pointing = 2 * (2 * sigmaDeg + angularSize / 2);
   return Math.max(framing, pointing);
+}
+
+// ---------------------------------------------------------------------------
+// Clear-sky horizon
+// ---------------------------------------------------------------------------
+
+/**
+ * Lowest usable elevation at `azDeg` from a per-azimuth horizon survey,
+ * linearly interpolated around the circle. `fallback` when the survey is
+ * empty or absent.
+ */
+export function horizonMinEl(
+  horizon: { azDeg: number; minElDeg: number }[] | undefined,
+  azDeg: number,
+  fallback: number,
+): number {
+  if (!horizon || horizon.length === 0) return fallback;
+  if (horizon.length === 1) return horizon[0].minElDeg;
+  const pts = [...horizon]
+    .map((p) => ({ az: norm360(p.azDeg), el: p.minElDeg }))
+    .sort((a, b) => a.az - b.az);
+  const az = norm360(azDeg);
+  // Neighbours around the circle.
+  let lo = pts[pts.length - 1];
+  let hi = pts[0];
+  for (let i = 0; i < pts.length; i++) {
+    if (pts[i].az <= az) lo = pts[i];
+    if (pts[i].az > az) { hi = pts[i]; break; }
+    if (i === pts.length - 1) hi = pts[0];
+  }
+  const span = norm360(hi.az - lo.az) || 360;
+  const f = norm360(az - lo.az) / span;
+  return lo.el + f * (hi.el - lo.el);
 }

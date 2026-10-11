@@ -92,27 +92,11 @@ export function ConfigPanel({
       </div>
 
       <div className="cfg-group">
-        <div className="cfg-title">pursuit</div>
-        <div className="segmented">
-          {(["carrot", "velocity"] as const).map((p) => (
-            <button key={p} className={`segment ${config.predict.pursuit === p ? "active" : ""}`}
-              onClick={() => conn.send({ type: "patchTracker", patch: { predict: { pursuit: p } } })}>
-              {p}
-            </button>
-          ))}
-        </div>
-        <Num label="horizon s" value={config.predict.carrotHorizonSec} step={0.1}
-          onCommit={(v) => conn.send({ type: "patchTracker", patch: { predict: { carrotHorizonSec: v } } })} />
-      </div>
-
-      <div className="cfg-group">
         <div className="cfg-title">prediction</div>
         <Num label="latency s" value={config.predict.adsbLatencySec} step={0.1}
           onCommit={(v) => conn.send({ type: "patchTracker", patch: { predict: { adsbLatencySec: v } } })} />
         <Num label="max lead s" value={config.predict.maxLeadSec} step={0.5}
           onCommit={(v) => conn.send({ type: "patchTracker", patch: { predict: { maxLeadSec: v } } })} />
-        <Num label="deadband°" value={config.predict.deadbandDeg} step={0.01}
-          onCommit={(v) => conn.send({ type: "patchTracker", patch: { predict: { deadbandDeg: v } } })} />
       </div>
 
       <div className="cfg-group">

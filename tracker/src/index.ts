@@ -3,6 +3,7 @@
 
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
+import type { PassArchiveStatus, TrackerState } from "@shared/index.js";
 import type { CameraDriver } from "./camera/driver.js";
 import { SimCamera } from "./camera/sim.js";
 import { ViscaCamera } from "./camera/visca.js";
@@ -13,6 +14,9 @@ import { ReplayUpstream, WsUpstream, type Upstream } from "./upstream.js";
 import { Mp4Stream } from "./video/mse.js";
 import { VideoStream } from "./video/stream.js";
 import { VideoRecorder } from "./video/recorder.js";
+import { PassArchive } from "./passes/archive.js";
+import { detectBuild, envBuild } from "./passes/build.js";
+import { PassUploader } from "./passes/uploader.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -22,6 +26,8 @@ const SERVER_WS = process.env.SERVER_WS ?? "ws://localhost:3000/ws";
 const REPLAY = process.env.TRACKER_REPLAY;
 const SESSIONS_DIR = resolve(__dirname, "../data/sessions");
 const RECORDINGS_DIR = resolve(__dirname, "../data/recordings");
+const PASSES_DIR = resolve(__dirname, "../data/passes");
+const REPO_DIR = resolve(__dirname, "../..");
 
 function rtspUrl(template: string, ip: string): string {
   return template.replace("{ip}", ip);
@@ -93,6 +99,27 @@ async function main(): Promise<void> {
   const mse = new Mp4Stream(rtspUrl(initial.rtspUrl, initial.cameraIp));
   const videoRec = new VideoRecorder(RECORDINGS_DIR, rtspUrl(initial.rtspUrl, initial.cameraIp));
 
+  // Pass archive: every tracked pass -> clip (tapped off the MSE relay, no
+  // second RTSP session) + series.json + pass.json, uploaded to the archive
+  // Worker. Env: PASS_ARCHIVE_URL, PASS_ARCHIVE_KEY, PASS_ARCHIVE_KEEP_LOCAL.
+  let build = envBuild();
+  const uploader = new PassUploader(PASSES_DIR, {
+    url: process.env.PASS_ARCHIVE_URL,
+    key: process.env.PASS_ARCHIVE_KEY || null,
+  });
+  const keepLocal = Number(process.env.PASS_ARCHIVE_KEEP_LOCAL);
+  const archive = new PassArchive({
+    dir: PASSES_DIR,
+    source: mse,
+    getState: (): TrackerState | null => loop.getState(),
+    find: (hex) => upstream.find(hex),
+    config: () => upstream.getConfig().tracker,
+    build: () => build,
+    codec: () => mse.init()?.codec ?? null,
+    uploader,
+    keepLocal: Number.isFinite(keepLocal) && keepLocal > 0 ? keepLocal : undefined,
+  });
+
   const loop = new ControlLoop(
     upstream,
     getDriver,
@@ -102,13 +129,20 @@ async function main(): Promise<void> {
     () => mse.status(),
     () => videoRec.status(),
     (cx, cy, t) => videoRec.noteDetection(cx, cy, t),
+    (): PassArchiveStatus => archive.status(),
   );
+  loop.onEvent((e) => archive.onLoopEvent(e));
 
   const hub = new TrackerHub(loop, upstream, recorder, video, videoRec);
 
   upstream.start();
   getDriver(); // instantiate per current config
   loop.start();
+  archive.start();
+  void detectBuild(REPO_DIR).then((b) => {
+    build = b;
+    console.log(`[passes] build ${b.version}${b.label ? ` (${b.label})` : ""}, local dir ${PASSES_DIR}`);
+  });
   // Only pull RTSP when we're actually driving the real camera.
   if (initial.driver === "visca") {
     video.start();
@@ -144,8 +178,14 @@ async function main(): Promise<void> {
     } catch {
       /* best effort — exiting anyway */
     }
-    // Leave time for the stop datagrams to flush.
-    setTimeout(() => process.exit(0), 250);
+    // Finalize an in-progress pass (series/pass.json + the ffmpeg remux, a
+    // second or two) — bounded, so a wedged ffmpeg can't hold the restart.
+    const exitAt = Date.now() + 250; // leave time for the stop datagrams to flush
+    const archiveDone = archive.stop().catch(() => {});
+    const bound = new Promise<void>((r) => setTimeout(r, 8000));
+    void Promise.race([archiveDone, bound]).then(() => {
+      setTimeout(() => process.exit(0), Math.max(0, exitAt - Date.now()));
+    });
   };
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));

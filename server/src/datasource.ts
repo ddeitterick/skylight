@@ -25,10 +25,17 @@ interface RawAircraft {
   r?: string;
   t?: string;
   seen?: number;
+  seen_pos?: number;
   rssi?: number;
 }
 
-function normalize(raw: RawAircraft, ts: number): Aircraft | null {
+/**
+ * `jsonAgeSec`: how old the source document was when we read it (readsb
+ * writes `now`; dump1090 rewrites the file on an interval, so a poll can land
+ * up to a full interval after the write). Folded into both ages so the
+ * tracker's dead-reckoning sees the true latency, not just the file's view.
+ */
+export function normalize(raw: RawAircraft, ts: number, jsonAgeSec = 0): Aircraft | null {
   if (!raw.hex) return null;
   const onGround = raw.alt_baro === "ground";
   return {
@@ -46,7 +53,8 @@ function normalize(raw: RawAircraft, ts: number): Aircraft | null {
     onGround,
     registration: raw.r,
     typeCode: raw.t,
-    seen: raw.seen,
+    seen: raw.seen != null ? raw.seen + jsonAgeSec : undefined,
+    seenPos: raw.seen_pos != null ? raw.seen_pos + jsonAgeSec : undefined,
     rssi: raw.rssi,
     ts,
   };
@@ -307,9 +315,15 @@ export class Poller {
     try {
       const json = await fetchJson(url);
       const rawList: RawAircraft[] = json.aircraft ?? json.ac ?? [];
+      // Document age at read time (readsb `now` is epoch seconds). Clamped:
+      // an aggregator's clock skew must not turn into phantom staleness.
+      const jsonAgeSec =
+        typeof json.now === "number"
+          ? Math.min(2, Math.max(0, now / 1000 - json.now))
+          : 0;
       const list: Aircraft[] = [];
       for (const raw of rawList) {
-        const ac = normalize(raw, now);
+        const ac = normalize(raw, now, jsonAgeSec);
         if (ac) list.push(ac);
       }
       // Area APIs sometimes return a far wider box than the radius we asked

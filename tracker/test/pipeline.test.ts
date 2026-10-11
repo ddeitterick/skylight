@@ -21,7 +21,9 @@ const SITE: GeoPoint = { lat: 37.6213, lon: -122.379, altM: 0 };
 // Synthetic fixes are truth-instant: no decode latency to compensate.
 const CFG = {
   ...DEFAULT_CONFIG.tracker,
-  predict: { ...DEFAULT_CONFIG.tracker.predict, adsbLatencySec: 0 },
+  // motorLatencySec: the loop passes a per-axis latency; 0.2 s is what
+  // these simulations were tuned with.
+  predict: { ...DEFAULT_CONFIG.tracker.predict, adsbLatencySec: 0, motorLatencySec: 0.2 },
 };
 
 /** Simulate a 737 passing 600 m north of the site at 3000 m, 250 kt, heading east. */
@@ -53,8 +55,8 @@ function passFix(tSec: number): Aircraft {
 describe("pipeline on a synthetic pass", () => {
   it("stays smooth, in-limits, and keeps the plane in frame", () => {
     const history = new TrackHistory();
-    const az = new AxisTracker(true, CFG.predict.alpha, CFG.predict.beta);
-    const el = new AxisTracker(false, CFG.predict.alpha, CFG.predict.beta);
+    const az = new AxisTracker(true);
+    const el = new AxisTracker(false);
 
     const dt = 1 / CFG.predict.commandHz;
     let pose = { panDeg: 0, tiltDeg: 0 };

@@ -5,6 +5,9 @@ import {
   MI_TO_M,
   aircraftGeoPoint,
   azElFromSite,
+  fixAgeSec,
+  horizonMinEl,
+  msgAgeSec,
   type Aircraft,
   type AzEl,
   type Candidate,
@@ -26,11 +29,6 @@ export interface CurrentTarget {
 function score(ac: Aircraft, azEl: AzEl, mode: TargetMode, c: TargetCriteria): { s: number; note: string } {
   const rangeFrac = Math.max(0, 1 - azEl.slantM / (c.maxRangeMi * MI_TO_M));
   switch (mode) {
-    case "overhead": {
-      // Best filming geometry: high elevation, close.
-      const s = azEl.elDeg / 90 + 0.3 * rangeFrac;
-      return { s, note: `el ${azEl.elDeg.toFixed(0)}°` };
-    }
     case "closest": {
       // Plain nearest-by-slant-range.
       const s = 2 * rangeFrac;
@@ -44,12 +42,14 @@ function score(ac: Aircraft, azEl: AzEl, mode: TargetMode, c: TargetCriteria): {
       const s = rangeFrac + vertical + low + 0.15 * (azEl.elDeg / 90);
       return { s, note: vr < -300 ? "descending" : vr > 300 ? "climbing" : "level" };
     }
+    case "overhead":
     case "sticky":
     default: {
-      // Same geometry score as overhead; stickiness handled by the holder.
-      // `default` keeps score() total — a stale config.json can carry a mode
-      // string this build doesn't know, and crashing the loop on it is worse
-      // than filming the overhead-best plane (#22).
+      // Best filming geometry: high elevation, close. Sticky scores the same
+      // (its stickiness lives in selectTarget). `default` keeps score() total
+      // — a stale config.json can carry a mode string this build doesn't
+      // know, and crashing the loop on it is worse than filming the
+      // overhead-best plane (#22).
       const s = azEl.elDeg / 90 + 0.3 * rangeFrac;
       return { s, note: `el ${azEl.elDeg.toFixed(0)}°` };
     }
@@ -70,6 +70,8 @@ export function selectTarget(
   mode: TargetMode,
   c: TargetCriteria,
   staleSec = 15,
+  posStaleSec = 30,
+  horizon?: { azDeg: number; minElDeg: number }[],
 ): Selection {
   const candidates: Candidate[] = [];
 
@@ -77,16 +79,21 @@ export function selectTarget(
     if (ac.onGround) continue;
     const altFt = ac.altGeom ?? ac.altBaro;
     if (altFt == null || altFt < c.minAltFt) continue;
-    const fixAge = (now - (ac.ts ?? 0)) / 1000 + (ac.seen ?? 0);
-    if (fixAge > staleSec) continue;
+    // Still being heard, and the position not too old to dead-reckon: a
+    // plane in the antenna's overhead null keeps sending velocity/altitude
+    // while its position goes quiet for tens of seconds — worth following by
+    // dead reckoning (vision holds the lock) up to a point.
+    if (msgAgeSec(ac, now) > staleSec) continue;
+    if (fixAgeSec(ac, now) > posStaleSec) continue;
     const geo = aircraftGeoPoint(ac);
     if (!geo) continue;
     const azEl = azElFromSite(site, geo);
     if (azEl.elDeg < c.minElevationDeg) continue;
+    // Per-azimuth clear-sky horizon (+1° so the frame's lower edge at tele
+    // stays above the roofline/trees).
+    if (azEl.elDeg < horizonMinEl(horizon, azEl.azDeg, -90) + 1) continue;
     if (azEl.slantM > c.maxRangeMi * MI_TO_M) continue;
-    const scored = score(ac, azEl, mode, c);
-    if (!scored) continue;
-    const { s, note } = scored;
+    const { s, note } = score(ac, azEl, mode, c);
     candidates.push({
       hex: ac.hex,
       flight: ac.flight,

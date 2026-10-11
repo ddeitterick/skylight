@@ -61,13 +61,12 @@ for your location and time. Tune everything from your phone.
   Includes a **TV dashboard** (`/tv.html`) with the live feed + radar inset, and a full
   **debug UI** (`/tracker.html`) with jog pad, target table, and a star-capture
   calibration wizard.
-- **Vision that knows a plane from a cloud** - the camera tracker fuses three signals:
-  a classical blob detector (distant specks) + a large-object detector (big overhead
-  planes), **track-before-detect** that picks the target by how it *moves* through the
-  world like ADS-B predicts (clouds are world-static and lose), and an **optional
-  neural airplane detector** (YOLOX-Nano ONNX, downloaded at setup) for a semantic
-  "is it an airplane?" confirmation. It also **continuously self-calibrates** the mount
-  from every locked pass, so the aim re-squares itself over time.
+- **Vision that knows a plane from a cloud** - the camera tracker cancels the camera's
+  own motion between frames, so the static sky, clouds and rooftops subtract away and
+  whatever *moved* is left; **track-before-detect** then picks the target by how it
+  moves through the world like ADS-B predicts (clouds are world-static and lose). It
+  also **continuously self-calibrates** the mount from every locked pass, so the aim
+  re-squares itself over time.
 - **Appliance-ready** - boots straight to a full-screen kiosk on a Raspberry Pi 5
   (dual-output: projector + TV dashboard).
 
@@ -110,9 +109,9 @@ There are two workloads, and they have very different requirements:
   **Pi 3B / Pi Zero 2 W** will work for the display if you keep the canvas modest - cap
   `maxFps` (e.g. 30), trim `trailSeconds`, and lean on `DATA_SOURCE=api` so the Pi isn't
   also running `dump1090`. 1 GB is workable but tight; 2 GB+ is the comfortable floor.
-- **The optional sky-camera tracker (vision + neural detector).** This is the heavy part
-  and is what the **Pi 5 (8 GB)** recommendation is for - real-time RTSP decode plus ONNX
-  inference. Don't expect the vision tracker to keep up on a Pi 4 or smaller.
+- **The optional sky-camera tracker (vision).** This is the heavy part and is what the
+  **Pi 5 (8 GB)** recommendation is for - real-time RTSP decode plus 10 Hz vision and a
+  15 Hz control loop. Don't expect the vision tracker to keep up on a Pi 4 or smaller.
 
 Rule of thumb: **Pi Zero 2 W / 3B** = display only, **Pi 4** = display + local radio,
 **Pi 5** = everything including the camera tracker.
@@ -170,23 +169,6 @@ Once it's running, push updates from your dev machine with:
 ```bash
 PI_HOST=skylight.local ./scripts/deploy-to-pi.sh
 ```
-
-### Optional: the neural airplane detector
-
-The camera tracker works out of the box with its classical + motion-tracking vision.
-For an extra semantic "is it an airplane?" signal (kills cloud locks, nails big
-overhead planes), download the optional ONNX model **on the machine with the camera**:
-
-```bash
-./scripts/fetch-vision-model.sh        # YOLOX-Nano, Apache-2.0, ~3.5 MB (not committed)
-sudo systemctl restart skylight-tracker
-# verify: the tracker state shows vision.net.ready == true
-```
-
-It's fully optional - if the model (or `onnxruntime-node`) is absent, the tracker runs
-classical-only with no errors. On a Pi 5 it adds ~0.8 to load average during a pass;
-turn it off with `tracker.vision.net.enabled = false` or run it less often with
-`tracker.vision.net.everyNTicks` if the Pi runs hot.
 
 ## Docker (server-driven projector)
 
@@ -365,7 +347,7 @@ RTL-SDR ──USB──> dump1090-fa ──> aircraft.json (:8080)
                    canvas renderer +  phone settings UI             • target selection + az/el
                    sky engine → projector (live, two-way)             lead prediction (ECEF)
                                                                     • velocity pursuit + zoom
-                                                                    • vision: sky-masked blob
+                                                                    • vision: motion-compensated
                                                                       detector, lag-compensated
                                                                     • VISCA-over-IP → PTZ camera
                                                                     • RTSP → H.264 passthrough
@@ -379,12 +361,31 @@ RTL-SDR ──USB──> dump1090-fa ──> aircraft.json (:8080)
   proxies TLEs, persists config, and pushes everything over a WebSocket.
 - **`web/`** - Vite + React, four pages: the **display** (`<canvas>` renderer + celestial
   engine), the mobile **control panel**, the **TV dashboard**, and the **tracker debug UI**.
-- **`tracker/`** - the camera brain: picks a target, predicts where it will be when the
-  command actually bites (fix age + decode latency + motor latency), drives the PTZ with
-  closed-loop velocity pursuit (sigma-delta speed dithering, soft limit guards,
-  dead-reckoned pose), verifies the plane on-frame with a vision detector, and zooms in
-  only while the lock holds. Runs against a **simulator** with zero hardware; replays
-  recorded sessions deterministically for debugging.
+- **`tracker/`** - the camera brain. Runs against a **simulator** with zero hardware;
+  replays recorded sessions deterministically for debugging.
+  - **Pointing:** picks a target, and leads each axis by its own command latency (pan
+    ~0.6 s, tilt ~0.4 s) on top of fix age + decode latency. Near-zenith passes park on
+    the exit azimuth and let the plane fly through; passes crossing the pan dead zone
+    pre-position on the far side.
+  - **Velocity pursuit:** a PI loop on the dead-reckoned pose, referenced to the command
+    issued one latency ago, with the dither ripple removed. The driver sigma-delta
+    dithers between the camera's discrete speed steps using a speed table that depends
+    on zoom (this firmware slows every step as it zooms in). Absolute moves are only
+    used for acquisition, the zenith park and dead-zone wraps.
+  - **Zoom ladder:** starts wide and steps tighter only while the vision lock holds,
+    capped by the ADS-B framing and by a gear-aware floor (at tele the pan axis has only
+    ~1.5 / 3 / 7°/s gears, so fast pan holds the view wider).
+  - **Vision correction:** motion-compensated frame differencing + a world-frame track
+    table; the locked track's offset from the ADS-B prediction is glided onto the aim
+    as a bias correction.
+  - **Auto-calibration:** steady locked frames become mount-model samples; the model is
+    refit between passes and applied only when it clearly beats the current one.
+  - **Horizon:** a per-azimuth clear-sky horizon (`tracker.limits.horizon`) gates both
+    target selection and aiming.
+  - **Pass archive:** every tracked pass is recorded (clip + telemetry), summarised and
+    uploaded - see [`docs/pass-archive.md`](docs/pass-archive.md).
+  - `tracker/scripts/` holds the bench tools (speed-vs-zoom surface, FOV, video
+    latency, motion smoothness, calibration analysis); each says when to run it.
 
 **Stack:** TypeScript · React · Vite · Express · ws · pnpm workspaces ·
 [astronomy-engine](https://github.com/cosinekitty/astronomy) ·

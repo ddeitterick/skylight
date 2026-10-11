@@ -4,6 +4,18 @@
 
 import type { CameraDiagnostics, CameraPose } from "@shared/index.js";
 
+export interface TrackRateOptions {
+  /**
+   * Position-ripple budget for the speed-step dither, deg (peak-to-peak).
+   * The loop scales it with the field of view: at full tele a 0.5° ripple is
+   * ±6% of the frame and reads as a visible sway, while at wide it is
+   * invisible and fewer speed flips are kinder to the motor.
+   */
+  rippleDeg?: number;
+  /** Tilt budget (the vertical field is 9/16 of the horizontal). Defaults to rippleDeg. */
+  rippleTiltDeg?: number;
+}
+
 export interface CameraDriver {
   readonly kind: "sim" | "visca";
 
@@ -11,13 +23,12 @@ export interface CameraDriver {
   stop(): void;
 
   /**
-   * Absolute move (mount-frame degrees + raw zoom units). Fire-and-forget:
-   * the implementation queues/throttles; the latest call wins. Optional
-   * per-axis speeds (deg/s) — used by "carrot" pursuit to glide: a goal
-   * slightly ahead, at a speed matched to arrive exactly when the next goal
-   * lands, never decelerates.
+   * Absolute move at full speed (mount-frame degrees + raw zoom units).
+   * Fire-and-forget: the implementation queues/throttles; the latest call
+   * wins. Used for acquisition slews, the zenith park, dead-zone wraps and
+   * the idle home position — tracking itself goes through trackRate.
    */
-  gotoAbsolute(pose: CameraPose, speeds?: { panDps?: number; tiltDps?: number }): void;
+  gotoAbsolute(pose: CameraPose): void;
 
   /** Continuous jog. Components in [-1, 1] of max speed; 0 = stop that axis. */
   jog(pan: number, tilt: number, zoom: number): void;
@@ -27,7 +38,7 @@ export interface CameraDriver {
    * continuous drive glides where streamed absolute moves stutter (each
    * absolute move runs at max speed and hard-stops).
    */
-  trackRate(panDps: number, tiltDps: number): void;
+  trackRate(panDps: number, tiltDps: number, opts?: TrackRateOptions): void;
 
   /** Command zoom alone (tracking-time zoom updates). */
   setZoom(zoomUnits: number): void;
@@ -52,6 +63,14 @@ export interface CameraDriver {
 
   /** Last pose reported by the camera (inquiry / integrator), or null. */
   getPose(): CameraPose | null;
+
+  /**
+   * How far the head currently lags (+) or leads (−) the smooth trajectory
+   * the velocity command describes, per axis, deg — the speed-step dither's
+   * position ripple. The control loop subtracts it from its error so the
+   * slow P/I loop does not chase the fast dither. Sim: zeros.
+   */
+  getDitherRipple(): { panDeg: number; tiltDeg: number };
 
   /**
    * Best-estimate CURRENT pose: the last report dead-reckoned forward by the

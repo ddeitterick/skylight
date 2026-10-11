@@ -6,7 +6,10 @@ import {
   aircraftGeoPoint,
   azElFromSite,
   estimateTurnRate,
+  fixAgeSec,
+  fixTimeMs,
   norm180,
+  SAME_FIX_MS,
   predictGeo,
   slewSeconds,
   type Aircraft,
@@ -48,6 +51,14 @@ export interface Prediction {
   nowAzEl: AzEl;
 }
 
+/**
+ * Cap on the slew-time component of the aim lead, s. In steady velocity
+ * tracking the camera rides lead×rate AHEAD of the plane (the bias estimator
+ * is referenced to truth, so it rightly leaves that): the only lead that
+ * belongs there is the fix age. Keep the slew term to a token amount.
+ */
+const MAX_SLEW_LEAD_SEC = 0.05;
+
 /** Per-aircraft track history for turn-rate estimation. */
 export class TrackHistory {
   private hist = new Map<string, { t: number; trackDeg: number }[]>();
@@ -61,8 +72,8 @@ export class TrackHistory {
     if (ac.track == null) return;
     const h = this.hist.get(ac.hex) ?? [];
     const last = h[h.length - 1];
-    const t = ac.ts ?? now;
-    if (last && t - last.t < 400) return; // same fix
+    const t = fixTimeMs(ac, now);
+    if (last && Math.abs(t - last.t) < 400) return; // same fix
     h.push({ t, trackDeg: ac.track });
     while (h.length > 6) h.shift();
     this.hist.set(ac.hex, h);
@@ -86,14 +97,19 @@ export class TrackHistory {
   smoothGeo(ac: Aircraft, now: number, gain: number): GeoPoint | null {
     const geo = aircraftGeoPoint(ac);
     if (!geo) return null;
-    const tFix = ac.ts ?? now;
+    const tFix = fixTimeMs(ac, now);
     const st = this.smPos.get(ac.hex);
+    // Same fix re-reported (a poll that found no new position): hold the
+    // estimate — pulling toward a stale position every poll would drag the
+    // smoothed track BACKWARD along the path.
+    if (st && Math.abs(tFix - st.t) < SAME_FIX_MS) {
+      return { lat: st.lat, lon: st.lon, altM: st.altM };
+    }
     // (Re)seed on first sight or after a gap where coasting would be wrong.
     if (!st || tFix - st.t > 10_000 || tFix < st.t) {
       this.smPos.set(ac.hex, { t: tFix, lat: geo.lat, lon: geo.lon, altM: geo.altM });
       return geo;
     }
-    if (tFix === st.t) return { lat: st.lat, lon: st.lon, altM: st.altM }; // same fix
     const dt = (tFix - st.t) / 1000;
     const pred = predictGeo(
       {
@@ -146,7 +162,7 @@ export function predictAim(
       : aircraftGeoPoint(ac);
   if (!geo) return null;
 
-  const fixAgeSec = Math.max(0, (now - (ac.ts ?? now)) / 1000) + (ac.seen ?? 0);
+  const ageSec = fixAgeSec(ac, now);
   const turnRateDps = history.turnRateDps(ac.hex);
   const kin = {
     lat: geo.lat,
@@ -169,18 +185,24 @@ export function predictAim(
   const motorLag = params.motorLatencySec ?? 0;
 
   // Pass 1: assume a small slew.
-  let lead = fixAgeSec + params.adsbLatencySec + motorLag + 0.3;
-  let clamped = lead > params.maxLeadSec + fixAgeSec;
-  lead = Math.min(lead, params.maxLeadSec + fixAgeSec);
+  let lead = ageSec + params.adsbLatencySec + motorLag + 0.3;
+  let clamped = lead > params.maxLeadSec + ageSec;
+  lead = Math.min(lead, params.maxLeadSec + ageSec);
   let azEl = predictAt(lead);
 
-  // Pass 2: refine with the actual slew time to the pass-1 aim point.
+  // Pass 2: refine with the slew time to the pass-1 aim point — CAPPED. In
+  // continuous velocity pursuit an uncapped slew term is a feedback path:
+  // when the head is 30° behind (coming out of an overhead crossing) the
+  // goal runs ~0.5 s further ahead, and as the head catches up the goal
+  // retreats — a chase-then-retreat hunt with 15-30° overshoots (observed
+  // after every crossing). Latency is already in motorLag; the slew term
+  // only needs to cover the last fraction of a second of travel.
   if (currentPanTilt) {
     const goal = mountFromWorld(azEl.azDeg, azEl.elDeg, mount);
-    const slew = slewSeconds(currentPanTilt, goal, limits);
-    let refined = fixAgeSec + params.adsbLatencySec + motorLag + slew;
-    if (refined > params.maxLeadSec + fixAgeSec) {
-      refined = params.maxLeadSec + fixAgeSec;
+    const slew = Math.min(MAX_SLEW_LEAD_SEC, slewSeconds(currentPanTilt, goal, limits));
+    let refined = ageSec + params.adsbLatencySec + motorLag + slew;
+    if (refined > params.maxLeadSec + ageSec) {
+      refined = params.maxLeadSec + ageSec;
       clamped = true;
     }
     azEl = predictAt(refined);
@@ -195,7 +217,7 @@ export function predictAim(
     (norm180(ahead.azDeg - azEl.azDeg) / 0.5);
   const elRateDps = (ahead.elDeg - azEl.elDeg) / 0.5;
 
-  const nowAzEl = predictAt(fixAgeSec + params.adsbLatencySec);
+  const nowAzEl = predictAt(ageSec + params.adsbLatencySec);
 
   return { azEl, leadSec: lead, clamped, azRateDps, elRateDps, nowAzEl };
 }

@@ -11,6 +11,7 @@ export default defineConfig({
       "tracker/test/**/*.test.ts",
       "server/test/**/*.test.ts",
       "web/test/**/*.test.ts",
+      "passes/test/**/*.test.ts",
     ],
   },
 });

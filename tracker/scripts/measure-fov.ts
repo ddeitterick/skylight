@@ -10,6 +10,8 @@
 //   sudo systemctl start skylight-tracker
 //
 // Output: a fovLut JSON array for config (tracker.zoom.fovLut).
+// When: after a camera/lens swap, or if the vision offsets (and so the
+// auto-calibration samples) look scaled wrong at some zoom.
 
 import { spawn } from "node:child_process";
 import dgram from "node:dgram";
@@ -21,8 +23,6 @@ const RTSP = process.env.RTSP_URL ?? `rtsp://${IP}:554/live/av1`;
 
 // Zoom stops to measure (raw units, 0..1437).
 const STOPS = [0, 180, 360, 540, 720, 900, 1080, 1260, 1437];
-// Rough current LUT to size the pan delta per stop (~22% of expected hfov).
-const ROUGH: [number, number][] = [[0, 62.3], [1437, 3.46]];
 
 const PAN_UPD = 71.714;
 const PAN_ZERO = 12550;
@@ -62,15 +62,6 @@ const setZoom = (units: number) =>
   transmit(0x0100, [0x81, 0x01, 0x04, 0x47, ...nib4(units), 0xff]);
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-function roughHfov(units: number): number {
-  // log-tan interpolation between the rough endpoints.
-  const toL = (d: number) => Math.log(Math.tan((d / 2) * Math.PI) / 180 + Number.EPSILON);
-  void toL;
-  const f = units / 1437;
-  // simple log-linear blend is plenty for sizing the delta
-  return Math.exp(Math.log(62.3) * (1 - f) + Math.log(3.46) * f);
-}
 
 // --- latest frame from a persistent production-style ffmpeg ---
 let lastJpeg: Buffer | null = null;

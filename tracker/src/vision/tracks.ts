@@ -40,8 +40,10 @@ export interface PredictedMotion {
 export interface SelectOptions {
   /** Position-error e-folding scale, deg (≈ ADS-B bias tolerance). */
   posScaleDeg?: number;
-  /** Velocity-error e-folding scale, deg/s. */
-  velScaleDps?: number;
+  /** Override the acquisition velocity tolerance, deg/s. Near the zenith a
+   *  few pixels of frame offset map to tens of degrees of azimuth, so the
+   *  world-angle velocity fit is meaningless there — the caller relaxes it. */
+  velTolDps?: number;
 }
 
 /** Linear velocity fit over a track's recent observations. */
@@ -70,7 +72,23 @@ const LOCK_MIN_AGE_MS = 700;
 const SWITCH_FACTOR = 1.6;
 const SWITCH_COUNT = 3;
 
+/** Velocity-error e-folding scale of the lock score, deg/s. */
+const VEL_SCALE_DPS = 1.2;
+
 let nextTrackId = 1;
+
+/**
+ * Velocity-error tolerance for a track to be ACQUIRED as the lock, deg/s.
+ * Scales with the predicted rate: a world-static cloud has velErr ≈ predRate,
+ * so demanding velErr < ~half of it rejects clouds whenever the plane is
+ * moving fast enough to tell them apart — the old fixed ±3°/s gate let a
+ * static cloud qualify under a 2°/s plane, and once locked the zoom ladder
+ * climbed onto it. The floor keeps slow/far planes (where velocity carries
+ * little information) acquirable on position alone.
+ */
+export function lockVelTolerance(predRateDps: number): number {
+  return Math.max(0.6, 0.5 * predRateDps);
+}
 
 export class CandidateTrack {
   readonly id = nextTrackId++;
@@ -190,6 +208,10 @@ export interface ScoredTrack {
   eligible: boolean;
   velErrDps: number;
   posErrDeg: number;
+  /** Still moving like the prediction (within lockVelTolerance). A lock that
+   *  has stopped matching — the plane left, a cloud edge took over — keeps
+   *  the lock through the grace window but must not be zoomed in on. */
+  motionOk: boolean;
 }
 
 export class TrackTable {
@@ -280,7 +302,8 @@ export class TrackTable {
    */
   select(pred: PredictedMotion, now: number, opts: SelectOptions = {}): ScoredTrack | null {
     const posScale = opts.posScaleDeg ?? 1.6;
-    const velScale = opts.velScaleDps ?? 1.2;
+    const velScale = VEL_SCALE_DPS;
+    const velTol = (r: number) => opts.velTolDps ?? lockVelTolerance(r);
     const predRate = Math.hypot(
       pred.azRateDps * Math.max(0.2, Math.cos(pred.elDeg * DEG)),
       pred.elRateDps,
@@ -317,9 +340,12 @@ export class TrackTable {
         tr.hits >= LOCK_MIN_HITS &&
         tr.ageMs(now) >= LOCK_MIN_AGE_MS &&
         v.n >= 3 &&
-        velErr < 3 + (1 - velWeight) * 3 &&
+        velErr < velTol(predRate) &&
         posErr < posScale * 3;
-      return { track: tr, score, eligible, velErrDps: velErr, posErrDeg: posErr };
+      return {
+        track: tr, score, eligible, velErrDps: velErr, posErrDeg: posErr,
+        motionOk: velErr < velTol(predRate),
+      };
     });
     scored.sort((a, b) => b.score - a.score);
 

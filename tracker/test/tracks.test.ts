@@ -60,6 +60,40 @@ describe("TrackTable", () => {
     expect(Math.abs(lockedAz! - p.az)).toBeLessThan(0.5); // it's the plane
   });
 
+  it("will not acquire a world-static cloud when the plane itself is undetected", () => {
+    // The failure that zoomed the camera onto clouds: the plane is too faint
+    // to detect, the only coherent track is a static cloud edge near the
+    // expectation, and the prediction says the plane moves at 2°/s. A
+    // static blob cannot be the plane — it must not become the lock.
+    const table = new TrackTable();
+    let locks = 0;
+    for (let i = 0; i < 30; i++) {
+      const t = T0 + i * TICK;
+      table.update([obs(t, planeAt(T0).az + 0.6, planeAt(T0).el + 0.3, 12, 0.05)], t, 2.5);
+      const sel = table.select(predAt(t), t);
+      if (sel) {
+        locks++;
+        expect(sel.motionOk).toBe(false);
+      }
+    }
+    expect(locks).toBe(0);
+  });
+
+  it("acquires a slow far plane on position when velocity carries no information", () => {
+    const table = new TrackTable();
+    const slowPred = (t: number): PredictedMotion => ({
+      azDeg: 200, elDeg: 20, azRateDps: 0.3, elRateDps: 0.1,
+    });
+    let sel = null;
+    for (let i = 0; i < 20; i++) {
+      const t = T0 + i * TICK;
+      table.update([obs(t, 200 + ((t - T0) / 1000) * 0.3, 20 + ((t - T0) / 1000) * 0.1, 6, 0.03)], t, 2.5);
+      sel = table.select(slowPred(t), t);
+    }
+    expect(sel).not.toBeNull();
+    expect(sel!.motionOk).toBe(true);
+  });
+
   it("rejects incoherent noise even at the predicted position", () => {
     const table = new TrackTable();
     let locks = 0;

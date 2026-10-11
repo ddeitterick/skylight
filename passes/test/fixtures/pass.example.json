@@ -1,0 +1,152 @@
+{
+  "schema": 1,
+  "id": "20261010T235405Z-a622bc",
+  "startedAt": 1791676445000,
+  "endedAt": 1791676488000,
+  "durationSec": 43.0,
+  "tz": "America/Los_Angeles",
+  "aircraft": {
+    "hex": "a622bc",
+    "flight": "ASA236",
+    "registration": "N495AS",
+    "typeCode": "B739",
+    "typeName": "Boeing 737-900",
+    "airline": "Alaska Airlines",
+    "category": "A3",
+    "origin": "SEA",
+    "originName": "Seattle",
+    "destination": "SFO",
+    "destName": "San Francisco"
+  },
+  "pass": {
+    "maxElDeg": 70.2,
+    "elAtStartDeg": 18.1,
+    "elAtEndDeg": 16.3,
+    "minSlantM": 3655,
+    "azStartDeg": 126,
+    "azEndDeg": 297,
+    "caAzDeg": 205,
+    "zenithPass": false,
+    "deadZoneWrap": false,
+    "gsKt": 248,
+    "altFtAtCa": 11175,
+    "baroRateFpm": 0,
+    "headingAtCaDeg": 140,
+    "aspectDeg": 85,
+    "turnDeg": 62,
+    "turnDir": "right",
+    "departure": false
+  },
+  "tracking": {
+    "lockPct": 83,
+    "firstLockSec": 1.4,
+    "centerMedAzDeg": 0.3,
+    "centerMedElDeg": 0.32,
+    "centerP90AzDeg": 0.8,
+    "centerP90ElDeg": 1.0,
+    "hfovMinDeg": 4.0,
+    "secToHfov8": 24.5,
+    "secToHfovMin": 36.4,
+    "teleSec": 15.2,
+    "teleAzSdDeg": 0.27,
+    "teleElSdDeg": 0.33,
+    "teleAzP2pDeg": 0.9,
+    "teleElP2pDeg": 1.29,
+    "panReversalsPer10s": 1.9,
+    "panHop1sDeg": 0.92,
+    "tiltHop1sDeg": 1.57,
+    "poseErrMedDeg": 0.7,
+    "corrMaxDeg": 1.8,
+    "zoomChanges": 9
+  },
+  "build": {
+    "version": "0c2cb9f",
+    "label": "16:52 build — tele ripple 0.25, tilt budget 9/16",
+    "node": "v22.x"
+  },
+  "tuning": {
+    "pursuit": "velocity",
+    "maxLeadSec": 3,
+    "panLatencySec": 0.6,
+    "tiltLatencySec": 0.4,
+    "rippleDeg": 0.5,
+    "rippleTeleDeg": 0.25,
+    "rateFloorDegPerDps": 2.5,
+    "rateFloorMaxDeg": 12,
+    "lockedSigmaDeg": 0.35,
+    "correctionSlewDps": 2.5,
+    "kp": 1.0,
+    "ki": 0.6
+  },
+  "camera": {
+    "model": "TONGVEO 20x PTZ",
+    "width": 1920,
+    "height": 1080,
+    "fps": 30
+  },
+  "license": "Videos and posters: © Skylight (Cameron Paczek). Free for non-commercial use with credit to skylightceiling.com; NOT covered by the repository's MIT license. Commercial use requires permission — see https://skylightceiling.com/passes#license",
+  "media": {
+    "clip": "clip.mp4",
+    "poster": "poster.jpg",
+    "series": "series.json",
+    "clipBytes": 34211776,
+    "clipDurationSec": 44.2,
+    "clipOffsetSec": -0.8
+  },
+  "quality": {
+    "score": 78,
+    "sharpness": 0.62,
+    "planeSizeFrac": 0.21,
+    "centredSec": 12.4,
+    "bestFrameSec": 23.8,
+    "flags": [],
+    "method": "q1"
+  },
+  "events": [
+    {
+      "t": 0.0,
+      "kind": "target",
+      "label": "Target selected: ASA236"
+    },
+    {
+      "t": 1.4,
+      "kind": "lock",
+      "label": "Visual lock acquired"
+    },
+    {
+      "t": 3.3,
+      "kind": "zoom",
+      "label": "Zoom in: 56° → 35°",
+      "hfovFrom": 56.5,
+      "hfovTo": 35.0
+    },
+    {
+      "t": 12.0,
+      "kind": "zenith",
+      "label": "Overhead park",
+      "phase": "park"
+    },
+    {
+      "t": 20.1,
+      "kind": "wrap",
+      "label": "Dead-zone anticipation: pre-positioning at −175°",
+      "phase": "engage"
+    },
+    {
+      "t": 30.2,
+      "kind": "lost",
+      "label": "Visual lock lost"
+    },
+    {
+      "t": 34.0,
+      "kind": "focus",
+      "label": "One-push autofocus"
+    },
+    {
+      "t": 43.0,
+      "kind": "release",
+      "label": "Target released"
+    }
+  ],
+  "notes": []
+}

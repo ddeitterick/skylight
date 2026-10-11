@@ -110,7 +110,7 @@ Description=dump1090-fa ADS-B decoder
 After=network.target
 [Service]
 ExecStartPre=/bin/mkdir -p /run/dump1090-fa
-ExecStart=/usr/local/bin/dump1090-fa --device-type rtlsdr ${LOCATION_ARGS}--write-json /run/dump1090-fa --write-json-every 1 --quiet
+ExecStart=/usr/local/bin/dump1090-fa --device-type rtlsdr ${LOCATION_ARGS}--write-json /run/dump1090-fa --write-json-every 0.5 --quiet
 Restart=always
 RestartSec=3
 [Install]

@@ -1,3 +1,11 @@
+// VISCA reply check: resets the sequence counter, sends 12 pan/tilt position
+// inquiries and prints every reply. Zero replies = the camera is answering a
+// different client (the tracker is still running) or the reply state machine
+// is wedged.
+//
+// When: "inquiry stall" in the driver diagnostics, or before any probe script.
+//   CAMERA_IP=192.168.5.206 pnpm exec tsx scripts/visca-diag.ts   (tracker stopped)
+
 import dgram from "node:dgram";
 const IP = process.env.CAMERA_IP ?? "192.168.5.206", PORT = 52381;
 const sock = dgram.createSocket("udp4");

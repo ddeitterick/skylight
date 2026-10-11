@@ -1,0 +1,25 @@
+# Skylight pass archive: clips/posters/telemetry in R2, a filterable index in D1,
+# served at https://passes.skylightceiling.com. Contract: docs/pass-archive.md.
+# Deploy: npx wrangler deploy
+name = "skylight-passes"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "skylight-passes"
+database_id = "3bece7b7-a796-43d8-a08f-2e3c1d8fb5af"
+
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "skylight-passes"
+
+[vars]
+SITE_ORIGIN = "https://skylightceiling.com"
+
+# Secrets (npx wrangler secret put ...): INGEST_KEY — bearer key for PUT/POST /ingest/* and
+# DELETE /api/passes/<id>. The Pi holds the same value as PASS_ARCHIVE_KEY.
+
+[[routes]]
+pattern = "passes.skylightceiling.com"
+custom_domain = true

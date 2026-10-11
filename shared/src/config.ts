@@ -91,30 +91,16 @@ export interface TrackerConfig {
   predict: {
     /** ADS-B decode/transport latency beyond the fix's `seen` age, s. */
     adsbLatencySec: number;
-    /**
-     * Command-to-motion latency of the camera (UDP + firmware + accel ramp),
-     * s. Folded into the aim lead so the setpoint trajectory is evaluated
-     * where the plane will be when the command actually bites — the rate
-     * feedforward then carries the right value for free.
-     */
-    motorLatencySec: number;
-    /** Never extrapolate further than this. */
+    /** Never extrapolate further than this (beyond the fix age), s. */
     maxLeadSec: number;
-    /** Don't re-command moves smaller than this, deg. */
-    deadbandDeg: number;
     /** Smoothed-setpoint command cadence, Hz. */
     commandHz: number;
-    /** Alpha-beta filter constants for the setpoint tracker. */
-    alpha: number;
-    beta: number;
     /**
-     * Pursuit style: "carrot" = speed-matched absolute moves toward a goal
-     * slightly ahead (smoothest); "velocity" = closed-loop drive commands.
+     * Pursuit style. Closed-loop velocity drive is the only one left (the
+     * speed-matched absolute "carrot" mode was retired); the field stays so
+     * the pass archive's tuning snapshot keeps its shape.
      */
-    pursuit: "carrot" | "velocity";
-    /** Carrot lead horizon, s, and re-issue cadence, ms. */
-    carrotHorizonSec: number;
-    carrotMs: number;
+    pursuit: "velocity";
     /**
      * Position-smoothing strength 0..1: denoise the plane's ADS-B position
      * before aiming so the camera follows the smooth predicted PATH rather
@@ -141,6 +127,24 @@ export interface TrackerConfig {
      * Below it, near-still targets rest normally. 0 = off.
      */
     minSweepDps: number;
+    /**
+     * Speed-step dither position-ripple budget, deg peak-to-peak, at HFOV
+     * ≥10° (`rippleDeg`) and at full tele 4° (`rippleTeleDeg`, interpolated
+     * between). Larger = fewer, longer gear changes (slow drift); smaller =
+     * frequent small ones (fast wobble). Live-tunable.
+     */
+    rippleDeg: number;
+    rippleTeleDeg: number;
+    /**
+     * Command→motion latency per axis, s (measured: pan ≈0.6, tilt ≈0.15).
+     * Folded into each axis's aim lead (the setpoint is evaluated where the
+     * plane will be when the command bites), and the pose is
+     * compared against the command issued that long ago — otherwise the
+     * loop sees a permanent lag term and its integrator rings (~3 s wobble,
+     * ±0.5-1° at tele, visible on every tele pass).
+     */
+    panLatencySec: number;
+    tiltLatencySec: number;
   };
   zoom: {
     auto: boolean;
@@ -158,13 +162,25 @@ export interface TrackerConfig {
     manualHfovDeg: number;
     /** Measured zoom-units -> HFOV samples (endpoints from the datasheet). */
     fovLut: FovPoint[];
+    /**
+     * Motor-smoothness zoom floor: HFOV ≥ rateFloorDegPerDps × the target's
+     * angular rate (deg/s), capped at rateFloorMaxDeg. The dither's velocity
+     * steps are fixed in deg/s, so a fast (close) plane at full tele lurches;
+     * holding the zoom proportionally wider keeps the picture steady.
+     */
+    rateFloorDegPerDps: number;
+    rateFloorMaxDeg: number;
   };
   vision: {
     /** Run the in-frame plane detector while tracking. */
     enabled: boolean;
     /** Close the loop: nudge the aim by the detected offset. */
     applyCorrection: boolean;
-    /** Stay at full wide while searching (Phase B bring-up). */
+    /**
+     * Vision-gated zoom ladder: start wide and step one rung tighter (toward
+     * the ADS-B framing) each time the lock holds; step back out when it
+     * degrades. false = zoom straight to the ADS-B framing.
+     */
     lockWide: boolean;
     /**
      * Once zoomed in and vision-locked on the plane, fire a one-push
@@ -193,25 +209,6 @@ export interface TrackerConfig {
      * when the refit clearly beats the current model.
      */
     autoCalibrate: boolean;
-    /**
-     * Optional neural airplane detector (ONNX). Adds a SEMANTIC signal that
-     * the classical blob paths lack — kills cloud locks and nails the big-
-     * overhead case. Self-disables gracefully when the runtime or model file
-     * is missing (run scripts/fetch-vision-model.sh on the Pi to install it).
-     */
-    net: {
-      enabled: boolean;
-      /** Path to the .onnx model (downloaded at setup, not committed). */
-      modelPath: string;
-      /** Square network input size (YOLOX-Nano = 416). */
-      inputSize: number;
-      /** Min airplane-class score to accept a detection. */
-      scoreThresh: number;
-      /** COCO class id (4 = airplane). */
-      classId: number;
-      /** Run the net every Nth vision tick (CPU budget). 1 = every tick. */
-      everyNTicks: number;
-    };
   };
 
   /** Idle "ready position" when auto mode has no target. */
@@ -491,19 +488,17 @@ export const DEFAULT_CONFIG: Config = {
     },
     predict: {
       adsbLatencySec: 0.6,
-      motorLatencySec: 0.2,
       maxLeadSec: 5,
-      deadbandDeg: 0.05,
       commandHz: 15,
-      alpha: 0.5,
-      beta: 0.1,
       pursuit: "velocity",
-      carrotHorizonSec: 1.5,
-      carrotMs: 600,
       posSmoothing: 0.7,
       errSmoothing: 0.5,
       maxAccelDps2: 80,
       minSweepDps: 0.6,
+      rippleDeg: 0.5,
+      rippleTeleDeg: 0.25,
+      panLatencySec: 0.6,
+      tiltLatencySec: 0.4,
     },
     zoom: {
       auto: true,
@@ -516,6 +511,8 @@ export const DEFAULT_CONFIG: Config = {
         { units: 0, hfovDeg: 62.3 },
         { units: 16384, hfovDeg: 3.46 },
       ],
+      rateFloorDegPerDps: 2.5,
+      rateFloorMaxDeg: 12,
     },
     vision: {
       enabled: true,
@@ -529,17 +526,6 @@ export const DEFAULT_CONFIG: Config = {
       encodeLagMs: 350,
       correctionSlewDps: 2.5,
       autoCalibrate: true,
-      net: {
-        // Retired: the YOLOX net (generic COCO, ~266 ms/inference) was the wrong
-        // tool for a speck on sky AND a CPU hog. Camera-motion-compensated
-        // detection replaced it. Left here (disabled) so old configs merge.
-        enabled: false,
-        modelPath: "tracker/models/yolox_nano.onnx",
-        inputSize: 416,
-        scoreThresh: 0.3,
-        classId: 4,
-        everyNTicks: 3,
-      },
     },
     home: {
       enabled: true,
@@ -567,6 +553,23 @@ export function mergeConfig(base: Config, patch: Partial<Config>): Config {
   };
 }
 
+/**
+ * Tracker keys earlier builds persisted that nothing reads any more (carrot
+ * pursuit, the unused deadband/alpha-beta/motor-latency knobs, the retired
+ * ONNX detector). A config.json from before the cleanup still loads: the
+ * merge drops them, and the next save writes the file without them.
+ */
+const RETIRED_TRACKER_KEYS = {
+  predict: ["carrotHorizonSec", "carrotMs", "deadbandDeg", "alpha", "beta", "motorLatencySec"],
+  vision: ["net"],
+} as const;
+
+function withoutKeys<T extends object>(obj: T, keys: readonly string[]): T {
+  const out = { ...obj } as Record<string, unknown>;
+  for (const k of keys) delete out[k];
+  return out as T;
+}
+
 /** Deep-merge a tracker patch (each nested section may be partial). */
 export function mergeTrackerConfig(
   base: TrackerConfig,
@@ -580,16 +583,12 @@ export function mergeTrackerConfig(
     units: { ...base.units, ...(patch.units ?? {}) },
     mount: { ...base.mount, ...(patch.mount ?? {}) },
     target: { ...base.target, ...(patch.target ?? {}) },
-    predict: { ...base.predict, ...(patch.predict ?? {}) },
-    zoom: { ...base.zoom, ...(patch.zoom ?? {}) },
-    vision: {
-      ...base.vision,
-      ...(patch.vision ?? {}),
-      // `net` is a nested object inside vision — deep-merge it too, or a
-      // partial patch (e.g. {net:{everyNTicks:3}}) would wipe enabled/
-      // modelPath and silently disable the detector.
-      net: { ...base.vision.net, ...(patch.vision?.net ?? {}) },
+    predict: {
+      ...withoutKeys({ ...base.predict, ...(patch.predict ?? {}) }, RETIRED_TRACKER_KEYS.predict),
+      pursuit: "velocity", // the only mode; an old persisted "carrot" must not survive
     },
+    zoom: { ...base.zoom, ...(patch.zoom ?? {}) },
+    vision: withoutKeys({ ...base.vision, ...(patch.vision ?? {}) }, RETIRED_TRACKER_KEYS.vision),
     home: { ...base.home, ...(patch.home ?? {}) },
   } as TrackerConfig;
 }

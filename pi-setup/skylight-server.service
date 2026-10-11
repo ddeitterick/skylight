@@ -14,6 +14,9 @@ Environment=PORT=3000
 Environment=HOST=0.0.0.0
 Environment=DATA_SOURCE=__DATA_SOURCE__
 Environment=AIRCRAFT_JSON_URL=http://localhost:8080/data/aircraft.json
+# Poll the decoder at 2 Hz (it rewrites aircraft.json every 0.5 s): the camera
+# tracker dead-reckons from these fixes, and every second of latency is degrees.
+Environment=POLL_MS=500
 ExecStart=__PNPM__ -F server start
 Restart=always
 RestartSec=3

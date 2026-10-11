@@ -6,6 +6,10 @@
 import { useEffect, useRef, useState, type MutableRefObject } from "react";
 import type { TrackerState } from "@shared/index.js";
 
+/** Seconds of buffered video to keep ahead of the playhead (≥ 1 fragment
+ *  interval + jitter; costs the same in added latency). */
+const TARGET_CUSHION_S = 2.2;
+
 function wsUrl(): string {
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const sameOrigin = location.port === "5173" || location.port === "3001";
@@ -41,6 +45,7 @@ export function useMse(
     }
 
     let alive = true;
+    let started = false;
     let ws: WebSocket | null = null;
     let ms: MediaSource | null = null;
     let sb: SourceBuffer | null = null;
@@ -101,22 +106,38 @@ export function useMse(
           sb = ms.addSourceBuffer(mime);
           sb.mode = "segments";
           sb.addEventListener("updateend", () => {
-            // Trim history and chase the live edge — but with a ~1 s cushion:
-            // sitting right on the edge stalls between fragments and reads as
-            // low framerate.
+            // The pass-through muxer emits ONE fragment per camera keyframe
+            // (~1.2 s, ~0.5 MB bursts). A player hugging the live edge
+            // starves at every fragment boundary — measured on the stream
+            // pusher: 82% repeated frames, freezes up to 1.3 s, ~5 fps of
+            // real picture. Keep a cushion of a couple of fragments and trim
+            // drift with playback RATE, never by seeking mid-play.
             if (sb && !sb.updating && el.buffered.length) {
               const end = el.buffered.end(el.buffered.length - 1);
               const start = el.buffered.start(0);
-              if (end - start > 30) {
-                try { sb.remove(start, end - 10); } catch { /* mid-update */ }
+              if (end - start > 40) {
+                try { sb.remove(start, end - 15); } catch { /* mid-update */ }
               }
-              if (end - el.currentTime > 3.5) el.currentTime = end - 1.0;
+              const cushion = end - el.currentTime;
+              if (!started) {
+                // Pre-roll: don't start until two fragments are in hand.
+                if (cushion >= TARGET_CUSHION_S) {
+                  started = true;
+                  void el.play().catch(() => {});
+                }
+              } else if (cushion > TARGET_CUSHION_S + 4) {
+                el.currentTime = end - TARGET_CUSHION_S; // fell far behind (tab throttled?)
+              } else {
+                // Gentle rate servo toward the target cushion.
+                const err = cushion - TARGET_CUSHION_S;
+                el.playbackRate = Math.max(0.94, Math.min(1.06, 1 + 0.04 * err));
+              }
             }
             pump();
           });
           pump();
         });
-        void el.play().catch(() => {});
+        // (playback starts from the pre-roll check above)
         failures.current = 0;
         setOk(true); // recovered — promote back from the MJPEG fallback
         return;

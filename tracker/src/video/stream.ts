@@ -1,8 +1,8 @@
-// Camera video for the debug UI (and, later, the CV stage). One ffmpeg
-// process pulls the RTSP stream and emits MJPEG frames on stdout; we split
-// them on JPEG markers, keep the latest frame, and fan out to any number of
-// multipart HTTP clients. Phase B's detector consumes `latestFrame()` /
-// `onFrame` from this same single RTSP connection.
+// Camera substream for the vision loop and the debug UI. One ffmpeg process
+// pulls the RTSP substream and emits MJPEG frames on stdout; we split them on
+// JPEG markers, keep the latest frame (+ its arrival time), and fan out to
+// any number of multipart HTTP clients. The detector polls `latestFrame()` /
+// `latestFrameAt()` from this same single RTSP connection.
 
 import { spawn, type ChildProcess } from "node:child_process";
 import type { Response } from "express";
@@ -15,7 +15,6 @@ export class VideoStream {
   private last: Buffer | null = null;
   private lastFrameAt = 0;
   private clients = new Set<Response>();
-  private listeners = new Set<(frame: Buffer) => void>();
   private restartTimer: ReturnType<typeof setTimeout> | null = null;
   private watchdog: ReturnType<typeof setInterval> | null = null;
   private stopped = true;
@@ -95,11 +94,6 @@ export class VideoStream {
     return this.lastFrameAt;
   }
 
-  onFrame(fn: (frame: Buffer) => void): () => void {
-    this.listeners.add(fn);
-    return () => this.listeners.delete(fn);
-  }
-
   /** Attach an HTTP response as an MJPEG (multipart/x-mixed-replace) client. */
   addClient(res: Response): void {
     res.writeHead(200, {
@@ -173,7 +167,6 @@ export class VideoStream {
       this.last = frame;
       this.lastFrameAt = Date.now();
       for (const res of this.clients) this.pushFrame(res, frame);
-      for (const fn of this.listeners) fn(frame);
     }
   }
 

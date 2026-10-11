@@ -1,0 +1,17 @@
+{
+  "name": "skylight-passes",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Cloudflare Worker: the Skylight pass archive — clips, posters and 10 Hz telemetry in R2, a filterable index in D1, served to skylightceiling.com/passes",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "schema": "wrangler d1 execute skylight-passes --remote --file schema.sql",
+    "schema:local": "wrangler d1 execute skylight-passes --local --file schema.sql",
+    "test": "pnpm -w exec vitest run passes/test"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260901.0",
+    "wrangler": "^4.148.0"
+  }
+}
