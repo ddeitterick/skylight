@@ -8,6 +8,8 @@ import type { SourceStatus } from "@shared/index.js";
 import { NM_PER_MILE, llToMeters, metersToMiles, rangeMeters } from "@shared/index.js";
 import { lookupAirline, lookupType } from "./enrich/tables.js";
 import type { RouteEnricher } from "./enrich/routes.js";
+import { checkRoute, type RouteFields } from "./enrich/route-check.js";
+import { SFO_AIRPORT } from "@shared/index.js";
 
 /** Raw readsb-style aircraft record (subset we use). */
 interface RawAircraft {
@@ -241,6 +243,13 @@ export class Poller {
   private lastApi: Aircraft[] = [];
   /** hex -> last good enrichment, so resolved routes never flicker back to "—". */
   private sticky = new Map<string, StickyEnrichment>();
+  /** hex -> a route the geometry contradicted, for this callsign. Once caught
+   *  (e.g. climbing out of SFO), it stays dropped after the plane levels off
+   *  and the check can no longer tell. Keeps what the geometry did prove. */
+  private rejectedRoutes = new Map<
+    string,
+    { callsign: string; knownOrigin?: string; knownDestination?: string; lastSeen: number }
+  >();
   /** Why the last poll failed, formatted for the status line. */
   private lastError: string | null = null;
   private lastErrorLogAt = 0;
@@ -451,16 +460,18 @@ export class Poller {
 
     // adsbdb fills gaps (route + better type), from cache when available.
     const e = this.o.enricher.enrichSync(ac.hex, ac.flight, now);
-    if (e.route) {
-      ac.airline = ac.airline ?? e.route.airline;
-      ac.origin = e.route.origin ?? ac.origin;
-      ac.destination = e.route.destination ?? ac.destination;
-      ac.originName = e.route.originName ?? ac.originName;
-      ac.destName = e.route.destName ?? ac.destName;
-      ac.originLat = e.route.originLat ?? ac.originLat;
-      ac.originLon = e.route.originLon ?? ac.originLon;
-      ac.destLat = e.route.destLat ?? ac.destLat;
-      ac.destLon = e.route.destLon ?? ac.destLon;
+    const route = this.plausibleRoute(ac, e.route, now);
+    const rejected = route !== e.route;
+    if (route) {
+      ac.airline = ac.airline ?? e.route?.airline;
+      ac.origin = route.origin ?? ac.origin;
+      ac.destination = route.destination ?? ac.destination;
+      ac.originName = route.originName ?? ac.originName;
+      ac.destName = route.destName ?? ac.destName;
+      ac.originLat = route.originLat ?? ac.originLat;
+      ac.originLon = route.originLon ?? ac.originLon;
+      ac.destLat = route.destLat ?? ac.destLat;
+      ac.destLon = route.destLon ?? ac.destLon;
     }
     if (e.aircraft) {
       ac.typeName = ac.typeName ?? e.aircraft.typeName;
@@ -472,15 +483,18 @@ export class Poller {
     const prev = this.sticky.get(ac.hex);
     ac.typeName = ac.typeName ?? prev?.typeName;
     ac.airline = ac.airline ?? prev?.airline;
-    ac.origin = ac.origin ?? prev?.origin;
-    ac.destination = ac.destination ?? prev?.destination;
     ac.registration = ac.registration ?? prev?.registration;
-    ac.originName = ac.originName ?? prev?.originName;
-    ac.destName = ac.destName ?? prev?.destName;
-    ac.originLat = ac.originLat ?? prev?.originLat;
-    ac.originLon = ac.originLon ?? prev?.originLon;
-    ac.destLat = ac.destLat ?? prev?.destLat;
-    ac.destLon = ac.destLon ?? prev?.destLon;
+    // A rejected route must not come back from the sticky copy.
+    if (!rejected) {
+      ac.origin = ac.origin ?? prev?.origin;
+      ac.destination = ac.destination ?? prev?.destination;
+      ac.originName = ac.originName ?? prev?.originName;
+      ac.destName = ac.destName ?? prev?.destName;
+      ac.originLat = ac.originLat ?? prev?.originLat;
+      ac.originLon = ac.originLon ?? prev?.originLon;
+      ac.destLat = ac.destLat ?? prev?.destLat;
+      ac.destLon = ac.destLon ?? prev?.destLon;
+    }
     this.sticky.set(ac.hex, {
       typeName: ac.typeName,
       airline: ac.airline,
@@ -497,10 +511,42 @@ export class Poller {
     });
   }
 
+  /**
+   * The enricher's route if the aircraft's geometry doesn't contradict it;
+   * otherwise only what the geometry proves (maybe nothing). Returns the same
+   * object when accepted, so callers can compare identity.
+   */
+  private plausibleRoute(ac: Aircraft, route: RouteFields | undefined, now: number): RouteFields | undefined {
+    const callsign = ac.flight?.trim().toUpperCase() ?? "";
+    let rej = this.rejectedRoutes.get(ac.hex);
+    if (rej && rej.callsign !== callsign) {
+      this.rejectedRoutes.delete(ac.hex);
+      rej = undefined;
+    }
+    if (route) {
+      const v = checkRoute(ac, route, this.o.getConfig().airport ?? SFO_AIRPORT);
+      if (!v.ok) {
+        rej = {
+          callsign,
+          knownOrigin: rej?.knownOrigin ?? v.knownOrigin,
+          knownDestination: rej?.knownDestination ?? v.knownDestination,
+          lastSeen: now,
+        };
+        this.rejectedRoutes.set(ac.hex, rej);
+      }
+    }
+    if (!rej) return route;
+    rej.lastSeen = now;
+    return { origin: rej.knownOrigin, destination: rej.knownDestination };
+  }
+
   /** Drop sticky entries for aircraft long gone (keep the map small). */
   private pruneSticky(now: number): void {
     for (const [hex, s] of this.sticky) {
       if (now - s.lastSeen > 600_000) this.sticky.delete(hex);
+    }
+    for (const [hex, r] of this.rejectedRoutes) {
+      if (now - r.lastSeen > 600_000) this.rejectedRoutes.delete(hex);
     }
   }
 }

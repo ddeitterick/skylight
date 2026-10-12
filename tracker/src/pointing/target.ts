@@ -4,6 +4,7 @@
 import {
   MI_TO_M,
   aircraftGeoPoint,
+  angularSepDeg,
   azElFromSite,
   fixAgeSec,
   horizonMinEl,
@@ -72,7 +73,12 @@ export function selectTarget(
   staleSec = 15,
   posStaleSec = 30,
   horizon?: { azDeg: number; minElDeg: number }[],
+  /** Sun direction (null/absent = below the horizon or unknown). */
+  sun?: { azDeg: number; elDeg: number } | null,
+  /** Home airport: departures climbing out toward the site get priority. */
+  airport?: { lat: number; lon: number } | null,
 ): Selection {
+  const sunAvoid = c.sunAvoidDeg ?? 15;
   const candidates: Candidate[] = [];
 
   for (const ac of aircraft) {
@@ -93,6 +99,7 @@ export function selectTarget(
     // stays above the roofline/trees).
     if (azEl.elDeg < horizonMinEl(horizon, azEl.azDeg, -90) + 1) continue;
     if (azEl.slantM > c.maxRangeMi * MI_TO_M) continue;
+    if (sun && angularSepDeg(azEl.azDeg, azEl.elDeg, sun.azDeg, sun.elDeg) < sunAvoid) continue;
     const { s, note } = score(ac, azEl, mode, c);
     candidates.push({
       hex: ac.hex,
@@ -105,6 +112,21 @@ export function selectTarget(
   }
 
   candidates.sort((a, b) => b.score - a.score);
+
+  // DEPARTURE PRIORITY. The site sits ~3 km off the departure end of the home
+  // runways: a departure climbs from below the skyline to overhead in ~10 s,
+  // so waiting until it clears the skyline/min-elevation filters (and the
+  // hysteresis on the current target) meant the camera arrived late and spent
+  // the pass catching up (UAE41P, 2026-10-11: selected at 30° el and 250 m,
+  // camera still parked on the previous plane). Pick it from lift-off, below
+  // the skyline: the aim clamps to the skyline at its azimuth, so the camera
+  // waits where it will rise into view.
+  const dep = airport ? findDeparture(aircraft, site, airport, now, staleSec, posStaleSec) : null;
+  if (dep) {
+    const has = candidates.find((x) => x.hex === dep.hex);
+    if (!has) candidates.unshift(dep);
+    return { hex: dep.hex, candidates };
+  }
 
   const cur = current ? candidates.find((x) => x.hex === current.hex) : undefined;
   const best = candidates[0];
@@ -120,4 +142,58 @@ export function selectTarget(
     heldSec >= c.hysteresisSec &&
     best.score > cur.score + c.switchMargin;
   return { hex: challengerWins ? best.hex : cur.hex, candidates };
+}
+
+/** Departure watch radius around the airport and toward the site, m. */
+const DEP_MAX_FROM_AIRPORT_M = 6000;
+const DEP_MAX_FROM_SITE_M = 6000;
+const DEP_MAX_ALT_FT = 3000;
+const DEP_MIN_CLIMB_FPM = 300;
+/** Track must point within this of the bearing to the site, deg. */
+const DEP_HEADING_TOL_DEG = 35;
+
+function distM(a: { lat: number; lon: number }, b: { lat: number; lon: number }): number {
+  const R = 6371000, toR = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * toR, dLon = (b.lon - a.lon) * toR;
+  const x = dLon * Math.cos(((a.lat + b.lat) / 2) * toR);
+  return Math.hypot(dLat, x) * R;
+}
+function bearingDeg(a: { lat: number; lon: number }, b: { lat: number; lon: number }): number {
+  const toR = Math.PI / 180;
+  const y = Math.sin((b.lon - a.lon) * toR) * Math.cos(b.lat * toR);
+  const x = Math.cos(a.lat * toR) * Math.sin(b.lat * toR) - Math.sin(a.lat * toR) * Math.cos(b.lat * toR) * Math.cos((b.lon - a.lon) * toR);
+  return ((Math.atan2(y, x) / toR) + 360) % 360;
+}
+
+/** The nearest airborne departure from the home airport heading at the site. */
+export function findDeparture(
+  aircraft: Aircraft[],
+  site: GeoPoint,
+  airport: { lat: number; lon: number },
+  now: number,
+  staleSec = 15,
+  posStaleSec = 30,
+): Candidate | null {
+  let best: Candidate | null = null;
+  let bestD = Infinity;
+  for (const ac of aircraft) {
+    if (ac.onGround || ac.lat == null || ac.lon == null || ac.track == null) continue;
+    if (msgAgeSec(ac, now) > staleSec || fixAgeSec(ac, now) > posStaleSec) continue;
+    const altFt = ac.altGeom ?? ac.altBaro;
+    if (altFt == null || altFt > DEP_MAX_ALT_FT) continue;
+    if ((ac.baroRate ?? 0) < DEP_MIN_CLIMB_FPM) continue;
+    const pos = { lat: ac.lat, lon: ac.lon };
+    if (distM(pos, airport) > DEP_MAX_FROM_AIRPORT_M) continue;
+    const dSite = distM(pos, site);
+    if (dSite > DEP_MAX_FROM_SITE_M) continue;
+    const off = Math.abs(((bearingDeg(pos, site) - ac.track + 540) % 360) - 180);
+    if (off > DEP_HEADING_TOL_DEG && dSite > 800) continue; // heading our way (or already on top of us)
+    if (dSite < bestD) {
+      const geo = aircraftGeoPoint(ac);
+      if (!geo) continue;
+      bestD = dSite;
+      best = { hex: ac.hex, flight: ac.flight, typeCode: ac.typeCode, azEl: azElFromSite(site, geo), score: 99, note: "departure" };
+    }
+  }
+  return best;
 }

@@ -10,7 +10,7 @@ import type { PassQuality } from "./quality.js";
 export const SERIES_HZ = 10;
 export const SERIES_COLS = [
   "t", "pan", "tilt", "cPan", "cTilt", "zoom", "hfov", "pAz", "pEl", "slant",
-  "dcx", "dcy", "dage", "corrAz", "corrEl", "lead",
+  "dcx", "dcy", "dage", "corrAz", "corrEl", "lead", "fe", "fpos",
 ] as const;
 /** A detection older than this is not a lock (contract: "< 1.5 s old"). */
 export const LOCK_MAX_AGE_MS = 1500;
@@ -45,6 +45,10 @@ export interface Sample {
   corrAz: number;
   corrEl: number;
   lead: number;
+  /** Focus edge width on the plane, full-res px (null = not measured). */
+  fe?: number | null;
+  /** Lens focus position, raw units. */
+  fpos?: number | null;
   gsKt?: number | null;
   altFt?: number | null;
   baroRateFpm?: number | null;
@@ -269,7 +273,7 @@ export function buildSeries(t0: number, samples: Sample[]): SeriesJson {
     rows: samples.map((s) => [
       r2(s.t), r2(s.pan), r2(s.tilt), r2(s.cPan), r2(s.cTilt), rInt(s.zoom), r2(s.hfov),
       r2(s.pAz), r2(s.pEl), rInt(s.slant), r3(s.dcx), r3(s.dcy), rInt(s.dage),
-      r3(s.corrAz), r3(s.corrEl), r2(s.lead),
+      r3(s.corrAz), r3(s.corrEl), r2(s.lead), s.fe == null ? null : r2(s.fe), s.fpos ?? null,
     ]),
   };
 }

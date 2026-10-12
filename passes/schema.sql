@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS passes (
   turn_deg        REAL,                        -- pass.turnDeg: unsigned total heading change
   turn_dir        TEXT,                        -- pass.turnDir: left | right | NULL
   departure       INTEGER,                     -- pass.departure 0/1: origin is the home airport
+  alt_ca          REAL,                        -- pass.altFtAtCa: ADS-B altitude at closest approach, ft
   has_clip        INTEGER NOT NULL DEFAULT 0,  -- R2 HEAD of <id>/clip.mp4 at ingest
   created_at      TEXT NOT NULL,               -- ingest time, ISO-8601 UTC
   meta            TEXT NOT NULL                -- pass.json verbatim
@@ -66,3 +67,4 @@ CREATE INDEX IF NOT EXISTS passes_flight        ON passes (flight);
 CREATE INDEX IF NOT EXISTS passes_quality       ON passes (quality);
 CREATE INDEX IF NOT EXISTS passes_aspect       ON passes (aspect);
 CREATE INDEX IF NOT EXISTS passes_turn_deg     ON passes (turn_deg);
+CREATE INDEX IF NOT EXISTS passes_alt_ca       ON passes (alt_ca);

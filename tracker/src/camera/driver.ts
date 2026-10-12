@@ -57,12 +57,18 @@ export interface CameraDriver {
    * focusing on the actual plane is the only reliable way to stay sharp.
    */
   onePushAutofocus(): void;
+  /** Manual focus without moving the lens (optional; VISCA only). */
+  focusManual?(): void;
+  /** Timed focus drive by about deltaUnits (+ = nearer) (optional). */
+  focusNudge?(deltaUnits: number): void;
 
   /** Stop all motion. */
   stopMotion(): void;
 
   /** Last pose reported by the camera (inquiry / integrator), or null. */
   getPose(): CameraPose | null;
+  /** Lens focus position, raw units (null = unknown / not supported). */
+  getFocusUnits?(): number | null;
 
   /**
    * How far the head currently lags (+) or leads (−) the smooth trajectory

@@ -61,6 +61,7 @@ describe("passToRow", () => {
       turn_deg: 62,
       turn_dir: "right",
       departure: 0,
+      alt_ca: 11175,
     });
     // Every derived column is present (has_clip / created_at are added at ingest).
     const expected = PASS_ROW_COLUMNS.filter((c) => c !== "has_clip" && c !== "created_at");

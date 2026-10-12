@@ -86,6 +86,7 @@ export function passToRow(meta: unknown): { ok: true; row: DerivedRow } | { ok: 
       clip_bytes: int(md.clipBytes),
       ...q,
       ...g,
+      alt_ca: num(p.altFtAtCa),
     },
   };
 }

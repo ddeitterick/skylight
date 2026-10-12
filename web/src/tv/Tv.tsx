@@ -26,6 +26,42 @@ function routeLine(ac: Aircraft | undefined): { from?: string; to?: string } {
   };
 }
 
+type NextPlaneState = NonNullable<import("@shared/index.js").TrackerState["nextPlane"]>;
+
+/** Seconds left until the next plane, ticking locally between updates. */
+function useCountdown(next: NextPlaneState | null | undefined, stateNow: number | undefined): number | null {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setTick((t) => t + 1), 1000);
+    return () => clearInterval(id);
+  }, []);
+  if (!next || stateNow == null) return null;
+  return Math.max(0, next.etaSec - (Date.now() - stateNow) / 1000);
+}
+
+function fmtEta(sec: number): string {
+  const s = Math.round(sec);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+function compass(az: number): string {
+  return ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][Math.round(((az % 360) + 360) % 360 / 45) % 8];
+}
+
+/** "Next up" strip under the radar. */
+function NextUp({ next, eta }: { next: NextPlaneState | null | undefined; eta: number | null }) {
+  if (!next || eta == null) return <div className="tv-next tv-next-none">NEXT UP · nothing inbound in the next 5 min</div>;
+  return (
+    <div className="tv-next">
+      <span className="tv-next-label">{next.departure ? "DEPARTING" : "NEXT UP"}</span>
+      <span className="tv-next-flight">{next.flight ?? next.hex}</span>
+      {(next.typeCode || next.typeName) && <span className="tv-next-type">{next.typeCode ?? next.typeName}</span>}
+      <span className="tv-next-eta">{eta < 1 ? "now" : `in ${fmtEta(eta)}`}</span>
+      <span className="tv-next-dir">from {compass(next.azDeg)}</span>
+    </div>
+  );
+}
+
 export function Tv() {
   const { stream } = useTracker();
   const { state: serverState } = useStream("display");
@@ -42,6 +78,7 @@ export function Tv() {
   const stabOn = new URLSearchParams(window.location.search).get("stab") === "1";
   useStabilize(mse.videoRef, state?.vision?.detection, { enabled: mse.ok && stabOn });
   const [clock, setClock] = useState("");
+  const nextEta = useCountdown(state?.nextPlane, state?.now);
   const [fps, setFps] = useState<number | null>(null);
 
   // Measured playback rate via requestVideoFrameCallback (where supported).
@@ -197,6 +234,7 @@ export function Tv() {
       <aside className="tv-radar">
         <div className="tv-radar-title">RADAR · {state.candidates.length} IN RANGE</div>
         <SkyPolar state={state} config={config} onPick={() => {}} />
+        <NextUp next={state.nextPlane} eta={nextEta} />
       </aside>
 
       {/* SFO surface traffic — who's taxiing / next up */}
@@ -248,10 +286,22 @@ export function Tv() {
         ) : (
           <>
             <div className="tv-card-tag scanning">SCANNING</div>
-            <div className="tv-flight idle-mark">SKYLIGHT</div>
-            <div className="tv-idle-sub">
-              watching the sky · {state.upstream.aircraftCount} aircraft on the radio
-            </div>
+            {state.nextPlane && nextEta != null ? (
+              <>
+                <div className="tv-countdown">{nextEta < 1 ? "NOW" : fmtEta(nextEta)}</div>
+                <div className="tv-idle-sub">
+                  next plane: {state.nextPlane.flight ?? state.nextPlane.hex}
+                  {state.nextPlane.typeCode ? ` · ${state.nextPlane.typeCode}` : ""} · from the {compass(state.nextPlane.azDeg)}
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="tv-flight idle-mark">SKYLIGHT</div>
+                <div className="tv-idle-sub">
+                  watching the sky · {state.upstream.aircraftCount} aircraft on the radio
+                </div>
+              </>
+            )}
           </>
         )}
       </section>

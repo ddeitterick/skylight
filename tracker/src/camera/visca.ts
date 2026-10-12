@@ -187,9 +187,15 @@ export function speedTableAt(
 
 /** Sentinel for "axis not driven" — distinct from speed byte 0, a real gear. */
 const STOP_STEP = -1;
-/** Absolute moves always run flat out (pan 0x18 / tilt 0x14, the maxima). */
+/** Absolute moves run flat out (pan 0x18 / tilt 0x14, the maxima)... */
 const ABS_PAN_SPEED = 0x18;
 const ABS_TILT_SPEED = 0x14;
+/** ...except LONG pan slews (dead-zone wraps, big re-targets): the pan
+ *  pointing jumped ~+2° across a wrap pass (SWA2306, 2026-10-11; landmark
+ *  checks saw −2.0/+1.0° jumps that afternoon) — the motor missing steps
+ *  while flinging the head through ~300°. */
+const ABS_PAN_SPEED_LONG = 0x12;
+const LONG_PAN_MOVE_DEG = 120;
 
 /** Sustained deg/s of a discrete speed step (nearest table entry). */
 function stepRate(table: [number, number][], step: number): number {
@@ -431,6 +437,62 @@ export class ViscaCamera implements CameraDriver {
     return st.onHi ? hiStep : loStep;
   }
 
+  /** Tilt rests only on detents ~0.33° apart (probed at full tele: a
+   *  pulse moves 0 or 22-24 encoder units, never less). Below the slowest
+   *  gear the dither's bursts slid one or two detents and the loop then
+   *  pulsed back — a 0.3-0.8° up-down limit cycle, 15-35% of the frame
+   *  height at 4° HFOV. The stepper below takes exactly one detent per
+   *  pulse, only in the direction the plane needs. */
+  static readonly TILT_DETENT_DEG = 0.33;
+  /** 120 ms at speed 2 moved exactly one detent in every probe trial; 40-80 ms
+   *  sometimes moved nothing (and the stall let a climbing plane out of frame). */
+  private static readonly TILT_PULSE_MS = 120;
+  /** Above this the stepper's ~3 pulses/s cadence can't keep up (ASA1403
+   *  climbing at 0.9°/s: tilt froze 0.8 s, lag 1.2°, plane left the frame). */
+  private static readonly STEPPER_MAX_DPS = 0.45;
+  /** Zoom from which the stepper replaces dithering (detent vs frame). */
+  private static readonly STEPPER_MIN_ZOOM = 900;
+  private tiltStepper = { acc: 0, until: 0, dir: 0, lastAt: 0, active: false };
+
+  /**
+   * Single-detent tilt stepping for rates below the slowest gear. Integrates
+   * the wanted rate; at 0.6 detent of accumulated demand fires one short
+   * speed-2 pulse (= one detent) and books a full detent. Reversal needs the
+   * demand to swing 1.2 detents the other way, so noise can't rock it.
+   * Returns null when the regular dither should drive.
+   */
+  private tiltDetentStep(
+    table: [number, number][],
+    want: number,
+    zoom: number,
+    now: number,
+  ): { step: number; dir: number } | null {
+    const st = this.tiltStepper;
+    const dt = st.lastAt ? Math.min(0.2, (now - st.lastAt) / 1000) : 0;
+    st.lastAt = now;
+    const slowest = table[0][1];
+    const engaged =
+      zoom >= ViscaCamera.STEPPER_MIN_ZOOM &&
+      Math.abs(want) < Math.min(0.8 * slowest, ViscaCamera.STEPPER_MAX_DPS);
+    if (!engaged) {
+      st.active = false;
+      st.acc = 0;
+      st.until = 0;
+      return null;
+    }
+    st.active = true;
+    if (now < st.until) return { step: 2, dir: st.dir };
+    const D = ViscaCamera.TILT_DETENT_DEG;
+    st.acc = Math.max(-1.5 * D, Math.min(1.5 * D, st.acc + want * dt));
+    if (Math.abs(st.acc) >= 0.6 * D) {
+      st.dir = Math.sign(st.acc);
+      st.acc -= st.dir * D;
+      st.until = now + ViscaCamera.TILT_PULSE_MS;
+      return { step: 2, dir: st.dir };
+    }
+    return { step: STOP_STEP, dir: 0 };
+  }
+
   /** Stop velocity drives this far before a mechanical limit, deg. */
   private static readonly LIMIT_MARGIN_DEG = 2.5;
 
@@ -485,7 +547,17 @@ export class ViscaCamera implements CameraDriver {
     const R = opts?.rippleDeg ?? ViscaCamera.DITHER_RIPPLE_DEG;
     const RT = opts?.rippleTiltDeg ?? R;
     const panStep = this.pickDithered(this.panDither, speedTableAt("pan", z), pd, now, R);
-    const tiltStep = this.pickDithered(this.tiltDither, speedTableAt("tilt", z), td, now, RT);
+    const tiltTable = speedTableAt("tilt", z);
+    let tiltStep: number;
+    const stepper = this.tiltDetentStep(tiltTable, td, z, now);
+    if (stepper !== null) {
+      tiltStep = stepper.step;
+      td = stepper.dir; // direction of the pulse in flight (0 = stopped)
+      this.cmdTiltDps = stepper.step === STOP_STEP ? 0 : stepper.dir * stepRate(tiltTable, stepper.step);
+      this.tiltDither.acc = 0;
+    } else {
+      tiltStep = this.pickDithered(this.tiltDither, tiltTable, td, now, RT);
+    }
     // Pan units increase to the RIGHT (02); tilt units increase UP (01).
     const panDir = panStep === STOP_STEP ? 0x03 : pd > 0 ? 0x02 : 0x01;
     const tiltDir = tiltStep === STOP_STEP ? 0x03 : td > 0 ? 0x01 : 0x02;
@@ -515,7 +587,7 @@ export class ViscaCamera implements CameraDriver {
 
   /** Focus state: null = unknown (assert on first call). "onepush" means a
    *  one-push AF sweep is the active mode (distinct from steady infinity). */
-  private focusMode: "infinity" | "auto" | "onepush" | null = null;
+  private focusMode: "infinity" | "auto" | "onepush" | "manual" | null = null;
   private focusFarTimer: ReturnType<typeof setTimeout> | null = null;
 
   setFocusInfinity(on: boolean): void {
@@ -536,6 +608,32 @@ export class ViscaCamera implements CameraDriver {
       this.sendCommand([0x81, 0x01, 0x04, 0x08, 0x00, 0xff]); // focus stop
       this.sendCommand([0x81, 0x01, 0x04, 0x38, 0x02, 0xff]); // auto focus
     }
+  }
+
+  /** Manual focus, lens left where it is (the camera keeps zoom-tracking). */
+  focusManual(): void {
+    if (this.focusFarTimer) { clearTimeout(this.focusFarTimer); this.focusFarTimer = null; }
+    if (this.focusMode === "manual") return;
+    this.focusMode = "manual";
+    this.sendCommand([0x81, 0x01, 0x04, 0x38, 0x03, 0xff]);
+  }
+
+  /**
+   * Move focus by about `deltaUnits` (signed raw units, + = nearer) with a
+   * timed speed-7 drive — Focus Direct is ignored by this firmware. Rates
+   * measured at full tele: near ≈ 94 u/s, far ≈ 80 u/s.
+   */
+  focusNudge(deltaUnits: number): void {
+    if (this.focusFarTimer) { clearTimeout(this.focusFarTimer); this.focusFarTimer = null; }
+    if (this.focusMode !== "manual") this.sendCommand([0x81, 0x01, 0x04, 0x38, 0x03, 0xff]);
+    this.focusMode = "manual";
+    const near = deltaUnits > 0;
+    const ms = Math.min(3000, Math.max(60, (Math.abs(deltaUnits) / (near ? 94 : 80)) * 1000));
+    this.sendCommand([0x81, 0x01, 0x04, 0x08, near ? 0x37 : 0x27, 0xff]);
+    this.focusFarTimer = setTimeout(() => {
+      this.focusFarTimer = null;
+      this.sendCommand([0x81, 0x01, 0x04, 0x08, 0x00, 0xff]); // focus stop
+    }, ms);
   }
 
   onePushAutofocus(): void {
@@ -707,9 +805,10 @@ export class ViscaCamera implements CameraDriver {
     if (moved) {
       const p = nibbles(panDegToUnits(w.panDeg, this.o.units), 4);
       const t = nibbles(tiltDegToUnits(w.tiltDeg, this.o.units), 4);
+      const longMove = this.pose != null && Math.abs(w.panDeg - this.pose.panDeg) > LONG_PAN_MOVE_DEG;
       this.sendCommand([
         0x81, 0x01, 0x06, 0x02,
-        ABS_PAN_SPEED, ABS_TILT_SPEED,
+        longMove ? ABS_PAN_SPEED_LONG : ABS_PAN_SPEED, ABS_TILT_SPEED,
         ...p, ...t, 0xff,
       ]);
       this.lastSent = { panDeg: w.panDeg, tiltDeg: w.tiltDeg };
@@ -718,7 +817,7 @@ export class ViscaCamera implements CameraDriver {
       // the gate's hard expiry even if no position reply ever lands.
       const travelSec = this.pose
         ? Math.max(
-            Math.abs(w.panDeg - this.pose.panDeg) / this.o.limits.panSpeedMaxDps,
+            Math.abs(w.panDeg - this.pose.panDeg) / (this.o.limits.panSpeedMaxDps * (longMove ? 0.6 : 1)),
             Math.abs(w.tiltDeg - this.pose.tiltDeg) / this.o.limits.tiltSpeedMaxDps,
           )
         : 3;
@@ -731,9 +830,37 @@ export class ViscaCamera implements CameraDriver {
     }
   }
 
+  private inquiryCycle = 0;
+  private focusPos: { units: number; at: number } | null = null;
+
   private inquirePosition(): void {
     this.sendInquiry([0x81, 0x09, 0x06, 0x12, 0xff]); // pan/tilt position
-    this.sendInquiry([0x81, 0x09, 0x04, 0x47, 0xff]); // zoom position
+    // Focus and zoom answers are both `90 50 <4 nibbles> ff` and replies
+    // carry no usable seq, so each cycle asks for exactly ONE of them (focus
+    // every 4th) and the 7-byte answer is matched to what was asked. The
+    // value can't tell them apart: focus crosses zero near zoom ~1000 and
+    // small positive focus readings were taken for zoom 20-170 (the zoom
+    // "flapping" 14°↔54° every 0.2 s that broke locks, 2026-10-11).
+    // One question outstanding at a time: while the last one is unanswered
+    // (<300 ms) this cycle asks nothing, so an answer can never be matched to
+    // a later question.
+    const now = Date.now();
+    if (this.pending7 && now - this.pending7.at < 300) return;
+    // Zoomed in, focus is servoed: ask for it every other cycle.
+    const focusEvery = (this.pose?.zoomUnits ?? 0) >= 900 ? 2 : 4;
+    if (++this.inquiryCycle % focusEvery === 0) {
+      this.pending7 = { kind: "focus", at: now };
+      this.sendInquiry([0x81, 0x09, 0x04, 0x48, 0xff]); // focus position
+    } else {
+      this.pending7 = { kind: "zoom", at: now };
+      this.sendInquiry([0x81, 0x09, 0x04, 0x47, 0xff]); // zoom position
+    }
+  }
+  private pending7: { kind: "zoom" | "focus"; at: number } | null = null;
+
+  /** Lens focus position (inquiry, signed raw units; larger = nearer). */
+  getFocusUnits(): number | null {
+    return this.focusPos && Date.now() - this.focusPos.at < 3000 ? this.focusPos.units : null;
   }
 
   private sendControlReset(): void {
@@ -798,7 +925,22 @@ export class ViscaCamera implements CameraDriver {
           zoomUnits: this.pose?.zoomUnits ?? 0,
         };
       } else if (payload.length === 7 && payload[payload.length - 1] === 0xff) {
-        const zoom = fromNibbles(payload.subarray(2, 6));
+        const v = fromNibbles(payload.subarray(2, 6)); // 16-bit signed
+        const asked = this.pending7;
+        this.pending7 = null;
+        if (!asked || Date.now() - asked.at > 300) return; // stale / unsolicited
+        if (asked.kind === "focus") {
+          // A late zoom answer can still land on a focus question (seen:
+          // "focus" 1401/1431/1437 at zoom 1392-1437 where focus is ≈ −3900).
+          // Focus never reads above ~+350 at any zoom on this lens; a value in
+          // the zoom range above that is a zoom answer.
+          if (v > 600) return;
+          this.focusPos = { units: v, at: Date.now() };
+          return;
+        }
+        const zoomMax = Math.max(this.o.units.zoomWideUnits, this.o.units.zoomTeleUnits);
+        if (v < 0 || v > zoomMax + 64) return; // not a zoom reading
+        const zoom = v;
         this.lastInquiryReply = Date.now();
         this.pose = {
           panDeg: this.pose?.panDeg ?? 0,

@@ -251,7 +251,7 @@ describe("buildSeries", () => {
     expect(s.hz).toBe(10);
     expect(s.cols).toEqual([...SERIES_COLS]);
     expect(s.rows).toHaveLength(25);
-    expect(s.rows[0]).toHaveLength(16);
+    expect(s.rows[0]).toHaveLength(18);
     expect(s.rows[0][0]).toBe(0);
     expect(s.rows[0][10]).toBeNull(); // dcx before the first detection
     expect(s.rows[24][10]).toBe(0.52);

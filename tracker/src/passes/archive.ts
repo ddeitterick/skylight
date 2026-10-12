@@ -196,7 +196,7 @@ export class PassArchive {
           action: e.action,
           hfov: round1(e.hfov),
           label:
-            e.action === "onePush" ? "One-push autofocus" : "Autofocus lost the plane: infinity fallback",
+            e.action === "onePush" ? "One-push autofocus" : "Focus nudged to the learned point",
         });
         break;
     }
@@ -260,8 +260,11 @@ export class PassArchive {
     const cfg = this.opts.config();
     const pose = state.pose;
     const cmd = state.target.commandedPanTilt ?? state.commanded;
+    // The lens's actual FOV (the detector's dcx/dcy are frame fractions at
+    // it); target.hfovDeg is the zoom being COMMANDED, which leads the lens
+    // by seconds during a zoom move.
     const hfov =
-      state.target.hfovDeg ?? (pose ? hfovFromZoomUnits(pose.zoomUnits, cfg.zoom.fovLut) : null);
+      pose ? hfovFromZoomUnits(pose.zoomUnits, cfg.zoom.fovLut) : state.target.hfovDeg;
     const det = state.vision.detection;
     const pred = state.target.predicted;
     const ac = this.opts.find(s.hex);
@@ -289,6 +292,8 @@ export class PassArchive {
       corrAz: state.vision.correctionAzDeg,
       corrEl: state.vision.correctionElDeg,
       lead: state.target.leadSec,
+      fe: state.vision.focus && state.vision.focus.ageMs < 1000 ? state.vision.focus.edgePx : null,
+      fpos: state.vision.lensFocusUnits ?? null,
       gsKt: ac?.gs ?? null,
       altFt: ac?.altGeom ?? ac?.altBaro ?? null,
       baroRateFpm: ac?.baroRate ?? null,

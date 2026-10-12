@@ -313,6 +313,21 @@ describe("geometry filters and sorts (schema 1.2)", () => {
   it("rejects a bad turnDir", () => {
     expect(parseFilters(params("turnDir=up")).errors).toEqual(["turnDir must be left or right"]);
   });
+  it("filters and sorts by altitude at closest approach", () => {
+    const { filters, errors } = parseFilters(new URLSearchParams("minAlt=8000&maxAlt=40000"));
+    expect(errors).toEqual([]);
+    expect(filters).toEqual({ minAlt: 8000, maxAlt: 40000 });
+    const { sql, params: p } = buildWhere(filters);
+    expect(sql).toBe("WHERE alt_ca >= ? AND alt_ca <= ?");
+    expect(p).toEqual([8000, 40000]);
+    expect(parseFilters(new URLSearchParams("minAlt=high")).errors).toEqual(["minAlt must be a number"]);
+    expect(SORTABLE).toContain("alt_ca");
+    expect(PASS_ROW_COLUMNS).toContain("alt_ca");
+    const q = buildListQuery({ minAlt: 8000 }, { sort: "alt_ca", dir: "desc", limit: 10, cursor: null });
+    expect(q.sql).toContain("WHERE alt_ca >= ? ORDER BY alt_ca DESC NULLS LAST, id DESC LIMIT ?");
+    expect(q.params).toEqual([8000, 11]);
+  });
+
   it("sorts by aspect and turn_deg, NULLs last", () => {
     for (const c of ["aspect", "turn_deg"] as const) {
       expect(SORTABLE).toContain(c);

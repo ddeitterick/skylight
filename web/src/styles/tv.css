@@ -193,6 +193,26 @@ body {
 .tv-radar .predicted-ring { stroke: var(--green); }
 .tv-radar .camera-aim line { stroke: var(--lock); stroke-width: 1.6; }
 
+/* --- next-plane countdown --- */
+.tv-next {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px;
+  font-family: var(--mono); font-size: 12px; letter-spacing: 0.08em;
+  color: rgba(232, 246, 238, 0.85);
+  padding: 8px 6px 6px; border-top: 1px solid var(--glass-line); margin-top: 4px;
+}
+.tv-next-none { color: var(--hud-dim); }
+.tv-next-label { color: var(--hud-dim); letter-spacing: 0.22em; font-size: 10.5px; }
+.tv-next-flight { color: #fff; font-weight: 600; letter-spacing: 0.06em; }
+.tv-next-type { color: var(--hud-dim); }
+.tv-next-eta { color: var(--green); font-weight: 600; font-variant-numeric: tabular-nums; }
+.tv-next-dir { color: var(--hud-dim); }
+.tv-countdown {
+  font-family: var(--mono); font-size: 64px; line-height: 1; font-weight: 600;
+  color: var(--green); font-variant-numeric: tabular-nums; letter-spacing: 0.04em;
+  text-shadow: 0 0 24px rgba(67, 209, 124, 0.25);
+  margin: 2px 0 6px;
+}
+
 /* --- flight card --- */
 .tv-card {
   position: absolute;

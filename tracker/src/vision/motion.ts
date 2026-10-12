@@ -246,6 +246,35 @@ export function findMovingBlobs(
  * The plane is always above the horizon; this drops rooftops/poles/trees for
  * free. `aimElDeg` is the frame-centre elevation, `vfovDeg` the vertical FOV.
  */
+/**
+ * Zero the residual below the local SKYLINE: per column, the measured
+ * obstruction elevation at that column's azimuth (`skylineEl(az)`, e.g. the
+ * per-azimuth `limits.horizon` table). The flat −2° mask left every roof and
+ * tree between 0° and 18° as a candidate, and on a low take-off toward a row
+ * of houses the lock took a roofline 5-8° below the plane (SKW6277,
+ * 2026-10-11) and dragged the aim into the houses.
+ */
+export function maskBelowSkyline(
+  residual: Uint8Array,
+  w: number,
+  h: number,
+  aimAzDeg: number,
+  aimElDeg: number,
+  hfovDeg: number,
+  vfovDeg: number,
+  skylineEl: (azDeg: number) => number,
+  /** +1 if image x grows with azimuth (pan gain > 0). */
+  sign = 1,
+): void {
+  if (vfovDeg <= 0 || hfovDeg <= 0) return;
+  const cosE = Math.max(0.2, Math.cos((aimElDeg * Math.PI) / 180));
+  for (let x = 0; x < w; x++) {
+    const az = aimAzDeg + (((x + 0.5) / w - 0.5) * hfovDeg * sign) / cosE;
+    const yH = 0.5 + (aimElDeg - skylineEl(((az % 360) + 360) % 360)) / vfovDeg;
+    for (let y = Math.max(0, Math.floor(yH * h)); y < h; y++) residual[y * w + x] = 0;
+  }
+}
+
 export function maskBelowHorizon(
   residual: Uint8Array,
   w: number,

@@ -57,6 +57,9 @@ export const JUMP_FRAC = 0.15;
 export const JUMP_WINDOW_SEC = 0.6;
 export const JUMPY_PER_MIN = 6;
 export const LOW_ZOOM_HFOV = 9;
+/** Plane spanning at least this fraction of the frame width is "big"
+ *  however wide the lens (no low-zoom flag). */
+export const BIG_IN_FRAME_FRAC = 0.12;
 export const WRAP_PINNED_LOCK_PCT = 55;
 
 // ------------------------------------------------------------------ frames
@@ -573,7 +576,12 @@ export function scorePass(inp: ScoreInput): PassQuality {
   if (lockPct < LOST_LOCK_PCT || st.lostGapTeleSec > LOST_GAP_TELE_SEC) flags.push("lost-lock");
   if (st.jumpsPerMin > JUMPY_PER_MIN) flags.push("jumpy");
   if (pass.pass?.deadZoneWrap && lockPct < WRAP_PINNED_LOCK_PCT) flags.push("wrap-pinned");
-  if (t.hfovMinDeg == null || t.hfovMinDeg > LOW_ZOOM_HFOV) flags.push("low-zoom");
+  // "Low zoom" means the plane stayed small, not that the lens stayed wide:
+  // a close A380 fills the frame at 15° (DLH455 was flagged and looked great).
+  const spanM = spanForCategory(pass.aircraft?.category);
+  const maxExpected = rows.reduce((m, r) => Math.max(m, r.hfov ? expectedSizeFrac(spanM, r.slant, r.hfov) : 0), 0);
+  const bigInFrame = (plane && best!.sizeFrac >= BIG_IN_FRAME_FRAC) || maxExpected >= BIG_IN_FRAME_FRAC;
+  if ((t.hfovMinDeg == null || t.hfovMinDeg > LOW_ZOOM_HFOV) && !bigInFrame) flags.push("low-zoom");
 
   const lockTerm = clamp01((lockPct - 30) / 60);
   const centredTerm = clamp01(st.centredTeleSec / 15);

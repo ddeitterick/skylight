@@ -345,3 +345,40 @@ describe("byte-0 slow gear", () => {
     expect(sent[0].slice(4, 8)).toEqual([1, 1, 0x03, 0x03]);
   });
 });
+
+describe("tilt detent stepper (slow tilt at tele)", () => {
+  type Step = { step: number; dir: number } | null;
+  const stepper = (cam: ViscaCamera) =>
+    (cam as unknown as { tiltDetentStep: (t: [number, number][], w: number, z: number, n: number) => Step })
+      .tiltDetentStep.bind(cam);
+  const TABLE: [number, number][] = [[0, 1.5], [2, 2.6], [6, 4.6]];
+
+  it("takes one detent per pulse at the demanded average rate, never reversing", () => {
+    const cam = makeCam();
+    const f = stepper(cam);
+    let pulses = 0, reversals = 0, lastDir = 0, inPulse = false;
+    for (let t = 0; t <= 20_000; t += 66) {
+      // 0.1°/s plus detector-like noise of ±0.15°/s
+      const want = 0.1 + 0.15 * Math.sin(t / 700);
+      const r = f(TABLE, want, 1437, 1_000_000 + t)!;
+      const moving = r.dir !== 0; // dir 0 = stopped between pulses
+      if (moving && !inPulse) {
+        pulses++;
+        if (lastDir && r.dir !== lastDir) reversals++;
+        lastDir = r.dir;
+      }
+      inPulse = moving;
+    }
+    // 2° over 20 s ≈ 6 detents of 0.33°
+    expect(pulses).toBeGreaterThanOrEqual(5);
+    expect(pulses).toBeLessThanOrEqual(7);
+    expect(reversals).toBe(0);
+  });
+
+  it("stays out of the way at wide zoom or above the slowest gear", () => {
+    const cam = makeCam();
+    const f = stepper(cam);
+    expect(f(TABLE, 0.1, 300, 1000)).toBeNull();
+    expect(f(TABLE, 2.0, 1437, 1100)).toBeNull();
+  });
+});

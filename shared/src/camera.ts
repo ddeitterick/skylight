@@ -97,6 +97,15 @@ export interface TargetCriteria {
   hysteresisSec: number;
   /** A challenger must beat the current target's score by this margin. */
   switchMargin: number;
+  /**
+   * Skip aircraft within this many degrees of the sun (absent = 15). The
+   * zoomed lens pointed at the sun is a blown-out frame at best and a
+   * sensor burn at worst.
+   */
+  sunAvoidDeg?: number;
+  /** Departures from the home airport heading at the site win selection
+   *  from lift-off (default true). */
+  departurePriority?: boolean;
 }
 
 export interface Candidate {
@@ -194,6 +203,24 @@ export interface VisionState {
     spanAzDeg: number;
     spanElDeg: number;
   };
+  /** Focus quality on the locked plane: edge width in full-res px (≈2-3
+   *  sharp at stream resolution; defocus grows it). */
+  focus?: { edgePx: number; contrast: number; ageMs: number } | null;
+  /** Lens focus position from the camera, raw units (larger = nearer). */
+  lensFocusUnits?: number | null;
+  /** Focus controller's last decision inputs (debugging). */
+  focusDebug?: Record<string, number | boolean | string | null>;
+  /** Landmark (skyline) re-calibration: catches a moved/re-placed base. */
+  landmarks?: {
+    refs: number;
+    capturedAt: number | null;
+    running: boolean;
+    lastCheckAt: number | null;
+    /** Last verdict kind and median measured shift, deg. */
+    lastVerdict: string | null;
+    lastShiftDeg: { dx: number; dy: number } | null;
+    lastAppliedAt: number | null;
+  };
 }
 
 /** Pass archive (automatic per-pass clip + telemetry recorder/uploader). */
@@ -214,6 +241,16 @@ export interface PassArchiveStatus {
 /** Everything the debug UI needs, broadcast ~5–10 Hz. */
 export interface TrackerState {
   now: number;
+  /** Soonest aircraft to become trackable (stream countdown). */
+  nextPlane?: {
+    hex: string;
+    flight?: string;
+    typeCode?: string;
+    typeName?: string;
+    etaSec: number;
+    azDeg: number;
+    departure: boolean;
+  } | null;
   mode: TrackerMode;
   targetMode: TargetMode;
   driver: CameraDiagnostics;

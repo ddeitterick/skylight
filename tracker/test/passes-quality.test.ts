@@ -235,7 +235,10 @@ describe("scorePass", () => {
       scorePass({ pass: { ...basePass(), ...p } as never, rows: r, best, framesWithPlane: w }).flags;
     expect(flags({ durationSec: 12 })).toContain("short");
     expect(flags({ tracking: { lockPct: 30, hfovMinDeg: 4 } })).toContain("lost-lock");
-    expect(flags({ tracking: { lockPct: 85, hfovMinDeg: 12 } })).toContain("low-zoom");
+    const wideRows = rows.map((r) => ({ ...r, hfov: 12, slant: 8000 }));
+    expect(flags({ tracking: { lockPct: 85, hfovMinDeg: 12 } }, frame({ sizeFrac: 0.04 }), 10, wideRows)).toContain("low-zoom");
+    // a close, big plane at a wide zoom is not "low zoom" (the A380 case)
+    expect(flags({ tracking: { lockPct: 85, hfovMinDeg: 15 } }, frame({ sizeFrac: 0.3 }), 10, wideRows)).not.toContain("low-zoom");
     expect(flags({ pass: { deadZoneWrap: true }, tracking: { lockPct: 50, hfovMinDeg: 4 } })).toContain("wrap-pinned");
     expect(flags({}, frame({ sharpness: 0.2 }))).toContain("soft-focus");
     expect(flags({}, frame({ present: false }), 0)).toContain("no-plane");

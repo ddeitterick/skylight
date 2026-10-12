@@ -24,6 +24,7 @@ import {
   worldFromMount,
   zoomUnitsFromHfov,
   type Aircraft,
+  type GeoPoint,
   type CalibrationRef,
   type CameraPose,
   type Config,
@@ -37,17 +38,33 @@ import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import type { CameraDriver } from "./camera/driver.js";
 import { AutoCalibrator } from "./calibration/auto.js";
-import { CalibrationSession } from "./calibration/session.js";
+import { CalibrationSession, visibleBodies } from "./calibration/session.js";
+import {
+  LandmarkStore,
+  decodeImg,
+  encodeImg,
+  evaluateShifts,
+  landmarkImage,
+  phaseCorrelate,
+  shiftDeg,
+  type LandmarkSet,
+} from "./calibration/landmarks.js";
 import { planPass, zenithHold, ZENITH_MIN_HFOV } from "./pointing/planner.js";
 import { predictAim, TrackHistory, type Prediction } from "./pointing/predict.js";
 import { selectTarget, type CurrentTarget } from "./pointing/target.js";
 import { chooseZoom } from "./pointing/zoom.js";
+import { FocusController } from "./camera/focus.js";
+import { nextPlane, type NextPlane } from "./pointing/nextPass.js";
 import { decodeLuma, VISION_W, VISION_H, type Detection } from "./vision/detect.js";
+import { silhouetteCentroid } from "./vision/silhouette.js";
+import { measureSharpness } from "./vision/sharpness.js";
+import sharp from "sharp";
 import {
   estimateShift,
   compensatedResidual,
   findMovingBlobs,
   maskBelowHorizon,
+  maskBelowSkyline,
 } from "./vision/motion.js";
 import { lockVelTolerance, TrackTable, type WorldObs } from "./vision/tracks.js";
 import type { Recorder } from "./record.js";
@@ -56,12 +73,38 @@ import type { VideoStream } from "./video/stream.js";
 
 const TRACKER_DIR = dirname(fileURLToPath(import.meta.url));
 const AUTOCAL_FILE = resolve(TRACKER_DIR, "../data/autocal.json");
+const LANDMARK_FILE = resolve(TRACKER_DIR, "../data/landmarks.json");
+const FOCUS_LUT_FILE = resolve(TRACKER_DIR, "../data/focus-lut.json");
+/** Landmark check cadence: first one shortly after start (a remount is
+ *  usually followed by a restart), then daily; retries after a failed or
+ *  aborted check. */
+const LM_FIRST_DELAY_MS = 60_000;
+const LM_PERIOD_MS = 60 * 60_000;
+const LM_RETRY_MS = 15 * 60_000;
+/** After an interruption: resume at the next idle gap, keeping the frames
+ *  already shot while they are this fresh. */
+const LM_RESUME_MS = 30_000;
+const LM_PARTIAL_MAX_AGE_MS = 30 * 60_000;
+/** Idle this long (no target) before taking the camera for ~40 s. */
+const LM_IDLE_MS = 20_000;
+/** Sun at least this high: the skyline needs daylight to correlate. */
+const LM_MIN_SUN_EL = 8;
+/** Reference azimuths (world); el = local horizon − 4° so the skyline sits
+ *  in the upper half of a wide frame. */
+const LM_AZIMUTHS = [15, 60, 105, 150, 195, 240, 285, 330];
+const WRAP_REARM_MS = 4000;
+/** Drift fold-in from per-pass vision bias (foldPassBias). */
+const BIAS_FOLD_PASSES = 3;
+const BIAS_FOLD_MIN_DEG = 0.6;
+const BIAS_FOLD_MAX_SPREAD = 0.8;
+const BIAS_FOLD_GAIN = 0.5;
 /** Vision bias-correction clamp, deg. The estimator measures an exogenous
  *  ADS-B-vs-mount offset directly (no plant feedback), so it cannot wind up;
- *  the clamp only bounds the damage of a wrong lock. A stale mount model
- *  (re-placed base) needs ~10° of authority or the plane rides the frame
- *  edge until auto-calibration catches up. */
-const CORR_MAX_DEG = 12;
+ *  the clamp only bounds the damage of a wrong lock. It was 12° so a stale
+ *  mount model (re-placed base) could still be followed; landmark re-cal
+ *  now fixes that case, and 12° let a roofline lock drag the aim 12° down
+ *  into the houses (SKW6277). Real ADS-B/mount bias here is < 1.5°. */
+const CORR_MAX_DEG = 3;
 /** Auto-calibration samples are only harvested below this aim slew rate. */
 const AUTOCAL_MAX_AIM_RATE_DPS = 2;
 /** The continuous-sweep floor applies only inside this pose error, deg. */
@@ -103,6 +146,13 @@ const WRAP_SETTLE_SEC = 1.0;
 /** A broadcast detection that moves more than this fraction of the frame
  *  width between consecutive frames is held back until it persists. */
 const DET_HOP_FRAC = 0.08;
+/** Fixed zoom stops near tele, in LENS UNITS (full tele first); their
+ *  HFOVs come from the fovLut, so a re-measured lens table can't move the
+ *  stops off full tele. */
+const TELE_STOP_UNITS = [1437, 1385, 1332, 1260, 1173];
+/** Expected plane size (vision px, 480 wide) above which detections are
+ *  re-centred on the whole silhouette (vision/silhouette.ts). */
+const SILHOUETTE_MIN_PX = 14;
 /** Zoom debounce: how long a tighter / wider framing want must persist. */
 const ZOOM_IN_HOLD_MS = 600;
 const ZOOM_OUT_HOLD_MS = 600;
@@ -149,7 +199,7 @@ export type LoopEvent =
   | {
       kind: "focus";
       t: number;
-      action: "onePush" | "infinityFallback";
+      action: "onePush" | "nudge";
       zoom: number;
       hfov: number | null;
     };
@@ -212,6 +262,24 @@ export class ControlLoop {
   private tracks = new TrackTable();
   /** Continuous auto-calibration from locked passes. */
   private autoCal = new AutoCalibrator(AUTOCAL_FILE);
+  private landmarks = new LandmarkStore(LANDMARK_FILE);
+  private focus = new FocusController(FOCUS_LUT_FILE);
+  private lmRunning = false;
+  private lmAbort = false;
+  private lmNextAt = Date.now() + LM_FIRST_DELAY_MS;
+  /** Frames already shot by an interrupted check — a busy sky rarely
+   *  leaves 40 idle seconds, so the next idle gap carries on from here. */
+  /** Focus quality on the locked plane (vision/sharpness.ts), ≤3 Hz. */
+  private focusMetric: { edgePx: number; contrast: number; t: number } | null = null;
+  private lastSharpAt = 0;
+  private frameDims: { w: number; h: number } | null = null;
+  private lmPartial: { startedAt: number; refsAt: number | null; imgs: (Float64Array | null)[] } | null = null;
+  private lmStatus: {
+    lastCheckAt: number | null;
+    lastVerdict: string | null;
+    lastShiftDeg: { dx: number; dy: number } | null;
+    lastAppliedAt: number | null;
+  } = { lastCheckAt: null, lastVerdict: null, lastShiftDeg: null, lastAppliedAt: null };
   private lastAutoCalAt = 0;
   /** Previous vision frame (luma) + its pose, for motion-compensated diffing. */
   private prevLuma: Uint8Array | null = null;
@@ -225,11 +293,12 @@ export class ControlLoop {
   private wasHold = false;
   /** Latched while pre-positioned at the far side of the pan dead zone. */
   private wrapHolding = false;
+  /** Released this crossing at — no re-engage for WRAP_REARM_MS (it flapped
+   *  engage/release every 0.1 s through UAE41P's 210° sweep). */
+  private wrapReleasedAt = 0;
   private wrapGoal = 0;
   /** Gear-aware zoom floor currently applied (0 = none); hysteresis state. */
   private gearFloorHfov = 0;
-  /** A one-push AF result is being held (don't override it with the far-stop). */
-  private focusHeld = false;
   /** Wall time of the most recent fresh detection (survives lastDetection = null). */
   private lastDetSeenAt = 0;
   /** This pass was classified as a zenith pass inbound (see zenithHold). */
@@ -266,13 +335,6 @@ export class ControlLoop {
   /** Zoom ladder rung (0 = full wide); climbs as vision lock sustains. */
   private ladderIdx = 0;
   private lastLadderAt = 0;
-  /** Focus-on-plane state: zoom units at the last one-push AF, and when.
-   *  lastFocusZoom: >0 = focused at that zoom; 0 = unfocused/reset; -1 = a sweep
-   *  failed and we fell back to the infinity stop (re-arm on the next clean frame). */
-  private lastFocusZoom = 0;
-  private lastFocusAt = 0;
-  /** When the last one-push AF was fired (0 = none pending a result check). */
-  private focusCheckAt = 0;
   /**
    * Recent aim/prediction history so vision can reference the pose AT FRAME
    * TIME — frames lag ~0.7 s, and measuring a blob in an old frame against
@@ -492,6 +554,243 @@ export class ControlLoop {
 
   // --- the tick ---
 
+  private nextPlaneCache: { t: number; v: NextPlane | null } = { t: 0, v: null };
+  private sunCache: { t: number; sun: { azDeg: number; elDeg: number } | null } | null = null;
+
+  /** Next trackable plane, refreshed each second. */
+  private nextPlaneAt(now: number, cfg: TrackerConfig): NextPlane | null {
+    if (now - this.nextPlaneCache.t > 1000) {
+      try {
+        this.nextPlaneCache = {
+          t: now,
+          v: nextPlane(
+            this.upstream.getAircraft(), cfg.site, now, cfg.target, cfg.limits.horizon,
+            this.current?.hex ?? null,
+            cfg.target.departurePriority === false ? null : (this.upstream.getConfig().airport ?? SFO_ARP),
+            this.sunAt(cfg.site, now),
+          ),
+        };
+      } catch {
+        this.nextPlaneCache = { t: now, v: null };
+      }
+    }
+    return this.nextPlaneCache.v;
+  }
+
+  /** Sun direction, refreshed every 30 s (it moves ~0.25°/min). */
+  private sunAt(site: GeoPoint, now: number): { azDeg: number; elDeg: number } | null {
+    if (!this.sunCache || now - this.sunCache.t > 30_000) {
+      const sun = visibleBodies(site, now, -5).find((b) => b.name === "Sun");
+      this.sunCache = { t: now, sun: sun ? { azDeg: sun.azDeg, elDeg: sun.elDeg } : null };
+    }
+    return this.sunCache.sun;
+  }
+
+  /** Mechanical poses for a fresh reference set (current model). */
+  private landmarkPoses(cfg: TrackerConfig): { panDeg: number; tiltDeg: number }[] {
+    const out: { panDeg: number; tiltDeg: number }[] = [];
+    const lim = cfg.limits;
+    for (const az of LM_AZIMUTHS) {
+      const el = horizonMinEl(lim.horizon, az, 12) - 4;
+      const pt = mountFromWorld(az, el, cfg.mount);
+      if (pt.panDeg < lim.panMinDeg + 2 || pt.panDeg > lim.panMaxDeg - 2) continue;
+      out.push({ panDeg: pt.panDeg, tiltDeg: Math.max(lim.tiltMinDeg + 0.5, pt.tiltDeg) });
+    }
+    return out;
+  }
+
+  /**
+   * Drive to a mechanical pose at wide zoom, let it settle, and return the
+   * landmark image of a frame shot after the settle. undefined = aborted
+   * (a target appeared), null = no usable frame.
+   */
+  private async shootLandmark(
+    p: { panDeg: number; tiltDeg: number },
+    cfg: TrackerConfig,
+  ): Promise<Float64Array | null | undefined> {
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const d = this.driver();
+    const target = { ...p, zoomUnits: cfg.units.zoomWideUnits };
+    this.lastCommanded = target;
+    d.gotoAbsolute(target);
+    const t0 = Date.now();
+    for (;;) {
+      await sleep(250);
+      if (this.lmAbort) return undefined;
+      const pose = d.getPose();
+      if (
+        pose &&
+        Math.abs(pose.panDeg - p.panDeg) < 0.15 &&
+        Math.abs(pose.tiltDeg - p.tiltDeg) < 0.15 &&
+        Math.abs(pose.zoomUnits - target.zoomUnits) < 5
+      ) break;
+      if (Date.now() - t0 > 15_000) return null;
+    }
+    // Encoder settled; the stream lags ~0.9 s behind it.
+    const settledAt = Date.now();
+    await sleep(1800);
+    if (this.lmAbort) return undefined;
+    const frame = this.video.latestFrame();
+    if (!frame || this.video.latestFrameAt() < settledAt + 1000) return null;
+    const luma = await decodeLuma(frame);
+    return landmarkImage(luma, VISION_W, VISION_H);
+  }
+
+  private async runLandmarkCheck(): Promise<void> {
+    this.lmRunning = true;
+    this.lmAbort = false;
+    this.atHome = true; // hold off the idle park while we borrow the camera
+    const cfg = this.cfg();
+    const startedAt = Date.now();
+    try {
+      // A pan offset far from the references' model means the base was
+      // deliberately re-aimed and the offset entered by hand: the stored
+      // poses now look elsewhere, so shoot a fresh set instead of comparing.
+      const stored = this.landmarks.set;
+      const reaimed =
+        stored != null && Math.abs(norm180(cfg.mount.panOffsetDeg - stored.model.panOffsetDeg)) > 20;
+      const set = reaimed ? null : stored;
+      const hfov = hfovFromZoomUnits(cfg.units.zoomWideUnits, cfg.zoom.fovLut);
+      const poses = set ? set.refs.map((r) => ({ panDeg: r.panDeg, tiltDeg: r.tiltDeg })) : this.landmarkPoses(cfg);
+      const refsAt = set?.capturedAt ?? null;
+      const partial = this.lmPartial;
+      const resume = partial && partial.refsAt === refsAt && startedAt - partial.startedAt < LM_PARTIAL_MAX_AGE_MS;
+      const imgs: (Float64Array | null)[] = resume ? partial.imgs : [];
+      this.lmPartial = { startedAt: resume ? partial.startedAt : startedAt, refsAt, imgs };
+      for (let i = imgs.length; i < poses.length; i++) {
+        const img = await this.shootLandmark(poses[i], cfg);
+        if (img === undefined) {
+          // Interrupted by a target: keep what we have, carry on next gap.
+          this.lmNextAt = Date.now() + LM_RESUME_MS;
+          this.lmStatus.lastVerdict = `paused ${imgs.length}/${poses.length}`;
+          return;
+        }
+        imgs.push(img);
+      }
+      this.lmPartial = null;
+      const now = Date.now();
+      this.lmStatus.lastCheckAt = now;
+      const capture = (model = cfg.mount): LandmarkSet => ({
+        capturedAt: now,
+        model,
+        hfovDeg: hfov,
+        refs: poses.flatMap((p, i) => (imgs[i] ? [{ ...p, img: encodeImg(imgs[i]!) }] : [])),
+      });
+
+      if (!set) {
+        const fresh = capture();
+        if (fresh.refs.length >= 4) {
+          this.landmarks.save(fresh);
+          this.lmStatus.lastVerdict = "captured";
+          this.lmNextAt = now + LM_PERIOD_MS;
+          console.log(`[tracker] landmarks: captured ${fresh.refs.length} skyline references`);
+        } else {
+          this.lmStatus.lastVerdict = "capture-failed";
+          this.lmNextAt = now + LM_RETRY_MS;
+        }
+        this.recorder.write("landmarks", { verdict: this.lmStatus.lastVerdict, refs: fresh.refs.length });
+        return;
+      }
+
+      const shifts = imgs.map((g, i) => (g ? shiftDeg(phaseCorrelate(decodeImg(set.refs[i].img), g), set.hfovDeg) : null));
+      const verdict = evaluateShifts(set, shifts, cfg.mount);
+      this.lmStatus.lastVerdict = verdict.kind;
+      this.lmStatus.lastShiftDeg =
+        "medDxDeg" in verdict ? { dx: verdict.medDxDeg, dy: verdict.medDyDeg } : null;
+      this.recorder.write("landmarks", { verdict, shifts });
+      console.log(
+        `[tracker] landmarks: ${verdict.kind} (${verdict.good}/${set.refs.length} refs)` +
+          ("medDxDeg" in verdict ? ` shift ${verdict.medDxDeg.toFixed(2)}°/${verdict.medDyDeg.toFixed(2)}°` : ""),
+      );
+
+      if (verdict.kind === "shifted") {
+        this.autoCal.shiftSamples(
+          verdict.model.panOffsetDeg - cfg.mount.panOffsetDeg,
+          verdict.model.tiltOffsetDeg - cfg.mount.tiltOffsetDeg,
+          cfg.mount.panGain, cfg.mount.tiltGain, now,
+        );
+        this.upstream.patchConfig({ tracker: { mount: verdict.model } } as Partial<Config>);
+        // Re-shoot the references at once (same frames, new model) so the
+        // next check measures only drift from here.
+        this.landmarks.save(capture(verdict.model));
+        this.corrAz = 0;
+        this.corrAzX = 0;
+        this.corrEl = 0;
+        this.corrAzApp = 0;
+        this.corrElApp = 0;
+        this.lmStatus.lastAppliedAt = now;
+        this.recorder.write("landmarksApplied", { model: verdict.model, rmsDeg: verdict.rmsDeg });
+        this.lmNextAt = now + LM_PERIOD_MS;
+        return;
+      }
+      if (verdict.kind === "unchanged") {
+        // Follow the auto-cal: references re-shot under a model the planes
+        // have refined since are better truth than the old ones.
+        const acAt = this.autoCal.status(cfg.mount).lastAppliedAt;
+        if (acAt != null && acAt > set.capturedAt) this.landmarks.save(capture());
+        this.lmNextAt = now + LM_PERIOD_MS;
+        return;
+      }
+      this.lmNextAt = now + LM_RETRY_MS; // insufficient / inconsistent (haze, glare, busy sky)
+    } catch (e) {
+      console.warn("[tracker] landmark check failed:", e);
+      this.lmNextAt = startedAt + LM_RETRY_MS;
+    } finally {
+      this.lmRunning = false;
+      this.atHome = false; // re-park at home
+    }
+  }
+
+  /** Bias corrections sampled while locked this pass (az, el deg). */
+  private passBias: { az: number; el: number }[] = [];
+  private biasSampleAt = 0;
+  /** Recent passes' median corrections, newest last. */
+  private biasHistory: { az: number; el: number; t: number }[] = [];
+
+  /**
+   * Drift fold-in. The per-pass vision bias IS the mount-model error where
+   * the plane flew; when several recent passes agree on a sizeable offset
+   * the mount has moved (pan slips of 1-2° were seen repeatedly on
+   * 2026-10-11, and a busy evening sky starves the landmark check of idle
+   * time — "paused 4/7" for 30 min while every pass needed +1.5° az). Fold
+   * the median into the offsets (off_new = off − corr), shift auto-cal's
+   * samples by the same delta, and have the landmark references re-shot.
+   */
+  private foldPassBias(now: number): void {
+    const b = this.passBias;
+    this.passBias = [];
+    if (b.length < 20) return;
+    const med = (xs: number[]) => {
+      const v = [...xs].sort((p, q) => p - q);
+      return v[v.length >> 1];
+    };
+    this.biasHistory.push({ az: med(b.map((x) => x.az)), el: med(b.map((x) => x.el)), t: now });
+    this.biasHistory = this.biasHistory.filter((h) => now - h.t < 45 * 60_000).slice(-6);
+    const last = this.biasHistory.slice(-BIAS_FOLD_PASSES);
+    if (last.length < BIAS_FOLD_PASSES) return;
+    const cfg = this.cfg();
+    const fold = (vals: number[]) => {
+      const m = med(vals);
+      const sameSign = vals.every((v) => Math.sign(v) === Math.sign(m));
+      const spread = Math.max(...vals) - Math.min(...vals);
+      return Math.abs(m) >= BIAS_FOLD_MIN_DEG && sameSign && spread <= BIAS_FOLD_MAX_SPREAD ? m : 0;
+    };
+    // Damped: the bias responded ~2x to each fold on 2026-10-11 (−1.64° moved
+    // it −3.3°, +1.52° moved it +2.5°), so full folds oscillated. Half a
+    // fold converges whether the true gain is 1 or 2.
+    const dAz = BIAS_FOLD_GAIN * fold(last.map((h) => h.az));
+    const dEl = BIAS_FOLD_GAIN * fold(last.map((h) => h.el));
+    if (dAz === 0 && dEl === 0) return;
+    const m = cfg.mount;
+    const next = { ...m, panOffsetDeg: m.panOffsetDeg - dAz, tiltOffsetDeg: m.tiltOffsetDeg - dEl };
+    this.autoCal.shiftSamples(-dAz, -dEl, m.panGain, m.tiltGain, now);
+    this.upstream.patchConfig({ tracker: { mount: next } } as Partial<Config>);
+    this.landmarks.clear(); // re-shoot the references under the new model (disk too)
+    this.biasHistory = [];
+    this.recorder.write("biasFold", { dAz, dEl, mount: next });
+    console.log(`[tracker] bias fold-in: pan offset ${(-dAz).toFixed(2)}°, tilt offset ${(-dEl).toFixed(2)}° (last ${BIAS_FOLD_PASSES} passes agree)`);
+  }
+
   private resetSetpoint(): void {
     this.azTracker.reset();
     this.elTracker.reset();
@@ -528,9 +827,6 @@ export class ControlLoop {
     this.zoomWantSince = 0;
     this.ladderIdx = 0;
     this.lastLadderAt = 0;
-    this.lastFocusZoom = 0;
-    this.lastFocusAt = 0;
-    this.focusCheckAt = 0;
     this.panRateI = 0;
     this.tiltRateI = 0;
     this.lastPanRateCmd = 0;
@@ -571,6 +867,8 @@ export class ControlLoop {
       undefined,
       undefined,
       cfg.limits.horizon,
+      this.sunAt(cfg.site, now),
+      cfg.target.departurePriority === false ? null : (this.upstream.getConfig?.()?.airport ?? SFO_ARP),
     );
 
     if (tracking) {
@@ -578,6 +876,7 @@ export class ControlLoop {
       // (null vs undefined: with no target at all this must NOT fire every
       // tick — it resets the setpoint/vision state and spams the recorder.)
       if ((hex ?? null) !== (this.current?.hex ?? null)) {
+        this.foldPassBias(now);
         this.current = hex ? { hex, sinceMs: now } : null;
         this.resetSetpoint();
         this.recorder.write("target", { hex });
@@ -724,7 +1023,17 @@ export class ControlLoop {
       // Never aim below the surveyed clear-sky horizon for this azimuth
       // (roofs/trees); the global tilt floor can then sit low for the
       // directions that are open.
-      el = Math.max(el, horizonMinEl(cfg.limits.horizon, az, -90));
+      {
+        const skyline = horizonMinEl(cfg.limits.horizon, az, -90);
+        if (el < skyline) {
+          // Waiting for a plane still below the skyline (a departure climbing
+          // out): frame the sky ABOVE the roofline rather than centring on it
+          // — the plane then rises into the lower part of the picture and the
+          // stream isn't half a house.
+          const vfov = hfovFromZoomUnits(d.getPose()?.zoomUnits ?? 0, cfg.zoom.fovLut) * (9 / 16);
+          el = skyline + 0.3 * vfov;
+        }
+      }
       const pt = mountFromWorld(az, el, cfg.mount);
       // Pan dead-zone anticipation (see WRAP_SLEW_DPS).
       {
@@ -732,7 +1041,7 @@ export class ControlLoop {
         const inZone = pt.panDeg < lim.panMinDeg || pt.panDeg > lim.panMaxDeg;
         const exitPan = plan?.wrapExitPanDeg;
         const crossing = !hold && poseEst != null && plan != null && exitPan != null && plan.wrapOutSec != null;
-        if (crossing && !this.wrapHolding && poseEst && plan && exitPan != null && plan.wrapOutSec != null) {
+        if (crossing && !this.wrapHolding && now - this.wrapReleasedAt > WRAP_REARM_MS && poseEst && plan && exitPan != null && plan.wrapOutSec != null) {
           const goal = clamp(exitPan, lim.panMinDeg + 1, lim.panMaxDeg - 1);
           const slewSec = Math.abs(goal - poseEst.panDeg) / WRAP_SLEW_DPS + WRAP_SETTLE_SEC;
           // ...and the slew to where the plane is NOW (within range): if the
@@ -764,11 +1073,13 @@ export class ControlLoop {
           const emerged = !inZone && (Math.sign(pt.panDeg) || 1) === (Math.sign(this.wrapGoal) || 1);
           if (emerged) {
             this.wrapHolding = false;
+            this.wrapReleasedAt = now;
             this.recorder.write("wrap", { phase: "release", panDeg: pt.panDeg });
             this.emit({ kind: "wrap", t: now, phase: "release", panDeg: pt.panDeg });
           } else if (!inZone && !crossing && !hold) {
             // Plan no longer crosses (course change) and the plane is reachable.
             this.wrapHolding = false;
+            this.wrapReleasedAt = now;
             this.recorder.write("wrap", { phase: "release", panDeg: pt.panDeg, reason: "no-crossing" });
             this.emit({ kind: "wrap", t: now, phase: "release", panDeg: pt.panDeg, reason: "no-crossing" });
           } else if (!hold) {
@@ -798,6 +1109,14 @@ export class ControlLoop {
         cfg.vision.applyCorrection &&
         this.visionGoodSince > 0 &&
         now - this.visionGoodSince > 800;
+      // Per-pass bias evidence for the drift fold-in (see foldPassBias).
+      if (visionLocked && now - this.biasSampleAt > 500) {
+        const elB = prediction.azEl.elDeg;
+        if (elB >= 20 && elB <= 75) {
+          this.biasSampleAt = now;
+          this.passBias.push({ az: this.corrAz, el: this.corrEl });
+        }
+      }
       // Pointing sigma: any FRESH, motion-consistent lock means vision is
       // closing the loop — not only after the centre-hold timer, which the
       // ladder resets on every rung. Tying sigma to that timer made each
@@ -840,11 +1159,20 @@ export class ControlLoop {
             // Once the head has settled on the ADS-B aim (pointing is good
             // to ~1° after autocal), start at a rung sized to the plane;
             // if nothing shows within 8 s, fall back to wide.
+            // Sized so the plane spans ~20 vision px (HFOV ≈ 24 × its angular
+            // size, never under 6°: pointing is good to ~0.5° now). A fixed
+            // 13.5° rung left a 0.3° plane at 10 px — the ~11,000 ft overhead
+            // arrivals locked 9-21% of the time inbound. Unseen after 8 s:
+            // one rung wider; after 16 s: wide.
             const settled = now - since > 1500 && lagDeg < 2;
             const ang = zoom.angularSizeDeg ?? 1;
-            const startRung = ang < 0.5 ? 3 : ang < 1.0 ? 2 : 0;
-            if (now - since >= 8000) this.ladderIdx = 0;
-            else if (settled && startRung > this.ladderIdx) {
+            const acqHfov = clamp(24 * ang, 6, wideHfov);
+            const sizedRung = Math.max(0, Math.floor(Math.log(acqHfov / wideHfov) / Math.log(RUNG)));
+            const startRung = now - since >= 16_000 ? 0 : now - since >= 8000 ? Math.max(0, sizedRung - 1) : sizedRung;
+            if (now - since >= 8000 && this.ladderIdx > startRung) {
+              this.ladderIdx = startRung;
+              this.lastLadderAt = now;
+            } else if (settled && startRung > this.ladderIdx) {
               this.ladderIdx = startRung;
               this.lastLadderAt = now;
             }
@@ -968,83 +1296,70 @@ export class ControlLoop {
           zoom.zoomUnits = zoomUnitsFromHfov(cur, cfg.zoom.fovLut);
         }
       }
+      // Zoom STOPS near tele: the lens's focus-tracking curve there is ~37
+      // focus units per zoom unit, so every small creep (1437→1429→1414…)
+      // knocked focus hundreds of units off. Snap to a few fixed zooms —
+      // never tighter than wanted, so the smoothness floors hold — each of
+      // which gets a well-learned focus (camera/focus.ts).
+      const teleStopsDeg = TELE_STOP_UNITS.map((u) => hfovFromZoomUnits(u, cfg.zoom.fovLut));
+      if (zoom.hfovDeg < teleStopsDeg[teleStopsDeg.length - 1] * 1.15) {
+        const stop = teleStopsDeg.find((h) => h >= zoom.hfovDeg * 0.97) ?? zoom.hfovDeg;
+        if (stop !== zoom.hfovDeg) {
+          zoom.hfovDeg = stop;
+          zoom.zoomUnits = zoomUnitsFromHfov(stop, cfg.zoom.fovLut);
+        }
+      }
       hfovDeg = zoom.hfovDeg;
       angular = zoom.angularSizeDeg;
       commandedPanTilt = pt;
 
-      // Focus strategy:
-      //  - Zoomed in AND vision-locked on the plane: one-push autofocus ON
-      //    THE PLANE. The lens is not parfocal, so the fixed infinity far-stop
-      //    softens at high zoom; focusing on the actual subject is the only way
-      //    to stay sharp toward 20×. BUT fire the sweep only once the framing
-      //    has SETTLED (the zoom ladder isn't still stepping) and the plane is
-      //    sitting on the centre AF zone with the camera keeping up — a sweep
-      //    fired mid-ladder or with the plane off-centre makes contrast-AF lock
-      //    the blank sky / a passing cloud and rack the lens (the "can't find
-      //    focus at high zoom" hunt). After a sweep, if the plane is no longer
-      //    being detected the AF defocused it, so fall back to the infinity
-      //    far-stop: stable and only mildly soft, never hunting. Re-arm on the
-      //    next clean, centred frame.
-      //  - Otherwise: infinity far-stop when meaningfully zoomed (a long lens
-      //    on open sky makes autofocus hunt), autofocus at wide (hyperfocal
-      //    depth covers everything and the plane is too small to lock).
-      const zoomedIn = zoom.hfovDeg < 25;
+      // Focus (camera/focus.ts): manual hold while zoomed in — the camera's
+      // own zoom tracking carries the wide infinity point to sharp at tele —
+      // corrected by measurement: soft on the plane → nudge to the focus
+      // learned for this zoom; one-push only where nothing is learned yet.
       const fdet = this.lastDetection;
       const fFresh = fdet != null && now - fdet.t < 1000;
       const fCentered =
         fFresh && Math.abs(fdet.cx - 0.5) < 0.18 && Math.abs(fdet.cy - 0.5) < 0.18;
-      const fZoomSettled = now - this.lastLadderAt > 1200; // ladder not stepping
+      const fCenteredLoose =
+        fFresh && Math.abs(fdet.cx - 0.5) < 0.28 && Math.abs(fdet.cy - 0.5) < 0.28;
+      const bigInFrame = angular != null && (angular / Math.max(0.5, zoom.hfovDeg)) * 1280 >= 120;
+      const lensZoom = d.getPose()?.zoomUnits ?? zoom.zoomUnits;
+      const fZoomSettled =
+        now - this.lastLadderAt > 800 && Math.abs(lensZoom - zoom.zoomUnits) < 12;
       const fSteady = lagDeg < Math.max(0.4 * hfovDeg, 0.5); // camera keeping up
-      if (zoomedIn && visionLocked && cfg.vision.autofocusOnZoom) {
-        const zoomChanged = Math.abs(zoom.zoomUnits - this.lastFocusZoom) > 120;
-        const wantFocus = this.lastFocusZoom <= 0 || zoomChanged;
-        // Never sit in continuous AF while zoomed in: until a one-push result
-        // is being held, the lens stays on the infinity far-stop. (Before,
-        // this branch sent nothing until a sweep fired — and the sweep's
-        // preconditions rarely lined up — so a lock carried up from wide
-        // kept the AUTO mode set at wide and the camera hunted at tele.)
-        if (!this.focusHeld) d.setFocusInfinity(true);
-        if (
-          wantFocus && fCentered && fSteady && fZoomSettled &&
-          now - this.lastFocusAt > 2000
-        ) {
-          d.onePushAutofocus();
-          this.focusHeld = true;
-          this.lastFocusZoom = zoom.zoomUnits;
-          this.lastFocusAt = now;
-          this.focusCheckAt = now;
-          this.recorder.write("focus", { action: "onePush", zoom: zoom.zoomUnits, hfov: hfovDeg });
-          this.emit({ kind: "focus", t: now, action: "onePush", zoom: zoom.zoomUnits, hfov: hfovDeg });
-        } else if (this.focusCheckAt > 0 && now - this.focusCheckAt > 2500) {
-          // The sweep has had time to settle; if the plane dropped out of
-          // detection the AF lost it — park at infinity and re-arm.
-          if (!fFresh) {
-            this.focusHeld = false;
-            d.setFocusInfinity(true);
-            this.lastFocusZoom = -1;
-            this.recorder.write("focus", { action: "infinityFallback", zoom: zoom.zoomUnits, hfov: hfovDeg });
-            this.emit({ kind: "focus", t: now, action: "infinityFallback", zoom: zoom.zoomUnits, hfov: hfovDeg });
-          }
-          this.focusCheckAt = 0;
+      const fm = this.focusMetric;
+      const focusActs = this.focus.update({
+        now,
+        zoomedIn: true, // tracking: manual focus from the first tick
+        zoomUnits: lensZoom,
+        zoomSettled: fZoomSettled,
+        locked: visionLocked && fCentered && fSteady,
+        detected: fFresh,
+        // A big (close) plane overlaps the camera's centre-weighted AF zone
+        // well off-centre; a strict ±18% window kept SKW5920 (300 px, 2 km)
+        // from ever getting a sweep while it sat in blur for 5 s.
+        sweepOk: fSteady && (fCentered || !fFresh || (fCenteredLoose && bigInFrame)),
+        targetPx: angular != null ? (angular / Math.max(0.5, zoom.hfovDeg)) * 1280 : null,
+        commandedZoom: zoom.zoomUnits,
+        slantM: prediction?.azEl.slantM ?? null,
+        edgePx: fm && now - fm.t < 700 ? fm.edgePx : null,
+        edgeContrast: fm?.contrast ?? null,
+        focusUnits: d.getFocusUnits?.() ?? null,
+      });
+      for (const a of focusActs) {
+        if (a.kind === "auto") d.setFocusInfinity(false);
+        else if (a.kind === "manual") d.focusManual ? d.focusManual() : d.setFocusInfinity(true);
+        else if (a.kind === "farReference") d.setFocusInfinity(true); // manual + drive to the far stop
+        else if (a.kind === "nudge") d.focusNudge?.(a.deltaUnits);
+        else if (a.kind === "onePush" && cfg.vision.autofocusOnZoom) d.onePushAutofocus();
+        if (a.kind === "nudge" || a.kind === "onePush") {
+          const extra = a.kind === "nudge" ? { delta: Math.round(a.deltaUnits), target: Math.round(a.target) } : {};
+          this.recorder.write("focus", { action: a.kind, zoom: lensZoom, hfov: hfovDeg, ...extra });
+          // Servo bursts are many per pass; only sweeps belong on the pass
+          // timeline (34 "Focus nudged" events cluttered one pass page).
+          if (a.kind === "onePush") this.emit({ kind: "focus", t: now, action: a.kind, zoom: lensZoom, hfov: hfovDeg });
         }
-      } else if (zoomedIn && this.focusHeld) {
-        // A one-push result is held and we are still zoomed in: a brief lock
-        // flicker must NOT drive the lens back to the far stop and re-arm a
-        // sweep (ACA568: 8 sweeps in one pass, each a visible blur). Fall
-        // back to the far stop only after a sustained loss of the plane.
-        if (now - this.lastDetSeenAt > 2500) {
-          this.focusHeld = false;
-          d.setFocusInfinity(true);
-          this.lastFocusZoom = -1;
-          this.recorder.write("focus", { action: "infinityFallback", zoom: zoom.zoomUnits, hfov: hfovDeg, reason: "lost" });
-          this.emit({ kind: "focus", t: now, action: "infinityFallback", zoom: zoom.zoomUnits, hfov: hfovDeg });
-        }
-        this.focusCheckAt = 0;
-      } else {
-        this.focusHeld = false;
-        d.setFocusInfinity(zoomedIn);
-        this.lastFocusZoom = 0; // re-arm one-push AF for the next lock
-        this.focusCheckAt = 0;
       }
 
       const cmd: CameraPose = { ...pt, zoomUnits: zoom.zoomUnits };
@@ -1349,6 +1664,27 @@ export class ControlLoop {
       this.recorder.write("home", { azDeg, elDeg: cfg.home.elDeg });
     }
 
+    // No target: hand focus back to AF (on the scenery, wide) so the next
+    // pass's zoom tracking starts from the wide infinity point.
+    if (!prediction) {
+      for (const a of this.focus.update({
+        now, zoomedIn: false, zoomUnits: 0, zoomSettled: false, locked: false, edgePx: null, focusUnits: null,
+      })) if (a.kind === "auto") this.driver().setFocusInfinity(false);
+    }
+
+    // Landmark re-calibration: borrow the idle camera in daylight.
+    if (this.lmRunning && (prediction || this.mode !== "auto")) this.lmAbort = true;
+    if (
+      !this.lmRunning &&
+      this.mode === "auto" &&
+      !prediction &&
+      now >= this.lmNextAt &&
+      now - this.lastTargetAt > LM_IDLE_MS &&
+      (this.sunAt(cfg.site, now)?.elDeg ?? -90) > LM_MIN_SUN_EL
+    ) {
+      void this.runLandmarkCheck();
+    }
+
     // Aim/prediction history for frame-lag-compensated vision. Entries are
     // timestamped `now`, so the dead-reckoned pose is the right aim here.
     if (poseEst && prediction) {
@@ -1477,8 +1813,20 @@ export class ControlLoop {
           };
         }),
         autoCal: cfg.vision.autoCalibrate ? this.autoCal.status(cfg.mount) : undefined,
+        lensFocusUnits: this.driver().getFocusUnits?.() ?? null,
+        focusDebug: this.focus.debug,
+        focus: this.focusMetric
+          ? { edgePx: this.focusMetric.edgePx, contrast: this.focusMetric.contrast, ageMs: now - this.focusMetric.t }
+          : null,
+        landmarks: {
+          refs: this.landmarks.set?.refs.length ?? 0,
+          capturedAt: this.landmarks.set?.capturedAt ?? null,
+          running: this.lmRunning,
+          ...this.lmStatus,
+        },
       },
       site: cfg.site,
+      nextPlane: this.nextPlaneAt(now, cfg),
       upstream: {
         connected: this.upstream.isConnected(),
         aircraftCount: this.upstream.getAircraft().length,
@@ -1603,6 +1951,11 @@ export class ControlLoop {
         // The plane is always above the horizon; drop the ground (known from
         // tilt) so rooftops/poles/trees never become false movers.
         maskBelowHorizon(resid, VISION_W, VISION_H, aim.elDeg, vfov, 2);
+        if (cfg.limits.horizon?.length) {
+          const hz = cfg.limits.horizon;
+          maskBelowSkyline(resid, VISION_W, VISION_H, aim.azDeg, aim.elDeg, hfov, vfov,
+            (az) => horizonMinEl(hz, az, -90), sign);
+        }
         const rawBlobs = findMovingBlobs(resid, VISION_W, VISION_H, 5, {
           expectedX: exX,
           expectedY: exY,
@@ -1629,6 +1982,40 @@ export class ControlLoop {
             score: b.peakSigma,
           };
         });
+        // Nothing moving near the prediction while zoomed in: a tracked,
+        // distant plane barely moves in the frame and the empty sky gives
+        // the motion detector nothing to register against (DAL902: centred,
+        // 14 px, in focus, undetected for 2+ s at 8.7° HFOV). Look for a
+        // static silhouette at the expected spot instead; the world-velocity
+        // tracker still has to agree before it becomes the lock.
+        if (hfov < 20 && (predicted || lockedBefore)) {
+          const near = cands.some((c) => Math.hypot((c.cx - exX) * VISION_W, (c.cy - exY) * VISION_H) < 30);
+          if (!near) {
+            const sil = silhouetteCentroid(cur, VISION_W, VISION_H, exX, exY, Math.max(8, thetaPx));
+            if (sil && sil.areaPx >= 4) {
+              cands.push({
+                cx: sil.cx, cy: sil.cy, areaPx: sil.areaPx, contrastSigma: 6,
+                box: sil.box, score: 6,
+              });
+            }
+          }
+        }
+        // Big in frame: even merged, the motion blob is weighted toward
+        // whichever edges moved most this frame. Re-centre the strongest few
+        // on the plane's silhouette in the current frame, then drop the
+        // duplicates that re-centred onto the same aircraft.
+        if (thetaPx >= SILHOUETTE_MIN_PX) {
+          const refined: Detection[] = [];
+          for (const c of cands.slice(0, 3)) {
+            const sil = silhouetteCentroid(cur, VISION_W, VISION_H, c.cx, c.cy, thetaPx);
+            const r = sil ? { ...c, cx: sil.cx, cy: sil.cy, areaPx: sil.areaPx, box: sil.box } : c;
+            const dup = refined.some(
+              (o) => Math.hypot((o.cx - r.cx) * VISION_W, (o.cy - r.cy) * VISION_H) < 0.3 * thetaPx,
+            );
+            if (!dup) refined.push(r);
+          }
+          cands = [...refined, ...cands.slice(3)];
+        }
       }
       // Roll the frame buffer forward for the next tick's diff.
       this.prevLuma = cur;
@@ -1754,6 +2141,25 @@ export class ControlLoop {
         }
         // Feed the live plane position to the recorder (for offline stabilization).
         this.videoRecNote(o.cx, o.cy, frameT);
+
+        // Focus quality on the plane, while zoomed in (wide frames put the
+        // plane at a few pixels — nothing to measure).
+        if (hfovF < 20 && now - this.lastSharpAt > 330) {
+          this.lastSharpAt = now;
+          try {
+            if (!this.frameDims) {
+              const m = await sharp(frame).metadata();
+              if (m.width && m.height) this.frameDims = { w: m.width, h: m.height };
+            }
+            const box = this.lastDetection?.box;
+            if (this.frameDims && box) {
+              const fm = await measureSharpness(frame, box, this.frameDims.w, this.frameDims.h);
+              if (fm) this.focusMetric = { ...fm, t: now };
+            }
+          } catch {
+            /* a bad frame — skip */
+          }
+        }
 
         const steady = aimRateDps < 8 && elF < 75;
         // The lock IS the temporal confirmation now: a track only becomes

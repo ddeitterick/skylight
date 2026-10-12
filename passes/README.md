@@ -75,6 +75,10 @@ Migrated with one `ALTER TABLE passes ADD COLUMN …` per column + `CREATE INDEX
 snapshots; `PI_SSH` overrides the target):
 `pnpm -w exec tsx passes/tools/geometry-backfill.ts [--dry-run] [--all] [--only <id>] [--tracks <file>]`
 
+Altitude: pass.json `pass.altFtAtCa` maps to `alt_ca` (ft; filters `minAlt`/`maxAlt`, sort
+`alt_ca`). Migrated with `ALTER TABLE passes ADD COLUMN alt_ca REAL` + `CREATE INDEX passes_alt_ca`,
+backfilled in SQL from `meta` via `json_extract(meta, '$.pass.altFtAtCa')`.
+
 Re-score the whole archive (downloads every clip, ~2 s of ffmpeg per pass):
 `pnpm -w exec tsx passes/tools/rescore.ts [--dry-run] [--only <id>] [--skip-scored] [--cache <dir>]`
 (`PASSES_API` overrides the base URL; the key comes from `PASS_ARCHIVE_KEY` or `.ingest-key`).

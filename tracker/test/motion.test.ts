@@ -87,3 +87,16 @@ describe("compensatedResidual + findMovingBlob", () => {
     expect(blob).toBeNull();
   });
 });
+
+describe("maskBelowSkyline", () => {
+  it("zeroes each column below the skyline at its azimuth", async () => {
+    const { maskBelowSkyline } = await import("../src/vision/motion.js");
+    const w = 40, h = 20;
+    const r = new Uint8Array(w * h).fill(9);
+    // aim az 100, el 15, 40° x 20° frame (bottom edge el 5); skyline 15° left of az 100, 10° right
+    maskBelowSkyline(r, w, h, 100, 15, 40, 20, (az) => (az < 100 ? 15 : 10));
+    const col = (x: number) => Array.from({ length: h }, (_, y) => r[y * w + x]);
+    expect(col(5).filter((v) => v === 0).length).toBe(10); // below frame centre
+    expect(col(35).filter((v) => v === 0).length).toBe(5); // 10° → bottom quarter
+  });
+});

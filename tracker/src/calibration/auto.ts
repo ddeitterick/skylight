@@ -143,6 +143,28 @@ export class AutoCalibrator {
     return true;
   }
 
+  /** The camera physically shifted by a measured amount (landmark check)
+   *  and the model was corrected by these offset deltas: move every stored
+   *  sample's mechanical pose so it describes the CURRENT mount. Without this
+   *  the buffer spans hours of a drifting mount (~1°/h observed) and the
+   *  trimmed fits wander instead of converging. */
+  shiftSamples(dPanOffsetDeg: number, dTiltOffsetDeg: number, panGain: number, tiltGain: number, now: number): void {
+    for (const s of this.samples) {
+      s.panDeg -= dPanOffsetDeg / (panGain || 1);
+      s.tiltDeg -= dTiltOffsetDeg / (tiltGain || 1);
+    }
+    this.dirty = true;
+    this.save(now, true);
+  }
+
+  /** Drop every sample: the mount physically moved, so they describe a
+   *  pose→world mapping that no longer exists. */
+  reset(now: number): void {
+    this.samples = [];
+    this.dirty = false;
+    this.save(now, true);
+  }
+
   status(current: MountModel): AutoCalStatus {
     return {
       samples: this.samples.length,

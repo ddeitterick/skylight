@@ -265,3 +265,24 @@ describe("AutoCalibrator remount path", () => {
     expect(out!.solvedGains).toBe(false);
   });
 });
+
+describe("AutoCalibrator.shiftSamples", () => {
+  it("moves sample poses so a corrected model fits them again", async () => {
+    const { mkdtempSync } = await import("node:fs");
+    const dir = mkdtempSync(join(tmpdir(), "ac-shift-"));
+    const ac = new AutoCalibrator(join(dir, "a.json"));
+    const m: MountModel = { ...TRUE_MOUNT };
+    const t0 = 1_000_000;
+    for (let i = 0; i < 8; i++) {
+      const az = 30 + i * 40, el = 20 + (i % 3) * 15;
+      const pt = mountFromWorld(az, el, m);
+      ac.add({ ...pt, azDeg: az, elDeg: el, t: t0 + i * 2000 });
+    }
+    expect(ac.status(m).rmsDeg!).toBeLessThan(0.01);
+    // camera physically rotated +1° in pan: model offset +1, samples shifted
+    const m2 = { ...m, panOffsetDeg: m.panOffsetDeg + 1 };
+    ac.shiftSamples(1, 0, m.panGain, m.tiltGain, t0 + 20000);
+    expect(ac.status(m2).rmsDeg!).toBeLessThan(0.05);
+    rmSync(dir, { recursive: true, force: true });
+  });
+});

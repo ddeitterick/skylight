@@ -64,7 +64,10 @@ describe("PassArchive", () => {
       source: null,
       getState: () => state,
       find: (hex) => (hex === aircraft.hex ? aircraft : undefined),
-      config: () => DEFAULT_CONFIG.tracker,
+      config: () => ({
+        ...DEFAULT_CONFIG.tracker,
+        zoom: { ...DEFAULT_CONFIG.tracker.zoom, fovLut: [{ units: 0, hfovDeg: 56.5 }, { units: 1000, hfovDeg: 35 }] },
+      }),
       build: () => ({ version: "abc1234", label: "test", node: process.version }),
       uploader,
       tz: "America/Los_Angeles",
@@ -105,7 +108,10 @@ describe("PassArchive", () => {
         aircraft = { ...aircraft, registration: "N495AS", typeCode: "B739", airline: "Alaska Airlines", ts: clock };
       }
       if (i >= 30) state.vision.detection = { cx: 0.52, cy: 0.48, boxX: 0, boxY: 0, boxW: 0, boxH: 0, contrastSigma: 9, offAzDeg: 0, offElDeg: 0, ageMs: 100 };
-      if (i === 60) state.target.hfovDeg = 35;
+      if (i === 60) {
+        state.target.hfovDeg = 35;
+        state.pose = { ...state.pose!, zoomUnits: 1000 }; // the lens follows
+      }
       if (i >= 90) state.vision.detection = null;
     });
     archive.onLoopEvent({ kind: "focus", t: clock - 1000, action: "onePush", zoom: 900, hfov: 35 });
@@ -135,7 +141,7 @@ describe("PassArchive", () => {
     expect(pass.quality!.flags).toContain("short");
     expect(series.rows).toHaveLength(120);
     expect(series.t0).toBe(T0);
-    expect(series.rows[0]).toEqual([0.1, 10, 30, 10.3, 30.4, 0, 56.5, 120, 40, 8000, null, null, null, 0, 0, 0.5]);
+    expect(series.rows[0]).toEqual([0.1, 10, 30, 10.3, 30.4, 0, 56.5, 120, 40, 8000, null, null, null, 0, 0, 0.5, null, null]);
     expect(existsSync(join(pdir, ".pending"))).toBe(true);
     expect(archive.status()).toMatchObject({ recording: false, passId: null, queued: 1 });
   });
