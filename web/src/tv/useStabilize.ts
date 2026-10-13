@@ -14,7 +14,7 @@
 // light EMA only strips detector jitter, not motion.
 
 import { useEffect, useRef, type MutableRefObject } from "react";
-import type { TrackerState } from "@shared/index.js";
+import { levelingTransform, type TrackerState } from "@shared/index.js";
 import { CropFollow } from "./cropFollow.js";
 
 export interface StabilizeOpts {
@@ -29,13 +29,16 @@ export interface StabilizeOpts {
   /** Constant pipeline-offset trim, ms: raise if the crop trails the plane
    *  on screen, lower (can go negative) if it leads. */
   leadMs?: number;
+  /** Picture roll to cancel, deg (imageRollDeg) — the tilted base turns the
+   *  picture against the horizon. null/undefined = leave unrotated. */
+  rollDeg?: number | null;
 }
 
 /** Detections older than this are a lost target — relax to full view. */
 const TRACK_TIMEOUT_MS = 1500;
 
 export function useStabilize(
-  videoRef: MutableRefObject<HTMLVideoElement | null>,
+  videoRef: MutableRefObject<HTMLElement | null>,
   detection: TrackerState["vision"]["detection"] | undefined,
   opts: StabilizeOpts = {},
 ): void {
@@ -46,12 +49,16 @@ export function useStabilize(
   const leadMs = opts.leadMs ?? 0;
   const detRef = useRef(detection);
   detRef.current = detection;
+  const rollRef = useRef(opts.rollDeg ?? null);
+  rollRef.current = opts.rollDeg ?? null;
+  const leveling = opts.rollDeg != null;
+  const roll = useRef<number | null>(null);
   const cur = useRef({ x: 0, y: 0, z: 1 });
   const follow = useRef(new CropFollow());
 
   useEffect(() => {
     const v = videoRef.current;
-    if (!enabled) {
+    if (!enabled && !leveling) {
       if (v) v.style.transform = "";
       return;
     }
@@ -59,7 +66,7 @@ export function useStabilize(
     let raf = 0;
     const tick = () => {
       const now = performance.now();
-      const d = detRef.current;
+      const d = enabled ? detRef.current : undefined;
       if (d && d.ageMs < TRACK_TIMEOUT_MS) follow.current.feed(d, now);
       const tracking = follow.current.sampleAgeMs(now) < TRACK_TIMEOUT_MS;
       // Zoom in only while tracking; relax to full view (scale 1, no shift)
@@ -76,11 +83,20 @@ export function useStabilize(
       }
       cur.current.x += (tx - cur.current.x) * posEase;
       cur.current.y += (ty - cur.current.y) * posEase;
+      // Leveling: ease toward the pose's roll (pose updates arrive at a few
+      // Hz; a step-wise rotation would read as a twitch).
+      const rt = rollRef.current;
+      if (rt == null) roll.current = null;
+      else roll.current = roll.current == null ? rt : roll.current + (rt - roll.current) * 0.15;
+      const lv = roll.current == null ? "" : (() => {
+        const t = levelingTransform(roll.current);
+        return `rotate(${t.rotateDeg.toFixed(3)}deg) scale(${t.scale.toFixed(4)}) `;
+      })();
       const el = videoRef.current;
       if (el) {
         el.style.transformOrigin = "center center";
         el.style.transform =
-          `scale(${cur.current.z.toFixed(4)}) translate(${(cur.current.x * 100).toFixed(3)}%, ${(cur.current.y * 100).toFixed(3)}%)`;
+          `${lv}scale(${cur.current.z.toFixed(4)}) translate(${(cur.current.x * 100).toFixed(3)}%, ${(cur.current.y * 100).toFixed(3)}%)`;
       }
       raf = requestAnimationFrame(tick);
     };
@@ -90,5 +106,5 @@ export function useStabilize(
       const el = videoRef.current;
       if (el) el.style.transform = "";
     };
-  }, [enabled, zoom, ease, posEase, leadMs, videoRef]);
+  }, [enabled, leveling, zoom, ease, posEase, leadMs, videoRef]);
 }

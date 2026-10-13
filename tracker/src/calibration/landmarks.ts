@@ -16,7 +16,7 @@
 
 import fs from "node:fs";
 import { dirname } from "node:path";
-import { solveMount, worldFromMount, type MountModel } from "@shared/index.js";
+import { solveMount, worldFromMountFrame, type MountModel } from "@shared/index.js";
 
 /** Correlation grid (power of two for the FFT). */
 export const LM_W = 256;
@@ -281,10 +281,15 @@ export function evaluateShifts(
   if (Math.hypot(medDx, medDy) < LM_APPLY_MIN_DEG) {
     return { kind: "unchanged", good: agree.length, medDxDeg: medDx, medDyDeg: medDy };
   }
+  // The shift is measured in the picture, i.e. along the HEAD's axes:
+  // displace in the mount frame, then carry to the world through the lean
+  // (on the tilted base a world-az/el displacement points the wrong way).
   const samples = agree.map((g) => {
-    const w = worldFromMount({ panDeg: g.r.panDeg, tiltDeg: g.r.tiltDeg }, current);
-    const cosE = Math.max(0.2, Math.cos((w.elDeg * Math.PI) / 180));
-    return { panDeg: g.r.panDeg, tiltDeg: g.r.tiltDeg, azDeg: w.azDeg + g.s.dxDeg / cosE, elDeg: w.elDeg + g.s.dyDeg };
+    const azM = g.r.panDeg * current.panGain + current.panOffsetDeg;
+    const elM = g.r.tiltDeg * current.tiltGain + current.tiltOffsetDeg;
+    const cosE = Math.max(0.2, Math.cos((elM * Math.PI) / 180));
+    const w = worldFromMountFrame(azM + g.s.dxDeg / cosE, elM + g.s.dyDeg, current);
+    return { panDeg: g.r.panDeg, tiltDeg: g.r.tiltDeg, azDeg: w.azDeg, elDeg: w.elDeg };
   });
   const sol = solveMount(samples, current, { solveGains: false, solveLevel: samples.length >= 6 });
   if (!sol) return { kind: "insufficient", good: agree.length };

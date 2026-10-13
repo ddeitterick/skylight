@@ -52,6 +52,10 @@ CREATE TABLE IF NOT EXISTS passes (
   departure       INTEGER,                     -- pass.departure 0/1: origin is the home airport
   alt_ca          REAL,                        -- pass.altFtAtCa: ADS-B altitude at closest approach, ft
   has_clip        INTEGER NOT NULL DEFAULT 0,  -- R2 HEAD of <id>/clip.mp4 at ingest
+  has_stab        INTEGER NOT NULL DEFAULT 0,  -- schema 1.3: media.stab.status ok AND R2 has <id>/clip.stab.mp4
+  stab_status     TEXT,                        -- media.stab.status: ok | skipped | failed; NULL = not processed
+  stab_wobble_before REAL,                     -- media.stab.wobbleBefore, % of frame width
+  stab_wobble_after  REAL,                     -- media.stab.wobbleAfter
   created_at      TEXT NOT NULL,               -- ingest time, ISO-8601 UTC
   meta            TEXT NOT NULL                -- pass.json verbatim
 );
@@ -68,3 +72,4 @@ CREATE INDEX IF NOT EXISTS passes_quality       ON passes (quality);
 CREATE INDEX IF NOT EXISTS passes_aspect       ON passes (aspect);
 CREATE INDEX IF NOT EXISTS passes_turn_deg     ON passes (turn_deg);
 CREATE INDEX IF NOT EXISTS passes_alt_ca       ON passes (alt_ca);
+CREATE INDEX IF NOT EXISTS passes_stab_status  ON passes (stab_status);

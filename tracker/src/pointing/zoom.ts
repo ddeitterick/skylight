@@ -65,9 +65,34 @@ export function chooseZoom(
 
   let hfov = requiredHfovDeg(theta, sigma, cfg.zoom.fillFrac);
   const wide = Math.max(...lut.map((p) => p.hfovDeg));
-  const tele = Math.min(...lut.map((p) => p.hfovDeg));
+  const tele = Math.max(Math.min(...lut.map((p) => p.hfovDeg)), cfg.zoom.minHfovDeg || 0);
   hfov = Math.min(wide, Math.max(tele, hfov));
 
   const zoomUnits = zoomUnitsFromHfov(hfov, lut);
   return { zoomUnits, hfovDeg: hfovFromZoomUnits(zoomUnits, lut), angularSizeDeg: theta };
+}
+
+/**
+ * The zoom stops as HFOVs, ascending (tele first): `zoom.stopUnits` when
+ * configured, else a geometric ladder every `stopRatio` from tele to wide.
+ */
+export function zoomStopsHfov(z: TrackerConfig["zoom"]): number[] {
+  const lut = z.fovLut;
+  const wide = Math.max(...lut.map((p) => p.hfovDeg));
+  const tele = Math.min(...lut.map((p) => p.hfovDeg));
+  let stops: number[];
+  if (z.stopUnits?.length) {
+    stops = z.stopUnits.map((u) => hfovFromZoomUnits(u, lut));
+  } else {
+    const r = Math.max(1.05, z.stopRatio || 1.3);
+    stops = [];
+    for (let h = tele; h < wide; h *= r) stops.push(h);
+  }
+  stops.push(wide);
+  return [...new Set(stops.map((h) => Math.round(h * 1000) / 1000))].sort((a, b) => a - b);
+}
+
+/** Snap a wanted HFOV to the tightest stop that still frames it (never tighter). */
+export function snapToStop(wantHfov: number, stops: number[]): number {
+  return stops.find((h) => h >= wantHfov * 0.97) ?? stops[stops.length - 1];
 }

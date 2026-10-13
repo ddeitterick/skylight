@@ -49,6 +49,15 @@ describe("mergeTrackerConfig", () => {
     });
     expect(persisted.tracker.predict).toEqual(DEFAULT_CONFIG.tracker.predict);
     expect(persisted.tracker.zoom).toEqual(DEFAULT_CONFIG.tracker.zoom);
+    expect(persisted.tracker.liveStab).toEqual(DEFAULT_CONFIG.tracker.liveStab);
+  });
+
+  it("deep-merges a partial liveStab patch", () => {
+    const merged = mergeTrackerConfig(DEFAULT_CONFIG.tracker, { liveStab: { enabled: false, delayMs: 2000 } });
+    expect(merged.liveStab.enabled).toBe(false);
+    expect(merged.liveStab.delayMs).toBe(2000);
+    expect(merged.liveStab.maxHfovDeg).toBe(DEFAULT_CONFIG.tracker.liveStab.maxHfovDeg);
+    expect(merged.liveStab.edge).toBe("auto");
   });
 });
 

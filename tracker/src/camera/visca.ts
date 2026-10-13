@@ -582,7 +582,76 @@ export class ViscaCamera implements CameraDriver {
     const z = Math.min(zoomMax, Math.max(zoomMin, Math.round(zoomUnits)));
     if (this.lastSentZoom !== null && Math.abs(z - this.lastSentZoom) <= 8) return;
     this.lastSentZoom = z;
+    this.noteZoomCommand(z);
+    this.lastSentFocus = null; // zoom tracking moves the focus
     this.sendCommand([0x81, 0x01, 0x04, 0x47, ...nibbles(z, 4), 0xff]);
+  }
+
+  private lastSentFocus: number | null = null;
+  /** When lastSentFocus went out, and whether a one-push sweep ran since
+   *  (a sweep's result is left alone: setFocusDirect won't undo it). */
+  private lastSentFocusAt = 0;
+  private sweptSinceFocus = false;
+  /** First zoom command (since the lens last moved) that asked for a zoom
+   *  away from where it sits — lens-stuck detection. */
+  private zoomAskedAt: number | null = null;
+  /** Reported lens zoom and since when it has not changed. */
+  private zoomReadStill: { units: number; since: number } | null = null;
+  private lensStuckLogged = false;
+
+  /**
+   * End a running timed focus drive NOW. A far/near drive (focusNudge, the
+   * far-reference) keeps going until a focus STOP arrives — a Zoom-Focus
+   * Direct or a mode change does not end it. Merely cancelling the stop
+   * timer (what every focus command used to do) left the drive running:
+   * TZP26 (2026-10-12 21:52Z) sat on its learned −1956 at zoom 1385, sharp,
+   * then the lens ran FAR at ~90 u/s for 12 s to −3120 (edge 2.2 → 14 px)
+   * while the servo's identical direct-focus re-sends were deduplicated.
+   */
+  private stopFocusDrive(): void {
+    if (!this.focusFarTimer) return;
+    clearTimeout(this.focusFarTimer);
+    this.focusFarTimer = null;
+    this.sendCommand([0x81, 0x01, 0x04, 0x08, 0x00, 0xff]); // focus stop
+  }
+
+  setZoomFocus(zoomUnits: number, focusUnits: number): void {
+    const zoomMin = Math.min(this.o.units.zoomWideUnits, this.o.units.zoomTeleUnits);
+    const zoomMax = Math.max(this.o.units.zoomWideUnits, this.o.units.zoomTeleUnits);
+    const z = Math.min(zoomMax, Math.max(zoomMin, Math.round(zoomUnits)));
+    const f = Math.round(focusUnits);
+    if (
+      this.lastSentZoom !== null && Math.abs(z - this.lastSentZoom) <= 8 &&
+      this.lastSentFocus !== null && Math.abs(f - this.lastSentFocus) <= 10
+    ) return; // (a one-push sweep since then is left alone until the target moves)
+    this.stopFocusDrive();
+    if (this.focusMode !== "manual") this.sendCommand([0x81, 0x01, 0x04, 0x38, 0x03, 0xff]);
+    this.focusMode = "manual";
+    if (this.lastSentZoom === null || Math.abs(z - this.lastSentZoom) > 8) this.noteZoomCommand(z);
+    this.lastSentZoom = z;
+    this.lastSentFocus = f;
+    this.lastSentFocusAt = Date.now();
+    this.sweptSinceFocus = false;
+    // Focus is signed 16-bit on this lens; nibbles() masks to 0xffff.
+    this.sendCommand([0x81, 0x01, 0x04, 0x47, ...nibbles(z, 4), ...nibbles(f, 4), 0xff]);
+  }
+
+  /** Re-send an unchanged direct focus after this long (it lands in ~2-3 s). */
+  private static readonly FOCUS_RESEND_MS = 2500;
+
+  setFocusDirect(focusUnits: number): void {
+    const z = this.lastSentZoom ?? this.pose?.zoomUnits;
+    if (z == null) return;
+    // The servo asks again only when the lens is still off the point; an
+    // identical command already sent was swallowed by setZoomFocus's dedupe,
+    // so a lens that wandered off (a drive, a missed command) was never
+    // brought back. Resend once the last one has had time to land — but
+    // never over a one-push sweep's result.
+    if (
+      this.lastSentFocus !== null && Math.abs(Math.round(focusUnits) - this.lastSentFocus) <= 10 &&
+      !this.sweptSinceFocus && Date.now() - this.lastSentFocusAt >= ViscaCamera.FOCUS_RESEND_MS
+    ) this.lastSentFocus = null;
+    this.setZoomFocus(z, focusUnits);
   }
 
   /** Focus state: null = unknown (assert on first call). "onepush" means a
@@ -594,7 +663,7 @@ export class ViscaCamera implements CameraDriver {
     const want = on ? "infinity" : "auto";
     if (this.focusMode === want) return;
     this.focusMode = want;
-    if (this.focusFarTimer) clearTimeout(this.focusFarTimer);
+    if (this.focusFarTimer) { clearTimeout(this.focusFarTimer); this.focusFarTimer = null; }
     if (on) {
       // Manual focus mode, then drive FAR to the stop (the far stop IS
       // infinity; Focus Direct scales vary per firmware, the stop doesn't).
@@ -612,7 +681,7 @@ export class ViscaCamera implements CameraDriver {
 
   /** Manual focus, lens left where it is (the camera keeps zoom-tracking). */
   focusManual(): void {
-    if (this.focusFarTimer) { clearTimeout(this.focusFarTimer); this.focusFarTimer = null; }
+    this.stopFocusDrive();
     if (this.focusMode === "manual") return;
     this.focusMode = "manual";
     this.sendCommand([0x81, 0x01, 0x04, 0x38, 0x03, 0xff]);
@@ -627,6 +696,7 @@ export class ViscaCamera implements CameraDriver {
     if (this.focusFarTimer) { clearTimeout(this.focusFarTimer); this.focusFarTimer = null; }
     if (this.focusMode !== "manual") this.sendCommand([0x81, 0x01, 0x04, 0x38, 0x03, 0xff]);
     this.focusMode = "manual";
+    this.lastSentFocus = null;
     const near = deltaUnits > 0;
     const ms = Math.min(3000, Math.max(60, (Math.abs(deltaUnits) / (near ? 94 : 80)) * 1000));
     this.sendCommand([0x81, 0x01, 0x04, 0x08, near ? 0x37 : 0x27, 0xff]);
@@ -638,11 +708,9 @@ export class ViscaCamera implements CameraDriver {
 
   onePushAutofocus(): void {
     // Always re-armable: the caller debounces (one sweep per zoom change).
-    if (this.focusFarTimer) {
-      clearTimeout(this.focusFarTimer);
-      this.focusFarTimer = null;
-    }
+    this.stopFocusDrive();
     this.focusMode = "onepush";
+    this.sweptSinceFocus = true;
     // MANUAL focus mode, then One Push Trigger: a single sweep on the framed
     // subject, after which the lens HOLDS. (Issuing the trigger from AUTO
     // mode left the camera in continuous AF: at 20× on open sky it hunted,
@@ -753,6 +821,7 @@ export class ViscaCamera implements CameraDriver {
       lastInquiryAgoMs: this.lastInquiryReply
         ? Date.now() - this.lastInquiryReply
         : undefined,
+      lensStuckSec: this.lensStuckSec() ?? undefined,
     };
   }
 
@@ -827,6 +896,8 @@ export class ViscaCamera implements CameraDriver {
       const z = nibbles(Math.round(w.zoomUnits), 4);
       this.sendCommand([0x81, 0x01, 0x04, 0x47, ...z, 0xff]);
       this.lastSentZoom = w.zoomUnits;
+      this.lastSentFocus = null; // zoom tracking moves the focus
+      this.noteZoomCommand(w.zoomUnits);
     }
   }
 
@@ -857,6 +928,60 @@ export class ViscaCamera implements CameraDriver {
     }
   }
   private pending7: { kind: "zoom" | "focus"; at: number } | null = null;
+
+  /**
+   * A late FOCUS answer landing on a zoom question: same 7-byte shape, and at
+   * mid zoom focus reads 0…+600 — a valid zoom number. SWA1085 (2026-10-12)
+   * "zoomed" 976 → 184 → 976 (14° → 49° → 14°) eight times in 37 s: 184 was
+   * the lens focus. A reading that equals the last focus answer and sits far
+   * from the zoom we know (the lens can't jump hundreds of units between two
+   * 100 ms inquiries) is that echo, not a zoom.
+   */
+  private isFocusEcho(v: number): boolean {
+    const cur = this.pose?.zoomUnits;
+    const f = this.focusPos;
+    if (cur == null || f == null || Date.now() - f.at > 3000) return false;
+    return Math.abs(v - f.units) <= 2 && Math.abs(v - cur) > 100;
+  }
+
+  /** Lens stuck: zoom commands keep asking for another zoom, the camera keeps
+   *  answering the same one (2026-10-12 21:56Z: zoom 976 / focus 184 from
+   *  then on, through a tracker restart — pan/tilt fine; only a camera
+   *  reboot / power-cycle clears it). */
+  private static readonly LENS_STUCK_MS = 10_000;
+  private static readonly LENS_STUCK_UNITS = 40;
+
+  private noteZoomCommand(z: number): void {
+    const st = this.zoomReadStill;
+    if (st && Math.abs(z - st.units) > ViscaCamera.LENS_STUCK_UNITS) this.zoomAskedAt ??= Date.now();
+  }
+
+  private noteZoomReading(zoom: number): void {
+    const now = Date.now();
+    if (!this.zoomReadStill || Math.abs(zoom - this.zoomReadStill.units) > 2) {
+      this.zoomReadStill = { units: zoom, since: now };
+      this.zoomAskedAt = null;
+      if (this.lensStuckLogged) console.log(`[visca] lens moving again (zoom ${zoom})`);
+      this.lensStuckLogged = false;
+      if (this.lastSentZoom != null) this.noteZoomCommand(this.lastSentZoom);
+      return;
+    }
+    const sec = this.lensStuckSec(now);
+    if (sec != null && !this.lensStuckLogged) {
+      this.lensStuckLogged = true;
+      this.diag.lastError = `lens not responding: zoom ${zoom}, commanded ${this.lastSentZoom}`;
+      console.warn(
+        `[visca] LENS NOT RESPONDING: zoom commands ignored for ${sec.toFixed(0)} s (commanded ${this.lastSentZoom}, camera stays at ${zoom}) — reboot / power-cycle the camera`,
+      );
+    }
+  }
+
+  /** Seconds the lens has ignored zoom commands, or null if it hasn't. */
+  private lensStuckSec(now = Date.now()): number | null {
+    if (this.zoomAskedAt == null) return null;
+    const ms = now - this.zoomAskedAt;
+    return ms >= ViscaCamera.LENS_STUCK_MS ? ms / 1000 : null;
+  }
 
   /** Lens focus position (inquiry, signed raw units; larger = nearer). */
   getFocusUnits(): number | null {
@@ -940,7 +1065,9 @@ export class ViscaCamera implements CameraDriver {
         }
         const zoomMax = Math.max(this.o.units.zoomWideUnits, this.o.units.zoomTeleUnits);
         if (v < 0 || v > zoomMax + 64) return; // not a zoom reading
+        if (this.isFocusEcho(v)) return;
         const zoom = v;
+        this.noteZoomReading(zoom);
         this.lastInquiryReply = Date.now();
         this.pose = {
           panDeg: this.pose?.panDeg ?? 0,

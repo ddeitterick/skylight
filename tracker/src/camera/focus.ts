@@ -192,6 +192,20 @@ export class FocusController {
     return lo.f + ((zoomUnits - lo.z) / (hi.z - lo.z)) * (hi.f - lo.f);
   }
 
+  /**
+   * A learned focus TRUSTED enough to drive the lens there directly (Zoom-
+   * Focus Direct): this exact zoom's bucket (no interpolation) with at least
+   * `minN` sharp samples, else null. A 4-sample entry at zoom 720 threw a
+   * close 757 from razor-sharp to a blob in 0.2 s (DAL8926, 2026-10-12) —
+   * where the lens's own zoom tracking would have kept it sharp.
+   */
+  trusted(zoomUnits: number, band: number, minN: number): number | null {
+    const b = Math.round(zoomUnits / LUT_BUCKET) * 10;
+    const e = this.lut.get(b + band);
+    if (!e || e.n < minN) return null;
+    return this.learned(zoomUnits, band);
+  }
+
   table(): Record<number, LutEntry> {
     return Object.fromEntries(this.lut);
   }
@@ -224,6 +238,13 @@ export class FocusController {
     const target = this.learned(i.zoomUnits, band);
     const sharp = i.edgePx != null && i.edgePx <= FE_SHARP;
     const soft = i.edgePx != null && i.edgePx > FE_SOFT;
+    // A believable sharp reading on the detected plane: the lens is right for
+    // THIS plane now, whatever the table says. Never drive it away (DAL8926,
+    // 2026-10-12: a 757 at 720 m razor-sharp at −490, zoom 718, driven to a
+    // 4-sample table point −170 — a blob in 0.2 s; a timed drive to the same
+    // point just blurs it over 3 s).
+    const sharpHere = sharp && i.edgePx! >= LEARN_MIN_EDGE &&
+      (i.edgeContrast ?? 0) >= LEARN_MIN_CONTRAST && (i.detected ?? i.locked);
 
 
     this.softSince = soft ? (this.softSince ?? i.now) : null;
@@ -287,7 +308,7 @@ export class FocusController {
         out.push({ kind: "onePush" });
         return out;
       }
-      if (!sweepNow && Math.abs(err) > NUDGE_MIN_UNITS) {
+      if (!sweepNow && !sharpHere && Math.abs(err) > NUDGE_MIN_UNITS) {
         const step = Math.sign(err) * Math.min(Math.abs(err), Math.abs(err) > 300 ? 150 : SERVO_BURST_UNITS);
         this.servoUntil = i.now + (Math.abs(step) / 90) * 1000 + SERVO_GAP_MS;
         this.lastActionAt = i.now;
@@ -315,7 +336,7 @@ export class FocusController {
       return out;
     }
     // Arriving at a zoom we know: go straight to the learned point.
-    if (justSettled && off != null && Math.abs(off) > 2 * NUDGE_MIN_UNITS) {
+    if (justSettled && !sharpHere && off != null && Math.abs(off) > 2 * NUDGE_MIN_UNITS) {
       this.lastActionAt = i.now;
       out.push({ kind: "nudge", deltaUnits: off, target: target! });
       return out;

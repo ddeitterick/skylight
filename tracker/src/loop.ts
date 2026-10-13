@@ -18,6 +18,7 @@ import {
   fixAgeSec,
   fixTimeMs,
   hfovFromZoomUnits,
+  mountFrameFromWorld,
   mountFromWorld,
   norm180,
   SAME_FIX_MS,
@@ -52,8 +53,8 @@ import {
 import { planPass, zenithHold, ZENITH_MIN_HFOV } from "./pointing/planner.js";
 import { predictAim, TrackHistory, type Prediction } from "./pointing/predict.js";
 import { selectTarget, type CurrentTarget } from "./pointing/target.js";
-import { chooseZoom } from "./pointing/zoom.js";
-import { FocusController } from "./camera/focus.js";
+import { chooseZoom, snapToStop, zoomStopsHfov } from "./pointing/zoom.js";
+import { distanceBand, FocusController } from "./camera/focus.js";
 import { nextPlane, type NextPlane } from "./pointing/nextPass.js";
 import { decodeLuma, VISION_W, VISION_H, type Detection } from "./vision/detect.js";
 import { silhouetteCentroid } from "./vision/silhouette.js";
@@ -63,10 +64,9 @@ import {
   estimateShift,
   compensatedResidual,
   findMovingBlobs,
-  maskBelowHorizon,
-  maskBelowSkyline,
 } from "./vision/motion.js";
 import { lockVelTolerance, TrackTable, type WorldObs } from "./vision/tracks.js";
+import { frameGeom, maskBelowWorld } from "./vision/frame.js";
 import type { Recorder } from "./record.js";
 import type { Upstream } from "./upstream.js";
 import type { VideoStream } from "./video/stream.js";
@@ -146,10 +146,6 @@ const WRAP_SETTLE_SEC = 1.0;
 /** A broadcast detection that moves more than this fraction of the frame
  *  width between consecutive frames is held back until it persists. */
 const DET_HOP_FRAC = 0.08;
-/** Fixed zoom stops near tele, in LENS UNITS (full tele first); their
- *  HFOVs come from the fovLut, so a re-measured lens table can't move the
- *  stops off full tele. */
-const TELE_STOP_UNITS = [1437, 1385, 1332, 1260, 1173];
 /** Expected plane size (vision px, 480 wide) above which detections are
  *  re-centred on the whole silhouette (vision/silhouette.ts). */
 const SILHOUETTE_MIN_PX = 14;
@@ -158,6 +154,21 @@ const ZOOM_IN_HOLD_MS = 600;
 const ZOOM_OUT_HOLD_MS = 600;
 /** The ladder widens a rung only after the lock has been bad this long. */
 const LADDER_DEMOTE_AFTER_MS = 1200;
+/** Search cycle while the plane isn't in sight (new, or lost > LADDER_LOST_MS):
+ *  sized rung, one rung wider at ACQ_WIDER_MS, wide at ACQ_WIDE_MS, and
+ *  from the top again at ACQ_CYCLE_MS. */
+const ACQ_WIDER_MS = 8000;
+const ACQ_WIDE_MS = 16_000;
+const ACQ_CYCLE_MS = 24_000;
+const LADDER_LOST_MS = 6000;
+/** Learn the vision bias only while the aim moves slower than this, deg/s. */
+const BIAS_MAX_AIM_RATE_DPS = 3;
+/** Zoom-Focus Direct only at/above this zoom (the tele stops)... */
+const ZOOM_FOCUS_MIN_UNITS = 1173;
+/** ...and only for a focus learned from at least this many sharp frames. */
+const ZOOM_FOCUS_MIN_SAMPLES = 20;
+/** A plane dropped for a challenger can't win the camera back for this long. */
+const TARGET_COOLDOWN_MS = 45_000;
 /** Rung cadence: normal, and when the lock is dead-centred and established
  *  (after the zenith flip the plane is close and big — framing it within a
  *  couple of seconds matters more than caution). */
@@ -283,7 +294,7 @@ export class ControlLoop {
   private lastAutoCalAt = 0;
   /** Previous vision frame (luma) + its pose, for motion-compensated diffing. */
   private prevLuma: Uint8Array | null = null;
-  private prevAim: { azDeg: number; elDeg: number; hfov: number } | null = null;
+  private prevAim: { azDeg: number; elDeg: number; azM: number; elM: number; hfov: number } | null = null;
   /** Since when the detection has been continuously near center (0 = not). */
   private visionGoodSince = 0;
   /** Since when the lock has been off-centre / motion-inconsistent / absent
@@ -305,6 +316,12 @@ export class ControlLoop {
   private zenithLatched = false;
   /** When the crossing regime was last released (short-lead window). */
   private zenithExitAt = 0;
+  /** Last tick the search clock was held (plane below the skyline, or the
+   *  overhead park/hand-over) — acquisition time only counts while the plane
+   *  can actually be seen. */
+  private acqHoldAt = 0;
+  /** Targets dropped for a challenger, hex → until (see selectTarget). */
+  private targetCooldown = new Map<string, number>();
   /** Bias-innovation gate: consecutive frames whose measured bias disagrees
    *  with the running estimate by more than the gate. */
   private biasOutliers = 0;
@@ -565,9 +582,11 @@ export class ControlLoop {
           t: now,
           v: nextPlane(
             this.upstream.getAircraft(), cfg.site, now, cfg.target, cfg.limits.horizon,
-            this.current?.hex ?? null,
+            this.current,
             cfg.target.departurePriority === false ? null : (this.upstream.getConfig().airport ?? SFO_ARP),
             this.sunAt(cfg.site, now),
+            cfg.targetMode,
+            this.targetCooldown,
           ),
         };
       } catch {
@@ -575,6 +594,25 @@ export class ControlLoop {
       }
     }
     return this.nextPlaneCache.v;
+  }
+
+  /**
+   * Zoom with the focus learned for that zoom and the plane's distance band,
+   * in ONE command when the camera supports it: the lens then arrives sharp
+   * instead of landing 300-1400 units short (its own zoom tracking) and
+   * crawling the rest at ~60 u/s. Unlearned zooms fall back to plain zoom.
+   */
+  private commandZoom(d: CameraDriver, zoomUnits: number, slantM: number | null): void {
+    // Only where the lens's own zoom tracking falls short — the tele stops,
+    // where it landed 300-1400 units off — and only on a well-learned point.
+    // Elsewhere tracking preserves the current focus DISTANCE, which is right
+    // for the plane already in focus; forcing a table value there defocused a
+    // close plane instantly (see FocusController.trusted).
+    const f = d.setZoomFocus && zoomUnits >= ZOOM_FOCUS_MIN_UNITS
+      ? this.focus.trusted(zoomUnits, distanceBand(slantM), ZOOM_FOCUS_MIN_SAMPLES)
+      : null;
+    if (f != null) d.setZoomFocus!(zoomUnits, f);
+    else d.setZoom(zoomUnits);
   }
 
   /** Sun direction, refreshed every 30 s (it moves ~0.25°/min). */
@@ -741,7 +779,7 @@ export class ControlLoop {
     }
   }
 
-  /** Bias corrections sampled while locked this pass (az, el deg). */
+  /** Bias corrections sampled while locked this pass, head frame (mount az, el deg). */
   private passBias: { az: number; el: number }[] = [];
   private biasSampleAt = 0;
   /** Recent passes' median corrections, newest last. */
@@ -869,6 +907,7 @@ export class ControlLoop {
       cfg.limits.horizon,
       this.sunAt(cfg.site, now),
       cfg.target.departurePriority === false ? null : (this.upstream.getConfig?.()?.airport ?? SFO_ARP),
+      this.targetCooldown,
     );
 
     if (tracking) {
@@ -876,6 +915,13 @@ export class ControlLoop {
       // (null vs undefined: with no target at all this must NOT fire every
       // tick — it resets the setpoint/vision state and spams the recorder.)
       if ((hex ?? null) !== (this.current?.hex ?? null)) {
+        // Dropped while still trackable (a challenger won) → cooldown, so the
+        // two can't ping-pong. A target that simply left isn't penalised.
+        const prev = this.current?.hex;
+        if (prev && hex && selection.candidates.some((c) => c.hex === prev)) {
+          this.targetCooldown.set(prev, now + TARGET_COOLDOWN_MS);
+        }
+        for (const [h, until] of this.targetCooldown) if (until <= now) this.targetCooldown.delete(h);
         this.foldPassBias(now);
         this.current = hex ? { hex, sinceMs: now } : null;
         this.resetSetpoint();
@@ -895,8 +941,12 @@ export class ControlLoop {
       // re-lock). Keep the lead short there; vision centres the rest.
       const shortLead = this.zenithLatched || now - this.zenithExitAt < 3000;
       const curPT = poseEst ? { panDeg: poseEst.panDeg, tiltDeg: poseEst.tiltDeg } : null;
-      const tiltLat = cfg.predict.tiltLatencySec ?? 0.4;
-      const panLat = cfg.predict.panLatencySec ?? 0.6;
+      // Setpoint lead per axis = actuator latency + the aim-only lead (the
+      // latter is NOT in the cmdAt() error reference below, so it shifts
+      // where the head ends up instead of cancelling out).
+      const aimLead = shortLead ? 0 : cfg.predict.aimLeadSec ?? 0;
+      const tiltLat = (cfg.predict.tiltLatencySec ?? 0.4) + aimLead;
+      const panLat = (cfg.predict.panLatencySec ?? 0.6) + aimLead;
       const baseP = { ...cfg.predict, motorLatencySec: tiltLat };
       prediction = predictAim(
         targetAc, cfg.site, now, this.history,
@@ -924,7 +974,8 @@ export class ControlLoop {
         panMinDeg: cfg.limits.panMinDeg,
         panMaxDeg: cfg.limits.panMaxDeg,
       });
-      const hold = zenithHold(plan, prediction.azEl.elDeg, this.zenithLatched);
+      const headEl = mountFrameFromWorld(prediction.azEl.azDeg, prediction.azEl.elDeg, cfg.mount).elDeg;
+      const hold = zenithHold(plan, headEl, this.zenithLatched);
       if (hold?.phase === "park") this.zenithLatched = true;
       else if (!hold && this.zenithLatched) {
         this.zenithLatched = false; // released: cone left
@@ -984,6 +1035,9 @@ export class ControlLoop {
           this.elTracker.observe(prediction.azEl.elDeg, dtFix, prediction.elRateDps, stepMax);
           this.lastObservedTs = fixTs;
         }
+        // Follow the predictor's current rates between fixes (see steer()).
+        this.azTracker.steer((azLeadPred ?? prediction).azRateDps);
+        this.elTracker.steer(prediction.elRateDps);
         const dt = 1 / (cfg.predict.commandHz || 15);
         az = this.azTracker.propagate(dt, cfg.limits.panSpeedMaxDps);
         el = this.elTracker.propagate(dt, cfg.limits.tiltSpeedMaxDps);
@@ -1025,14 +1079,17 @@ export class ControlLoop {
       // directions that are open.
       {
         const skyline = horizonMinEl(cfg.limits.horizon, az, -90);
-        if (el < skyline) {
-          // Waiting for a plane still below the skyline (a departure climbing
-          // out): frame the sky ABOVE the roofline rather than centring on it
-          // — the plane then rises into the lower part of the picture and the
-          // stream isn't half a house.
-          const vfov = hfovFromZoomUnits(d.getPose()?.zoomUnits ?? 0, cfg.zoom.fovLut) * (9 / 16);
-          el = skyline + 0.3 * vfov;
-        }
+        const vfov = hfovFromZoomUnits(d.getPose()?.zoomUnits ?? 0, cfg.zoom.fovLut) * (9 / 16);
+        const waitEl = skyline + 0.3 * vfov;
+        // Waiting for a plane still below the skyline (a departure climbing
+        // out): frame the sky ABOVE the roofline rather than centring on it
+        // — the plane then rises into the lower part of the picture and the
+        // stream isn't half a house. A RISING plane keeps that framing until
+        // it climbs up to it: dropping the aim onto the plane the moment it
+        // cleared the roofline and then chasing it back up (5-8°/s) blinded
+        // the detector — CES590 (777, in frame from ~12 s) first locked at 18 s.
+        const rising = (prediction?.elRateDps ?? 0) > 0.2;
+        if (el < skyline || (rising && el < waitEl)) el = Math.max(el, waitEl);
       }
       const pt = mountFromWorld(az, el, cfg.mount);
       // Pan dead-zone anticipation (see WRAP_SLEW_DPS).
@@ -1111,10 +1168,14 @@ export class ControlLoop {
         now - this.visionGoodSince > 800;
       // Per-pass bias evidence for the drift fold-in (see foldPassBias).
       if (visionLocked && now - this.biasSampleAt > 500) {
-        const elB = prediction.azEl.elDeg;
-        if (elB >= 20 && elB <= 75) {
+        // Kept in the HEAD frame — what the mount offsets act on. On the
+        // tilted base a world-el correction is part pan, part tilt.
+        const t = prediction.nowAzEl;
+        const p0 = mountFrameFromWorld(t.azDeg, t.elDeg, cfg.mount);
+        const p1 = mountFrameFromWorld(t.azDeg + this.corrAz, t.elDeg + this.corrEl, cfg.mount);
+        if (prediction.azEl.elDeg >= 20 && p0.elDeg >= 20 && p0.elDeg <= 75) {
           this.biasSampleAt = now;
-          this.passBias.push({ az: this.corrAz, el: this.corrEl });
+          this.passBias.push({ az: norm180(p1.azDeg - p0.azDeg), el: p1.elDeg - p0.elDeg });
         }
       }
       // Pointing sigma: any FRESH, motion-consistent lock means vision is
@@ -1150,41 +1211,49 @@ export class ControlLoop {
         const detFresh =
           this.lastDetection && now - this.lastDetection.t < 1200;
         const locked = visionLocked;
+        // Hold the search clock while there is nothing to find: a departure
+        // is picked at lift-off and spends ~30 s below the roofline, and the
+        // overhead park is wide by design. (The clock used to run from target
+        // pick, so SKW6277 on 2026-10-12 hit "wide" before it ever cleared
+        // the skyline and stayed at 56° — zero detections all pass.)
+        const visible =
+          prediction.azEl.elDeg >= horizonMinEl(cfg.limits.horizon, prediction.azEl.azDeg, -90);
+        if (!visible || hold) this.acqHoldAt = now;
         if (!detFresh && this.lastDetection == null) {
           const since = this.current?.sinceMs ?? now;
-          if (this.lastDetSeenAt < since) {
-            // ACQUISITION (nothing seen yet this pass): a small or distant
-            // plane is ~10 px at wide and never gets detected, so the ladder
-            // never climbs (UAL939: 79 s at 9 km, 0.44°, zero detections).
-            // Once the head has settled on the ADS-B aim (pointing is good
-            // to ~1° after autocal), start at a rung sized to the plane;
-            // if nothing shows within 8 s, fall back to wide.
-            // Sized so the plane spans ~20 vision px (HFOV ≈ 24 × its angular
-            // size, never under 6°: pointing is good to ~0.5° now). A fixed
-            // 13.5° rung left a 0.3° plane at 10 px — the ~11,000 ft overhead
-            // arrivals locked 9-21% of the time inbound. Unseen after 8 s:
-            // one rung wider; after 16 s: wide.
-            const settled = now - since > 1500 && lagDeg < 2;
+          const seen = this.lastDetSeenAt >= since;
+          if (seen && now - this.lastDetSeenAt <= LADDER_LOST_MS) {
+            // Just lost: step OUT one rung at a time first — a plane that
+            // went soft or dim is usually still in frame, and ×1.6 wider
+            // usually re-finds it in a second.
+            if (this.ladderIdx > 0 && now - this.lastLadderAt > LADDER_DEMOTE_AFTER_MS) {
+              this.ladderIdx--;
+              this.lastLadderAt = now;
+            }
+          } else {
+            // SEARCH (nothing seen yet, or lost for a while): a small or
+            // distant plane is ~10 px at wide and never gets detected, so the
+            // ladder never climbs (UAL939: 79 s at 9 km, 0.44°, zero
+            // detections). Once the head has settled on the ADS-B aim, start
+            // at a rung sized so the plane spans ~20 vision px (HFOV ≈ 24 ×
+            // its angular size, never under 6°); unseen: one rung wider, then
+            // wide, then try again. A lost plane re-enters this cycle too —
+            // N529QS sat at 36° for 45 s after an overhead crossing with the
+            // aim 0.5° off it, because "lost" used to mean wide for good.
+            const t0 = Math.max(since, this.acqHoldAt, seen ? this.lastDetSeenAt + LADDER_LOST_MS : 0);
+            const tAcq = (now - t0) % ACQ_CYCLE_MS;
+            const settled = now - t0 > 1500 && lagDeg < 2;
             const ang = zoom.angularSizeDeg ?? 1;
             const acqHfov = clamp(24 * ang, 6, wideHfov);
             const sizedRung = Math.max(0, Math.floor(Math.log(acqHfov / wideHfov) / Math.log(RUNG)));
-            const startRung = now - since >= 16_000 ? 0 : now - since >= 8000 ? Math.max(0, sizedRung - 1) : sizedRung;
-            if (now - since >= 8000 && this.ladderIdx > startRung) {
+            const startRung = tAcq >= ACQ_WIDE_MS ? 0 : tAcq >= ACQ_WIDER_MS ? Math.max(0, sizedRung - 1) : sizedRung;
+            if (this.ladderIdx > startRung) {
               this.ladderIdx = startRung;
               this.lastLadderAt = now;
             } else if (settled && startRung > this.ladderIdx) {
               this.ladderIdx = startRung;
               this.lastLadderAt = now;
             }
-          } else if (now - this.lastDetSeenAt > 6000) {
-            // Lost after having seen it: step OUT one rung at a time first —
-            // a plane that went soft or dim is usually still in frame, and
-            // ×1.6 wider usually re-finds it in a second. Only a sustained
-            // loss goes back to wide.
-            this.ladderIdx = 0;
-          } else if (this.ladderIdx > 0 && now - this.lastLadderAt > LADDER_DEMOTE_AFTER_MS) {
-            this.ladderIdx--;
-            this.lastLadderAt = now;
           }
         } else if (
           locked && detFresh &&
@@ -1227,9 +1296,12 @@ export class ControlLoop {
         } else {
           // Ladder has reached the ADS-B framing — clamp the rung so a later
           // demotion starts from here, not from rungs banked beyond it.
+          // (ceil, not round: the rung must stay AT or inside the framing.
+          // Rounding sent a 4.1° framing back to the 5.2° rung, so with
+          // zoom.minHfovDeg 4.1 the lens never got past the 5.04° stop.)
           this.ladderIdx = Math.max(
             0,
-            Math.round(Math.log(zoom.hfovDeg / wideHfov) / Math.log(RUNG)),
+            Math.ceil(Math.log(zoom.hfovDeg / wideHfov) / Math.log(RUNG) - 1e-6),
           );
         }
       }
@@ -1296,14 +1368,15 @@ export class ControlLoop {
           zoom.zoomUnits = zoomUnitsFromHfov(cur, cfg.zoom.fovLut);
         }
       }
-      // Zoom STOPS near tele: the lens's focus-tracking curve there is ~37
-      // focus units per zoom unit, so every small creep (1437→1429→1414…)
-      // knocked focus hundreds of units off. Snap to a few fixed zooms —
-      // never tighter than wanted, so the smoothness floors hold — each of
-      // which gets a well-learned focus (camera/focus.ts).
-      const teleStopsDeg = TELE_STOP_UNITS.map((u) => hfovFromZoomUnits(u, cfg.zoom.fovLut));
-      if (zoom.hfovDeg < teleStopsDeg[teleStopsDeg.length - 1] * 1.15) {
-        const stop = teleStopsDeg.find((h) => h >= zoom.hfovDeg * 0.97) ?? zoom.hfovDeg;
+      // Zoom STOPS (tracker.zoom.stopUnits / stopRatio): the lens re-focuses
+      // after every zoom move — ~37 focus units per zoom unit near tele, and
+      // the servo only manages ~90 units/s — so a framing that crept through
+      // in-between values (4.4→5.8→6.6→8.3→9.4…, 20-60 zoom moves a pass on
+      // 2026-10-12) kept the picture soft. Snap to a few fixed zooms, never
+      // tighter than wanted so the smoothness floors hold; each stop gets a
+      // well-learned focus (camera/focus.ts).
+      {
+        const stop = snapToStop(zoom.hfovDeg, zoomStopsHfov(cfg.zoom));
         if (stop !== zoom.hfovDeg) {
           zoom.hfovDeg = stop;
           zoom.zoomUnits = zoomUnitsFromHfov(stop, cfg.zoom.fovLut);
@@ -1351,7 +1424,17 @@ export class ControlLoop {
         if (a.kind === "auto") d.setFocusInfinity(false);
         else if (a.kind === "manual") d.focusManual ? d.focusManual() : d.setFocusInfinity(true);
         else if (a.kind === "farReference") d.setFocusInfinity(true); // manual + drive to the far stop
-        else if (a.kind === "nudge") d.focusNudge?.(a.deltaUnits);
+        // Zoom-Focus Direct lands the learned point in ~1-2 s; the timed
+        // drive crawls ~60 u/s (6+ s soft after every arrival at tele).
+        else if (a.kind === "nudge") {
+          // Jump straight there only onto a trusted tele point; anything else
+          // stays a timed drive the sharpness feedback can catch mid-way.
+          const trusted = lensZoom >= ZOOM_FOCUS_MIN_UNITS
+            ? this.focus.trusted(lensZoom, distanceBand(prediction?.azEl.slantM ?? null), ZOOM_FOCUS_MIN_SAMPLES)
+            : null;
+          if (d.setFocusDirect && trusted != null && Math.abs(trusted - a.target) < 5) d.setFocusDirect(a.target);
+          else d.focusNudge?.(a.deltaUnits);
+        }
         else if (a.kind === "onePush" && cfg.vision.autofocusOnZoom) d.onePushAutofocus();
         if (a.kind === "nudge" || a.kind === "onePush") {
           const extra = a.kind === "nudge" ? { delta: Math.round(a.deltaUnits), target: Math.round(a.target) } : {};
@@ -1623,7 +1706,7 @@ export class ControlLoop {
         // tilt at 9/16 of the pan so both axes hop the same FRACTION.
         d.trackRate(panRate, tiltRate, { rippleDeg, rippleTiltDeg: rippleDeg * (9 / 16) });
         this.pursuing = panRate !== 0 || tiltRate !== 0;
-        d.setZoom(zoom.zoomUnits);
+        this.commandZoom(d, zoom.zoomUnits, prediction?.azEl.slantM ?? null);
         this.recorder.write("command", {
           panRate, tiltRate, errPan, errTilt, zoom: zoom.zoomUnits, mode: "pursue",
           ffPan, ffTilt, iPan: this.panRateI, iTilt: this.tiltRateI,
@@ -1911,17 +1994,16 @@ export class ControlLoop {
     let exY = 0.5;
     const lockedBefore = this.tracks.lockedTrack();
     const atPre = this.aimAt(frameT);
+    const geomNow = frameGeom(pose, cfg.mount, hfov);
     if (lockedBefore && atPre) {
       const p = lockedBefore.positionAt(frameT);
-      const cosE = Math.max(0.2, Math.cos((atPre.aimEl * Math.PI) / 180));
-      exX = clamp01(0.5 + (norm180(p.azDeg - atPre.aimAz) * cosE * sign) / atPre.hfov);
-      exY = clamp01(0.5 - (p.elDeg - atPre.aimEl) / (atPre.hfov * (9 / 16)));
+      const e = frameGeom(atPre, cfg.mount, atPre.hfov).toFrame(p.azDeg, p.elDeg);
+      exX = clamp01(e.cx);
+      exY = clamp01(e.cy);
     } else if (predicted) {
-      const dAz =
-        norm180(predicted.azDeg - aim.azDeg) *
-        Math.cos((predicted.elDeg * Math.PI) / 180);
-      exX = clamp01(0.5 + dAz / hfov);
-      exY = clamp01(0.5 - (predicted.elDeg - aim.elDeg) / vfov);
+      const e = geomNow.toFrame(predicted.azDeg, predicted.elDeg);
+      exX = clamp01(e.cx);
+      exY = clamp01(e.cy);
     }
 
     this.visionBusy = true;
@@ -1941,27 +2023,37 @@ export class ControlLoop {
         // Seed the background-shift search with the known aim delta between the
         // two frames (camera moves -> world shifts the opposite way in frame);
         // a tiny ±6 px refine absorbs pose lag / lens distortion.
-        const cosE0 = Math.max(0.2, Math.cos((aim.elDeg * Math.PI) / 180));
+        // Head-frame (pixel-axis) delta: on the tilted base the world az/el
+        // delta points the wrong way in the rolled picture.
+        const cosE0 = Math.max(0.2, Math.cos((geomNow.elM * Math.PI) / 180));
         const seedDx = Math.round(
-          ((-norm180(aim.azDeg - prevAim.azDeg) * cosE0 * sign) / Math.max(1, hfov)) * VISION_W,
+          ((-norm180(geomNow.azM - prevAim.azM) * cosE0 * sign) / Math.max(1, hfov)) * VISION_W,
         );
-        const seedDy = Math.round(((aim.elDeg - prevAim.elDeg) / Math.max(1, vfov)) * VISION_H);
+        const seedDy = Math.round(((geomNow.elM - prevAim.elM) / Math.max(1, vfov)) * VISION_H);
         const shift = estimateShift(prev, cur, VISION_W, VISION_H, seedDx, seedDy, 6);
         const resid = compensatedResidual(prev, cur, VISION_W, VISION_H, shift);
         // The plane is always above the horizon; drop the ground (known from
         // tilt) so rooftops/poles/trees never become false movers.
-        maskBelowHorizon(resid, VISION_W, VISION_H, aim.elDeg, vfov, 2);
-        if (cfg.limits.horizon?.length) {
-          const hz = cfg.limits.horizon;
-          maskBelowSkyline(resid, VISION_W, VISION_H, aim.azDeg, aim.elDeg, hfov, vfov,
-            (az) => horizonMinEl(hz, az, -90), sign);
-        }
+        // Evaluated per cell in the WORLD frame, so the mask follows the
+        // slanted horizon of a rolled picture.
+        const hz = cfg.limits.horizon;
+        maskBelowWorld(resid, VISION_W, VISION_H, geomNow,
+          hz?.length ? (az) => Math.max(-2, horizonMinEl(hz, az, -90)) : () => -2);
         const rawBlobs = findMovingBlobs(resid, VISION_W, VISION_H, 5, {
           expectedX: exX,
           expectedY: exY,
           maxDistFrac: lockedBefore ? 0.22 : 0.45,
           minPeakSigma: 5,
         });
+        // Reserved slot for the plane: strong distractors (gull pieces were
+        // 20-80σ vs the plane's 8-18σ) can fill every slot and hide a locked
+        // plane for ~0.5 s. If nothing was found right at the expected spot,
+        // look there alone.
+        if (lockedBefore && !rawBlobs.some((b) => Math.hypot((b.cx - exX) * VISION_W, (b.cy - exY) * VISION_H) < 0.06 * VISION_W)) {
+          rawBlobs.push(...findMovingBlobs(resid, VISION_W, VISION_H, 1, {
+            expectedX: exX, expectedY: exY, maxDistFrac: 0.06, minPeakSigma: 5,
+          }));
+        }
         // A plane that fills a good part of the frame (full tele) leaves
         // SEVERAL residual blobs — nose, tail, engines, contrail — and the
         // lock hopped between them along the fuselage, dragging the aim
@@ -2019,7 +2111,7 @@ export class ControlLoop {
       }
       // Roll the frame buffer forward for the next tick's diff.
       this.prevLuma = cur;
-      this.prevAim = { azDeg: aim.azDeg, elDeg: aim.elDeg, hfov };
+      this.prevAim = { azDeg: aim.azDeg, elDeg: aim.elDeg, azM: geomNow.azM, elM: geomNow.elM, hfov };
 
       const now = Date.now();
       const atFrame = this.aimAt(frameT);
@@ -2045,10 +2137,8 @@ export class ControlLoop {
       const hfovF = atFrame.hfov;
       const elF = atFrame.aimEl;
       const cosE = Math.max(0.2, Math.cos((elF * Math.PI) / 180));
-      const toWorld = (cx: number, cy: number) => ({
-        azDeg: atFrame.aimAz + ((cx - 0.5) * hfovF * sign) / cosE,
-        elDeg: atFrame.aimEl + (0.5 - cy) * hfovF * (9 / 16),
-      });
+      const geomF = frameGeom(atFrame, cfg.mount, hfovF);
+      const toWorld = (cx: number, cy: number) => geomF.toWorld(cx, cy);
       const obs: WorldObs[] = cands.map((c) => {
         const w = toWorld(c.cx, c.cy);
         return {
@@ -2111,8 +2201,7 @@ export class ControlLoop {
         // What the UI / crop-follow see: the SMOOTHED position in frame
         // coordinates (the raw blob hopped around on the stream), with a
         // single-frame hop held back until it persists.
-        const sx = 0.5 + (offAz * cosE * sign) / hfovF;
-        const sy = 0.5 - offElDeg / (hfovF * (9 / 16));
+        const { cx: sx, cy: sy } = geomF.toFrame(smooth.azDeg, smooth.elDeg);
         const prevDet = this.lastDetection;
         const hop = prevDet && now - prevDet.t < 600
           ? Math.hypot(sx - prevDet.cx, (sy - prevDet.cy) * (9 / 16))
@@ -2161,7 +2250,11 @@ export class ControlLoop {
           }
         }
 
-        const steady = aimRateDps < 8 && elF < 75;
+        // The bias is a slow ADS-B offset: learn it only with the head nearly
+        // still. During a fast slew the pose estimate runs ahead of the real
+        // head, and that error was learned as bias and pulled the aim the
+        // wrong way (DAL8926: plane at the frame top, correction pulling DOWN).
+        const steady = aimRateDps < BIAS_MAX_AIM_RATE_DPS && elF < 75;
         // The lock IS the temporal confirmation now: a track only becomes
         // the lock after several coherent, motion-consistent frames.
         const confirmed = lt.hits >= 4;
@@ -2247,9 +2340,12 @@ export class ControlLoop {
             // A FRESH position only: the "truth" of a sample dead-reckoned
             // from a seconds-old fix is itself degrees off.
             if (ac && ac.altGeom != null && (ac.gs ?? 0) > 80 && fixAgeSec(ac, now) < 2.5) {
+              // Head-frame offset = the pixel offset itself (the lean
+              // cancels), so the sample doesn't depend on the model's lean.
+              const mo = geomF.mountOffset(smooth.azDeg, smooth.elDeg);
               this.autoCal.add({
-                panDeg: atFrame.panDeg + offAz / cfg.mount.panGain,
-                tiltDeg: atFrame.tiltDeg + offElDeg / cfg.mount.tiltGain,
+                panDeg: atFrame.panDeg + mo.dAzM / cfg.mount.panGain,
+                tiltDeg: atFrame.tiltDeg + mo.dElM / cfg.mount.tiltGain,
                 azDeg: atFrame.truthAz,
                 elDeg: atFrame.truthEl,
                 t: now,

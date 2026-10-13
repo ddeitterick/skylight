@@ -76,6 +76,26 @@ describe("AutoCalibrator", () => {
     expect(out).toBeNull();
   });
 
+  it("does not re-apply a correct model just because trimming flatters the fit", () => {
+    // 2026-10-11 dusk: honest samples + a few mis-locks, current model right.
+    // The old test compared the trimmed pool's rms against the WHOLE buffer's
+    // (outliers included) and "improved 1.3 -> 0.4°" every 5 minutes.
+    const cal = new AutoCalibrator(file);
+    const t0 = 1_000_000_000;
+    let t = t0;
+    for (let i = 0; i < 40; i++) {
+      const az = (i * 47) % 360;
+      const el = 12 + ((i * 13) % 50);
+      const s = sampleAt(az, el, t);
+      // Pixel-ish noise on every sample, and one in five a wrong-blob lock.
+      const n = Math.sin(i * 12.9898) * 0.25;
+      const junk = i % 5 === 0 ? 3 + (i % 3) : 0;
+      cal.add({ ...s, panDeg: s.panDeg + n + junk, tiltDeg: s.tiltDeg - n + 0.6 * junk });
+      t += 2000;
+    }
+    expect(cal.trySolve(TRUE_MOUNT, t + 60_000)).toBeNull();
+  });
+
   it("needs a minimum sample count", () => {
     const cal = new AutoCalibrator(file);
     const t0 = 1_000_000_000;

@@ -84,6 +84,10 @@ export class VideoRecorder {
       "-rtsp_transport", "tcp",
       "-i", this.url,
       "-an", "-c:v", "copy",
+      // The TONGVEO sends FULL-range video without colour tags; players then
+      // assume TV range and clip highlights / crush shadows (sunlit planes:
+      // 6.3% → 2.9% clipped pixels with the tag). Tag it — no transcode.
+      "-bsf:v", "h264_metadata=video_full_range_flag=1:colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1",
       "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
       "-f", "mp4",
       path,

@@ -55,6 +55,8 @@ body {
 
 /* MJPEG fallback layers over the (kept-mounted) MSE video. */
 .tv-video.fallback { position: absolute; inset: 0; }
+/* Live-stabilized picture (WebGL canvas) over the raw <video>. */
+.tv-video.tv-stab { position: absolute; inset: 0; }
 
 /* subtle cinematic vignette over the video */
 .tv::after {

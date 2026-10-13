@@ -1,0 +1,7 @@
+# Skylight archive stabilizer (dev box). Fedora ships all of these as system packages
+# (python3-numpy python3-scipy python3-opencv python3-av); pip works too:
+#   python3 -m pip install --user -r stabilizer/requirements.txt
+numpy>=2.0
+scipy>=1.13
+opencv-python-headless>=4.10   # or the distro's python3-opencv
+av>=14                          # PyAV: frame-exact decode/encode by PTS

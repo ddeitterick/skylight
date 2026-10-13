@@ -104,4 +104,18 @@ describe("selectTarget", () => {
     const sel = selectTarget([cruiser, lander], SITE, now, null, "approach", CRIT);
     expect(sel.hex).toBe("lander");
   });
+
+  it("a plane dropped for a challenger can't win back a valid current target during its cooldown", () => {
+    // "a" (dropped earlier) is now clearly the better plane; "b" is current
+    // and still valid. With "a" cooling down, "b" stays; afterwards "a" wins.
+    const a = planeAt("a", 60, now);
+    const b = planeAt("b", 20, now);
+    const cur = { hex: "b", sinceMs: now - 60_000 };
+    const cooldown = new Map([["a", now + 30_000]]);
+    expect(selectTarget([a, b], SITE, now, cur, "overhead", CRIT, undefined, undefined, undefined, null, null, cooldown).hex).toBe("b");
+    expect(selectTarget([a, b], SITE, now, cur, "overhead", CRIT, undefined, undefined, undefined, null, null, new Map()).hex).toBe("a");
+    // With no valid current target, a cooling-down plane is still pickable.
+    expect(selectTarget([a], SITE, now, cur, "overhead", CRIT, undefined, undefined, undefined, null, null, cooldown).hex).toBe("a");
+  });
 });
+

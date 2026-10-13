@@ -145,6 +145,15 @@ export interface TrackerConfig {
      */
     panLatencySec: number;
     tiltLatencySec: number;
+    /**
+     * Extra lead on the AIM only, s (not on the loop's error reference). The
+     * per-axis latencies above set both the setpoint lead and the "command
+     * the head is executing now" reference, so raising them cancels out in
+     * steady pursuit. Measured 2026-10-12: the plane sat ~0.45 s AHEAD of
+     * frame centre along-track in every pass while the vision bias said
+     * ADS-B was right (along-track ≈ 0) — the head trails its own estimate.
+     */
+    aimLeadSec: number;
   };
   zoom: {
     auto: boolean;
@@ -158,6 +167,14 @@ export interface TrackerConfig {
     lockedSigmaDeg: number;
     /** Fraction of frame height the plane should fill. */
     fillFrac: number;
+    /**
+     * Never zoom tighter than this HFOV, deg (0 = the lens's full tele).
+     * Pointing wobble is ~fixed in degrees (tele 2026-10-12: centring p90
+     * 0.6-1.7°, 1-s hops p90 0.8-1.6°), so the tightest zoom shows it
+     * largest; a slightly wider limit trades a little plane size for a
+     * steadier, sharper-looking shot.
+     */
+    minHfovDeg: number;
     /** HFOV used when auto is off, deg. */
     manualHfovDeg: number;
     /** Measured zoom-units -> HFOV samples (endpoints from the datasheet). */
@@ -170,6 +187,16 @@ export interface TrackerConfig {
      */
     rateFloorDegPerDps: number;
     rateFloorMaxDeg: number;
+    /**
+     * Zoom STOPS, lens units: every zoom command snaps to one of these (never
+     * tighter than wanted). The lens re-focuses (zoom tracking, then the
+     * focus servo at ~90 units/s) after every zoom move, so a framing that
+     * creeps through in-between values keeps the picture soft; a few fixed
+     * stops each get a well-learned focus (camera/focus.ts). Empty = stops
+     * every `stopRatio` in HFOV from tele to wide.
+     */
+    stopUnits: number[];
+    stopRatio: number;
   };
   vision: {
     /** Run the in-frame plane detector while tracking. */
@@ -209,6 +236,52 @@ export interface TrackerConfig {
      * when the refit clearly beats the current model.
      */
     autoCalibrate: boolean;
+  };
+
+  /**
+   * Picture leveling on the TV/stream pages. On a tilted base (wedge) the
+   * picture is rolled against the horizon by up to ~the lean; the pages
+   * counter-rotate it (and zoom just enough to hide the corners). Faded out
+   * toward overhead, where "level" means nothing and the roll swings fast.
+   */
+  leveling: {
+    enabled: boolean;
+    /** Full correction while the camera looks below this elevation, deg. */
+    fullBelowElDeg: number;
+    /** No correction above this elevation, deg (linear fade between). */
+    offAboveElDeg: number;
+    /** Never rotate the picture more than this, deg (corner zoom grows fast). */
+    maxRollDeg: number;
+  };
+
+  /**
+   * Live video stabilization on the TV/stream page (WebGL; needs a real GPU —
+   * the Twitch box, not the Pi). A page opts in with ?stab=1; `enabled` is the
+   * global switch (POST /api/config turns it off live). The page finds the
+   * plane in every video frame, smooths its path with a centred Gaussian that
+   * looks `delayMs` into the future, and shows the video `delayMs` late,
+   * shifted onto the smooth path. Overlays are replayed equally late.
+   */
+  liveStab: {
+    enabled: boolean;
+    /** Look-ahead = extra display delay, ms (1500 measured −61..−75% wobble). */
+    delayMs: number;
+    /** Gaussian sigma of the smoothed path, ms. */
+    sigmaMs: number;
+    /** Stabilize only at or below this HFOV, deg (wide = weak detections). */
+    maxHfovDeg: number;
+    /** Never shift the picture more than this fraction of the frame. */
+    maxShiftFrac: number;
+    /** Exposed edge: "fill" (flat-field + soft sky fill), "crop" (zoom in to
+     *  hide it), "auto" (fill on open sky, crop when skyline/texture shows). */
+    edge: "auto" | "fill" | "crop";
+    /** auto: fill only while the frame's bottom edge is above this elevation, deg. */
+    fillMinElDeg: number;
+    /** Largest crop zoom in crop mode. */
+    maxCropZoom: number;
+    /** Fade in/out time when the plane is found/lost (uses the look-ahead,
+     *  so the fade starts before a loss), ms. */
+    fadeMs: number;
   };
 
   /** Idle "ready position" when auto mode has no target. */
@@ -499,12 +572,14 @@ export const DEFAULT_CONFIG: Config = {
       rippleTeleDeg: 0.25,
       panLatencySec: 0.6,
       tiltLatencySec: 0.4,
+      aimLeadSec: 0,
     },
     zoom: {
       auto: true,
       sigmaDeg: 0.6,
       lockedSigmaDeg: 0.35,
       fillFrac: 0.28,
+      minHfovDeg: 0,
       manualHfovDeg: 20,
       // Datasheet endpoints; refined empirically at M4.
       fovLut: [
@@ -513,6 +588,8 @@ export const DEFAULT_CONFIG: Config = {
       ],
       rateFloorDegPerDps: 2.5,
       rateFloorMaxDeg: 12,
+      stopUnits: [],
+      stopRatio: 1.3,
     },
     vision: {
       enabled: true,
@@ -526,6 +603,23 @@ export const DEFAULT_CONFIG: Config = {
       encodeLagMs: 350,
       correctionSlewDps: 2.5,
       autoCalibrate: true,
+    },
+    leveling: {
+      enabled: true,
+      fullBelowElDeg: 35,
+      offAboveElDeg: 60,
+      maxRollDeg: 25,
+    },
+    liveStab: {
+      enabled: true,
+      delayMs: 1500,
+      sigmaMs: 750,
+      maxHfovDeg: 12,
+      maxShiftFrac: 0.15,
+      edge: "auto",
+      fillMinElDeg: 8,
+      maxCropZoom: 1.45,
+      fadeMs: 1000,
     },
     home: {
       enabled: true,
@@ -589,6 +683,8 @@ export function mergeTrackerConfig(
     },
     zoom: { ...base.zoom, ...(patch.zoom ?? {}) },
     vision: withoutKeys({ ...base.vision, ...(patch.vision ?? {}) }, RETIRED_TRACKER_KEYS.vision),
+    leveling: { ...base.leveling, ...(patch.leveling ?? {}) },
+    liveStab: { ...base.liveStab, ...(patch.liveStab ?? {}) },
     home: { ...base.home, ...(patch.home ?? {}) },
   } as TrackerConfig;
 }

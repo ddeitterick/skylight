@@ -8,7 +8,7 @@
 // window — see stream/README.md for the TikTok RTMP pusher.
 
 import { useEffect, useMemo, useState } from "react";
-import { metersToMiles, type Aircraft } from "@shared/index.js";
+import { displayRollDeg, metersToMiles, type Aircraft } from "@shared/index.js";
 import { useStream } from "../lib/useStream.js";
 import { useTracker } from "../tracker/useTracker.js";
 import { useLiveVideo } from "../tracker/useLiveVideo.js";
@@ -30,7 +30,13 @@ export function Stream() {
   const { state, config } = stream;
   const mse = useMse(stream.connected, state?.video);
   const liveVideo = useLiveVideo(stream.connected, mse.ok ? undefined : state?.video);
-  useStabilize(mse.videoRef, state?.vision?.detection, { enabled: mse.ok });
+  // Level the picture against the horizon (tilted base; tracker.leveling). ?level=0 shows it raw.
+  const levelOn = new URLSearchParams(window.location.search).get("level") !== "0";
+  const rollDeg =
+    levelOn && config?.leveling?.enabled && state?.pose
+      ? displayRollDeg(state.pose, config.mount, config.leveling)
+      : null;
+  useStabilize(mse.videoRef, state?.vision?.detection, { enabled: mse.ok, rollDeg });
 
   // Stream options via URL params; route info is opt-IN here (it's wrong
   // often enough that the default is to keep it off the broadcast).

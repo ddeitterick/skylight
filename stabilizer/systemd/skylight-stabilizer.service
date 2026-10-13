@@ -1,0 +1,24 @@
+# Skylight archive stabilizer (dev box only, never the Pi). See stabilizer/README.md.
+#   install:  ln -sf ~/plane-tracker/stabilizer/systemd/skylight-stabilizer.service ~/.config/systemd/user/
+#             systemctl --user daemon-reload && systemctl --user enable --now skylight-stabilizer
+[Unit]
+Description=Skylight pass archive stabilizer (clip.stab.mp4 for every pass)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/plane-tracker/stabilizer
+ExecStart=/usr/bin/python3 -u -m skylight_stab run --jobs 2 --threads 2
+Restart=on-failure
+RestartSec=60
+# Stay out of the way of the Twitch stream and the desktop: lowest CPU and IO priority, and a
+# hard cap of 20 of the 32 cores (at least 12 always free).
+Nice=19
+CPUSchedulingPolicy=idle
+IOSchedulingClass=idle
+CPUQuota=600%
+MemoryMax=8G
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

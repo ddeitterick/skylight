@@ -2,9 +2,9 @@
  * Skylight pass archive Worker — https://passes.skylightceiling.com
  * Contract shared with the Pi uploader and the site: docs/pass-archive.md.
  *
- *   PUT    /ingest/<id>/<name>   raw blob → R2 `<id>/<name>` (clip.mp4 | poster.jpg | series.json)
+ *   PUT    /ingest/<id>/<name>   raw blob → R2 `<id>/<name>` (clip.mp4 | poster.jpg | series.json | clip.stab.mp4 | stab.json)
  *   POST   /ingest/<id>          pass.json → D1 upsert (index columns + verbatim meta)
- *   DELETE /api/passes/<id>      removes the row and the three blobs
+ *   DELETE /api/passes/<id>      removes the row and its blobs
  *   GET    /api/passes           filters, sort, keyset cursor → { items, nextCursor, total }
  *   GET    /api/passes/<id>      PassRow & { meta }
  *   GET    /api/facets           distinct airlines / types / airports / builds with counts
@@ -16,7 +16,7 @@
  * camera: pass geometry is az/el only.
  */
 import { buildCountQuery, buildListQuery, decodeCursor, encodeCursor, ID_RE, parseFilters, parseLimit, parseSort } from "./query";
-import { buildUpsert, passToRow } from "./row";
+import { buildUpsert, carryStab, passToRow, stabColumns, stabOffered } from "./row";
 
 export interface Env {
   DB: D1Database;
@@ -32,18 +32,28 @@ const MEDIA_LICENSE = "Free for non-commercial use with credit; not MIT. https:/
 
 const DEV_ORIGINS = ["http://localhost:3000", "http://127.0.0.1:3000"];
 /** Blob names under <id>/ and the content-type they are stored and served with. */
-const MEDIA_TYPES: Record<string, string> = { "clip.mp4": "video/mp4", "poster.jpg": "image/jpeg", "series.json": "application/json" };
+const MEDIA_TYPES: Record<string, string> = {
+  "clip.mp4": "video/mp4",
+  "poster.jpg": "image/jpeg",
+  "series.json": "application/json",
+  "clip.stab.mp4": "video/mp4", // schema 1.3: stabilized copy (dev-box stabilizer)
+  "stab.json": "application/json",
+};
 /** What a client may label an upload as; anything else is obviously wrong → 415. */
 const UPLOAD_TYPES: Record<string, string[]> = {
   "clip.mp4": ["video/mp4", "application/mp4", "application/octet-stream"],
   "poster.jpg": ["image/jpeg", "image/jpg", "application/octet-stream"],
   "series.json": ["application/json", "text/json", "text/plain", "application/octet-stream"],
+  "clip.stab.mp4": ["video/mp4", "application/mp4", "application/octet-stream"],
+  "stab.json": ["application/json", "text/json", "text/plain", "application/octet-stream"],
 };
 const MAX_PASS_JSON_BYTES = 2 * 1024 * 1024;
 const MEDIA_CACHE = "public, max-age=31536000, immutable";
 /** poster.jpg is re-picked when a pass is re-scored (quality tool), so it revalidates by ETag after an hour. */
 const POSTER_CACHE = "public, max-age=3600, stale-while-revalidate=86400";
-const cacheFor = (name: string) => (name === "poster.jpg" ? POSTER_CACHE : MEDIA_CACHE);
+/** poster.jpg is re-picked by the re-scorer and the stabilized files are re-rendered when the method changes. */
+const REVALIDATE = new Set(["poster.jpg", "clip.stab.mp4", "stab.json"]);
+const cacheFor = (name: string) => (REVALIDATE.has(name) ? POSTER_CACHE : MEDIA_CACHE);
 
 type Hdrs = Record<string, string>;
 type Row = Record<string, string | number | null>;
@@ -132,16 +142,39 @@ async function handlePostPass(req: Request, env: Env, id: string, h: Hdrs): Prom
   const parsed = passToRow(meta);
   if (!parsed.ok) return json({ ok: false, error: parsed.error }, 400, h);
   if (parsed.row.id !== id) return json({ ok: false, error: "id in body does not match the URL" }, 400, h);
-  const clip = await env.MEDIA.head(`${id}/clip.mp4`);
+  // The Pi never sends media.stab; keep what the stabilizer stored (schema 1.3).
+  let row = parsed.row;
+  let stored = text;
+  const md = (meta as { media?: { stab?: unknown } }).media;
+  if (md?.stab === undefined || md?.stab === null) {
+    const prev = await env.DB.prepare("SELECT json_extract(meta, '$.media.stab') AS stab FROM passes WHERE id = ?").bind(id).first<{ stab: string | null }>();
+    let prevStab: unknown = null;
+    try {
+      prevStab = prev?.stab ? JSON.parse(prev.stab) : null;
+    } catch {
+      prevStab = null;
+    }
+    const c = carryStab(meta as Record<string, unknown>, prevStab);
+    if (c.carried) {
+      meta = c.meta;
+      stored = JSON.stringify(c.meta);
+      row = { ...row, ...stabColumns(prevStab) };
+    }
+  }
+  const [clip, stabClip] = await Promise.all([
+    env.MEDIA.head(`${id}/clip.mp4`),
+    stabOffered(meta) ? env.MEDIA.head(`${id}/clip.stab.mp4`) : Promise.resolve(null),
+  ]);
   const q = buildUpsert({
-    ...parsed.row,
-    clip_bytes: parsed.row.clip_bytes ?? clip?.size ?? null,
+    ...row,
+    clip_bytes: row.clip_bytes ?? clip?.size ?? null,
     has_clip: clip ? 1 : 0,
+    has_stab: stabClip ? 1 : 0,
     created_at: new Date().toISOString(),
-    meta: text,
+    meta: stored,
   });
   await env.DB.prepare(q.sql).bind(...q.params).run();
-  return json({ ok: true, id, hasClip: !!clip }, 200, h);
+  return json({ ok: true, id, hasClip: !!clip, hasStab: !!stabClip }, 200, h);
 }
 
 async function handleDelete(env: Env, id: string, h: Hdrs): Promise<Response> {
@@ -301,7 +334,7 @@ export default {
         if (!ID_RE.test(id)) return json({ ok: false, error: "bad id" }, 400, h);
         if (seg.length === 2 && req.method === "POST") return await handlePostPass(req, env, id, h);
         if (seg.length === 3 && req.method === "PUT") {
-          if (!isMediaName(seg[2])) return json({ ok: false, error: "name must be clip.mp4, poster.jpg or series.json" }, 400, h);
+          if (!isMediaName(seg[2])) return json({ ok: false, error: `name must be one of ${Object.keys(MEDIA_TYPES).join(", ")}` }, 400, h);
           return await handlePutBlob(req, env, id, seg[2], h);
         }
         return json({ ok: false, error: "not found" }, 404, h);

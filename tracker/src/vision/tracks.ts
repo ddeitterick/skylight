@@ -90,6 +90,25 @@ export function lockVelTolerance(predRateDps: number): number {
   return Math.max(0.6, 0.5 * predRateDps);
 }
 
+/** An observation this many times larger or smaller (blob area) than the
+ *  track's recent median is a different object passing through the gate,
+ *  not the same one: a gull (176 detector px) crossing a ~5 px Falcon fed
+ *  the plane's lock for 0.6 s by distance alone (2026-10-12, bird pass). */
+const SIZE_RATIO_MAX = 6;
+const SIZE_FLOOR_PX = 4;
+const SIZE_GATE_MAX_REF_PX = 30;
+
+function sizeCompatible(tr: CandidateTrack, o: WorldObs): boolean {
+  const recent = tr.obs.slice(-5).map((x) => x.areaPx).sort((a, b) => a - b);
+  if (!recent.length) return true;
+  const ref = Math.max(SIZE_FLOOR_PX, recent[recent.length >> 1]);
+  // Only for small targets: a big plane's area swings between the motion
+  // blob and its silhouette, and a bird near a big plane is no bigger.
+  if (ref > SIZE_GATE_MAX_REF_PX) return true;
+  const a = Math.max(SIZE_FLOOR_PX, o.areaPx);
+  return a / ref <= SIZE_RATIO_MAX && ref / a <= SIZE_RATIO_MAX;
+}
+
 export class CandidateTrack {
   readonly id = nextTrackId++;
   readonly obs: WorldObs[] = [];
@@ -254,7 +273,7 @@ export class TrackTable {
           norm180(o.azDeg - p.azDeg) * cosE,
           o.elDeg - p.elDeg,
         );
-        if (d <= gateDeg) pairs.push({ ti, oi, d });
+        if (d <= gateDeg && sizeCompatible(tr, o)) pairs.push({ ti, oi, d });
       }
     }
     pairs.sort((a, b) => a.d - b.d);

@@ -92,3 +92,9 @@ The code is MIT; the clips and posters are not. They are © Skylight (Cameron
 Paczek), free for non-commercial use with credit to skylightceiling.com, and
 commercial use requires permission. The Worker states this in `/health`,
 `/api/facets`, every pass's `meta.license` and the `x-license` header on media.
+
+Stabilized clips (schema 1.3): the dev-box stabilizer (`stabilizer/`) uploads `clip.stab.mp4` and
+`stab.json` (1 h revalidating cache) and re-POSTs pass.json with `media.stab`, which maps to
+`has_stab` (status ok + R2 HEAD of the clip), `stab_status`, `stab_wobble_before/after`; filters
+`hasStab=0|1`, `stab=none|ok|skipped|failed`. A re-POST without `media.stab` (the Pi's) keeps the
+stored one. Migrated with one `ALTER TABLE passes ADD COLUMN …` per column + `CREATE INDEX passes_stab_status`.

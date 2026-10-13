@@ -206,6 +206,16 @@ export class AutoCalibrator {
     if (!fit) return null;
 
     const m = fit.model;
+    // Judge the candidate on the SAME samples as the incumbent. The trimmed
+    // fit's rms is over its own inlier pool while the old rmsBefore was over
+    // the whole buffer (outliers and all), so every solve looked like a big
+    // win ("1.3 -> 0.4°") and re-applied every 5 min — the tilt offset
+    // random-walked ~8° in an hour on 2026-10-11. Two fair tests: the
+    // incumbent on the candidate's pool, and the whole-buffer median (which
+    // trimming can't flatter).
+    const poolBefore = rmsUnder(fit.pool, current);
+    const medBefore = medianResidual(this.samples, current);
+    const medAfter = medianResidual(this.samples, m);
     const dPan = Math.abs(norm180(m.panOffsetDeg - current.panOffsetDeg));
     const dTilt = Math.abs(m.tiltOffsetDeg - current.tiltOffsetDeg);
     const gainsSane =
@@ -217,17 +227,18 @@ export class AutoCalibrator {
       dPan <= MAX_OFFSET_STEP_DEG &&
       dTilt <= MAX_OFFSET_STEP_DEG &&
       gainsSane &&
-      fit.rmsDeg <= rmsBefore * IMPROVE_FACTOR &&
+      fit.rmsDeg <= poolBefore * IMPROVE_FACTOR &&
       // Demand a meaningful absolute gain too — refitting a model that is
       // already good just churns the config for noise.
-      rmsBefore - fit.rmsDeg >= 0.05 &&
+      poolBefore - fit.rmsDeg >= 0.05 &&
+      medAfter <= medBefore * IMPROVE_FACTOR &&
       fit.rmsDeg <= 1.2 // never apply a poor fit
     ) {
       this.lastAppliedAt = now;
       this.save(now, true);
       return {
         model: m,
-        rmsBeforeDeg: rmsBefore,
+        rmsBeforeDeg: poolBefore,
         rmsAfterDeg: fit.rmsDeg,
         n: fit.pool.length,
         solvedGains: solveGains,
@@ -365,6 +376,18 @@ export function rmsUnder(samples: AutoCalSample[], m: MountModel): number {
     ss += ra * ra + re * re;
   }
   return Math.sqrt(ss / samples.length);
+}
+
+/** Median angular residual of samples under a model, deg. */
+export function medianResidual(samples: AutoCalSample[], m: MountModel): number {
+  if (!samples.length) return 0;
+  const r = samples
+    .map((s) => {
+      const p = worldFromMount({ panDeg: s.panDeg, tiltDeg: s.tiltDeg }, m);
+      return Math.hypot(norm180(p.azDeg - s.azDeg) * Math.cos(s.elDeg * DEG), p.elDeg - s.elDeg);
+    })
+    .sort((a, b) => a - b);
+  return r[r.length >> 1];
 }
 
 /** Circular azimuth span: 360 minus the largest empty gap between samples. */

@@ -10,6 +10,10 @@
 #   FPS           framerate           (default 30)
 #   VBITRATE      video bitrate       (default 2500k at 720x1280; use 4500k at 1080x1920)
 #   ENCODER       libx264 | h264_v4l2m2m  (default: auto — v4l2m2m if /dev/video11 exists)
+#   CHROME_FLAGS  extra browser flags, space-separated (default none). The
+#                 Twitch box sets "--use-angle=vulkan --enable-features=Vulkan
+#                 --ignore-gpu-blocklist" so WebGL runs on the GPU — the live
+#                 stabilizer (tv.html?stab=1) loses its context on SwiftShader.
 #
 # Usage:
 #   ./start-stream.sh             reads .env            (Ctrl-C stops everything)
@@ -33,6 +37,7 @@ FPS="${FPS:-30}"
 VBITRATE="${VBITRATE:-2500k}"
 W="${RES%x*}" H="${RES#*x}"
 DISPLAY_NUM="${DISPLAY_NUM:-:22}"
+read -r -a EXTRA_CHROME_FLAGS <<< "${CHROME_FLAGS:-}"
 
 # Pi 4 has a hardware H.264 encoder (v4l2m2m); Pi 5 and PCs go software x264.
 if [ -z "${ENCODER:-}" ]; then
@@ -41,7 +46,7 @@ fi
 case "$ENCODER" in
   h264_v4l2m2m) VOPTS=(-c:v h264_v4l2m2m -b:v "$VBITRATE") ;;
   *)            VOPTS=(-c:v libx264 -preset superfast -tune zerolatency \
-                       -b:v "$VBITRATE" -maxrate "$VBITRATE" -bufsize 2M \
+                       -b:v "$VBITRATE" -maxrate "$VBITRATE" -bufsize "${VBUFSIZE:-6M}" \
                        -pix_fmt yuv420p) ;;
 esac
 
@@ -65,6 +70,7 @@ DISPLAY="$DISPLAY_NUM" "$CHROMIUM" \
   --noerrdialogs --disable-infobars --no-first-run \
   --disable-features=TranslateUI \
   --user-data-dir="/tmp/skylight-stream-chrome-${INSTANCE:-default}" \
+  "${EXTRA_CHROME_FLAGS[@]}" \
   --app="$PAGE_URL" &
 CHROME_PID=$!
 sleep 5

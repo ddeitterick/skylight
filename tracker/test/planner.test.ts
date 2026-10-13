@@ -66,6 +66,23 @@ describe("planPass", () => {
     expect(plan!.tCaSec).toBeGreaterThan(20);
   });
 
+  it("parks a fast, lower pass on its closest-approach point", () => {
+    // Low and close: ~400 m up, 200 m east of the site at closest approach
+    // (peak ≈ 63°, ~28°/s of azimuth) — too fast to chase, too low for the
+    // just-under-vertical park.
+    const ac = overheadFix(60);
+    const plan = planPass(
+      { ...ac, altGeom: 400 / FT_TO_M, gs: 200, lon: ac.lon! + 200 / (111320 * Math.cos((SITE.lat * Math.PI) / 180)) },
+      SITE,
+      60_000,
+    );
+    expect(plan).not.toBeNull();
+    expect(plan!.elMaxDeg).toBeLessThan(70);
+    expect(plan!.zenithPass).toBe(true);
+    expect(plan!.holdAzEl.elDeg).toBeCloseTo(plan!.elMaxDeg, 1);
+    expect(Math.abs(norm180(plan!.holdAzEl.azDeg - plan!.caAzDeg))).toBeLessThan(1);
+  });
+
   it("does NOT flag a moderate pass", () => {
     // Same flight, but offset 3 km east: peaks well below the zenith.
     const ac = overheadFix(60);

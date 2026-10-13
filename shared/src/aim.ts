@@ -156,6 +156,73 @@ export function mountFromWorld(azDeg: number, elDeg: number, m: MountModel): Pan
   };
 }
 
+/**
+ * The MOUNT frame: az/el measured in the pan/tilt head's own axes — what
+ * the head's pan and tilt actually sweep (pan·gain + offset, tilt·gain +
+ * offset), before the base's lean is applied. On a level mount it IS the
+ * world frame; on the 2026-10-12 wedge (≈25° lean) the two differ by up to
+ * the lean, and everything tied to the head's geometry (image axes, the
+ * pan/tilt singularity, pixel offsets) lives in this frame.
+ */
+export function mountFrameFromWorld(azDeg: number, elDeg: number, m: MountModel): { azDeg: number; elDeg: number } {
+  if (m.levelTiltDeg === 0) return { azDeg: norm360(azDeg), elDeg };
+  return vecToAzEl(rotate(azElToVec(azDeg, elDeg), leanAxis(m.levelDirDeg), -m.levelTiltDeg));
+}
+
+/** Inverse of mountFrameFromWorld. */
+export function worldFromMountFrame(azMDeg: number, elMDeg: number, m: MountModel): { azDeg: number; elDeg: number } {
+  if (m.levelTiltDeg === 0) return { azDeg: norm360(azMDeg), elDeg: elMDeg };
+  return vecToAzEl(rotate(azElToVec(azMDeg, elMDeg), leanAxis(m.levelDirDeg), m.levelTiltDeg));
+}
+
+/**
+ * Image roll at a pose, deg: the angle from the frame's "up" (the head's
+ * tilt direction) to world up, measured clockwise in the picture. A level
+ * mount gives 0; turn the picture by −roll to level the horizon.
+ */
+export function imageRollDeg(pt: PanTilt, m: MountModel): number {
+  if (m.levelTiltDeg === 0) return 0;
+  const a = (pt.panDeg * m.panGain + m.panOffsetDeg) * DEG;
+  const e = (pt.tiltDeg * m.tiltGain + m.tiltOffsetDeg) * DEG;
+  const k = leanAxis(m.levelDirDeg);
+  // Image right (+az) and up (+el) in the mount frame, carried to the world;
+  // their vertical components are world-up projected onto the picture.
+  const right = rotate([Math.cos(a), -Math.sin(a), 0], k, m.levelTiltDeg);
+  const up = rotate([-Math.sin(e) * Math.sin(a), -Math.sin(e) * Math.cos(a), Math.cos(e)], k, m.levelTiltDeg);
+  const sign = Math.sign(m.panGain) || 1;
+  return Math.atan2(right[2] * sign, up[2]) / DEG;
+}
+
+/**
+ * The roll a DISPLAY should cancel: the full image roll while the camera
+ * looks low (where the horizon is in shot and a tilted one reads as wrong),
+ * faded out toward overhead — there "level" means nothing, and near the
+ * mount's pole the roll swings fast (a 45° spin seen on the first overhead
+ * pass, 2026-10-12) while the corner-hiding zoom balloons. Capped too.
+ * Thresholds come from config (`tracker.leveling`).
+ */
+export function displayRollDeg(
+  pt: PanTilt,
+  m: MountModel,
+  opts: { fullBelowElDeg: number; offAboveElDeg: number; maxRollDeg: number },
+): number {
+  const r = imageRollDeg(pt, m);
+  const el = worldFromMount(pt, m).elDeg;
+  const span = Math.max(1e-6, opts.offAboveElDeg - opts.fullBelowElDeg);
+  const fade = Math.max(0, Math.min(1, (opts.offAboveElDeg - el) / span));
+  return Math.max(-opts.maxRollDeg, Math.min(opts.maxRollDeg, r)) * fade;
+}
+
+/**
+ * Display transform that levels a rolled picture: rotate by −roll and scale
+ * up just enough that the rotated w:h frame still covers the viewport (no
+ * black corners).
+ */
+export function levelingTransform(rollDeg: number, aspect = 16 / 9): { rotateDeg: number; scale: number } {
+  const t = Math.abs(rollDeg) * DEG;
+  return { rotateDeg: -rollDeg, scale: Math.cos(t) + aspect * Math.sin(t) };
+}
+
 // ---------------------------------------------------------------------------
 // Prediction
 // ---------------------------------------------------------------------------
@@ -295,6 +362,9 @@ export class AxisTracker {
   pos = 0;
   rate = 0;
   private initialized = false;
+  /** rate − rateHint at the last observation: the filter's own correction,
+   *  kept while the geometric rate hint is refreshed between fixes. */
+  private rateBias = 0;
 
   constructor(
     private wrap: boolean,
@@ -306,6 +376,18 @@ export class AxisTracker {
     this.initialized = pos != null;
     this.pos = pos ?? 0;
     this.rate = 0;
+    this.rateBias = 0;
+  }
+
+  /**
+   * Between fixes: follow the target's CURRENT geometric rate (recomputed by
+   * the predictor every tick) plus the filter's last correction. Holding the
+   * rate from the last fix lagged an accelerating close climb-out by ½·a·t²
+   * — ~5-7° of tilt on DAL8926 (2026-10-12) with a few seconds between fixes.
+   */
+  steer(rateHint: number): void {
+    if (!this.initialized || !Number.isFinite(rateHint)) return;
+    this.rate = rateHint + this.rateBias;
   }
 
   /** Advance the smoothed setpoint by dt, rate-limited to maxDps. */
@@ -326,6 +408,7 @@ export class AxisTracker {
     if (!this.initialized) {
       this.pos = target;
       this.rate = rateHint ?? 0;
+      this.rateBias = 0;
       this.initialized = true;
       return;
     }
@@ -339,6 +422,7 @@ export class AxisTracker {
     if (this.wrap) this.pos = norm360(this.pos);
     if (rateHint != null) {
       this.rate = rateHint + (dtFixSec > 0.05 ? (this.beta / dtFixSec) * resid : 0);
+      this.rateBias = this.rate - rateHint;
     } else if (dtFixSec > 0.05) {
       this.rate += (this.beta / dtFixSec) * resid;
     }

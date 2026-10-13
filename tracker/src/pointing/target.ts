@@ -77,6 +77,13 @@ export function selectTarget(
   sun?: { azDeg: number; elDeg: number } | null,
   /** Home airport: departures climbing out toward the site get priority. */
   airport?: { lat: number; lon: number } | null,
+  /**
+   * Planes recently dropped for a challenger (hex → until, ms epoch). While
+   * the current target is still valid they can't win it back: in a busy sky
+   * "closest" ping-ponged between two planes (JBU1633 ↔ SWA2115, 2026-10-12),
+   * cutting both passes in two and re-acquiring each time.
+   */
+  cooldown?: ReadonlyMap<string, number>,
 ): Selection {
   const sunAvoid = c.sunAvoidDeg ?? 15;
   const candidates: Candidate[] = [];
@@ -129,10 +136,10 @@ export function selectTarget(
   }
 
   const cur = current ? candidates.find((x) => x.hex === current.hex) : undefined;
-  const best = candidates[0];
-
-  if (!best) return { hex: null, candidates };
-  if (!cur || !current) return { hex: best.hex, candidates };
+  if (!candidates.length) return { hex: null, candidates };
+  if (!cur || !current) return { hex: candidates[0].hex, candidates };
+  // A plane on cooldown can't challenge a still-valid current target.
+  const best = candidates.find((x) => x.hex === cur.hex || !((cooldown?.get(x.hex) ?? 0) > now))!;
 
   if (mode === "sticky") return { hex: cur.hex, candidates };
 

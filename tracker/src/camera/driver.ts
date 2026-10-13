@@ -61,6 +61,15 @@ export interface CameraDriver {
   focusManual?(): void;
   /** Timed focus drive by about deltaUnits (+ = nearer) (optional). */
   focusNudge?(deltaUnits: number): void;
+  /**
+   * Zoom AND focus in one command (VISCA Zoom-Focus Direct, 81 01 04 47
+   * zzzz ffff). Focus Direct alone is ignored by the TONGVEO, but this form
+   * lands both exactly in ~2-3 s and the lens holds there (probed
+   * 2026-10-12: 1437/−3874 and 1384/−1949). Optional.
+   */
+  setZoomFocus?(zoomUnits: number, focusUnits: number): void;
+  /** Move focus to an absolute position at the current zoom (via Zoom-Focus Direct). */
+  setFocusDirect?(focusUnits: number): void;
 
   /** Stop all motion. */
   stopMotion(): void;

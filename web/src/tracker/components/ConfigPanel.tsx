@@ -114,6 +114,10 @@ export function ConfigPanel({
           onCommit={(v) => conn.send({ type: "patchTracker", patch: { zoom: { sigmaDeg: v } } })} />
         <Num label="manual hfov°" value={config.zoom.manualHfovDeg} step={1}
           onCommit={(v) => conn.send({ type: "patchTracker", patch: { zoom: { manualHfovDeg: v } } })} />
+        <Num label="min hfov° (0 = full tele)" value={config.zoom.minHfovDeg ?? 0} step={0.1}
+          onCommit={(v) => conn.send({ type: "patchTracker", patch: { zoom: { minHfovDeg: v } } })} />
+        <Num label="fill frac" value={config.zoom.fillFrac} step={0.02}
+          onCommit={(v) => conn.send({ type: "patchTracker", patch: { zoom: { fillFrac: v } } })} />
       </div>
 
       <div className="cfg-group">
@@ -166,6 +170,25 @@ export function ConfigPanel({
           onCommit={(v) => conn.send({ type: "patchTracker", patch: { mount: { panOffsetDeg: v } } })} />
         <Num label="tilt0°" value={config.mount.tiltOffsetDeg} step={0.1}
           onCommit={(v) => conn.send({ type: "patchTracker", patch: { mount: { tiltOffsetDeg: v } } })} />
+        <Num label="lean°" value={config.mount.levelTiltDeg} step={0.1}
+          onCommit={(v) => conn.send({ type: "patchTracker", patch: { mount: { levelTiltDeg: v } } })} />
+        <Num label="lean dir°" value={config.mount.levelDirDeg} step={1}
+          onCommit={(v) => conn.send({ type: "patchTracker", patch: { mount: { levelDirDeg: v } } })} />
+      </div>
+
+      <div className="cfg-group">
+        <div className="cfg-title">picture leveling (tilted base)</div>
+        <label className="cfg-num">
+          <span>level TV/stream</span>
+          <input type="checkbox" checked={config.leveling.enabled}
+            onChange={(e) => conn.send({ type: "patchTracker", patch: { leveling: { enabled: e.target.checked } } })} />
+        </label>
+        <Num label="full below el°" value={config.leveling.fullBelowElDeg} step={1}
+          onCommit={(v) => conn.send({ type: "patchTracker", patch: { leveling: { fullBelowElDeg: v } } })} />
+        <Num label="off above el°" value={config.leveling.offAboveElDeg} step={1}
+          onCommit={(v) => conn.send({ type: "patchTracker", patch: { leveling: { offAboveElDeg: v } } })} />
+        <Num label="max roll°" value={config.leveling.maxRollDeg} step={1}
+          onCommit={(v) => conn.send({ type: "patchTracker", patch: { leveling: { maxRollDeg: v } } })} />
       </div>
     </div>
   );

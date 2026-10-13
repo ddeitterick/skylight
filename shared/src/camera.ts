@@ -133,6 +133,8 @@ export interface CameraDiagnostics {
   lastRxHex?: string;
   /** ms since the camera last answered a position inquiry. */
   lastInquiryAgoMs?: number;
+  /** The lens has ignored zoom commands this long, s (visca; absent = fine). */
+  lensStuckSec?: number;
 }
 
 /** A reference the user centered the camera on during calibration. */

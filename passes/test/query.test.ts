@@ -337,3 +337,25 @@ describe("geometry filters and sorts (schema 1.2)", () => {
     for (const c of ["heading_ca", "aspect", "turn_deg", "turn_dir", "departure"]) expect(PASS_ROW_COLUMNS).toContain(c);
   });
 });
+
+describe("stab filters (schema 1.3)", () => {
+  it("parses hasStab and stab, and builds the clauses", () => {
+    const { filters, errors } = parseFilters(params("hasStab=1&stab=OK"));
+    expect(errors).toEqual([]);
+    expect(filters).toEqual({ hasStab: 1, stab: "ok" });
+    const w = buildWhere(filters);
+    expect(w.sql).toBe("WHERE has_stab = ? AND stab_status = ?");
+    expect(w.params).toEqual([1, "ok"]);
+    const none = buildWhere(parseFilters(params("hasClip=1&stab=none")).filters);
+    expect(none.sql).toBe("WHERE has_clip = ? AND stab_status IS NULL");
+    expect(none.params).toEqual([1]);
+  });
+
+  it("rejects an unknown stab status", () => {
+    expect(parseFilters(params("stab=maybe")).errors).toEqual(["stab must be none, ok, skipped or failed"]);
+  });
+
+  it("returns the stab columns in every PassRow", () => {
+    for (const c of ["has_stab", "stab_status", "stab_wobble_before", "stab_wobble_after"]) expect(PASS_ROW_COLUMNS).toContain(c);
+  });
+});

@@ -16,7 +16,8 @@ export const PASS_ROW_COLUMNS = [
   "hfov_min", "sec_to_hfov_min", "tele_sec", "tele_az_sd", "tele_el_sd", "pan_reversals", "pan_hop", "tilt_hop",
   "pose_err_med", "corr_max", "zoom_changes", "build_version", "build_label", "clip_bytes",
   "quality", "flagged", "flags", "best_frame_sec",
-  "heading_ca", "aspect", "turn_deg", "turn_dir", "departure", "alt_ca", "has_clip", "created_at",
+  "heading_ca", "aspect", "turn_deg", "turn_dir", "departure", "alt_ca", "has_clip",
+  "has_stab", "stab_status", "stab_wobble_before", "stab_wobble_after", "created_at",
 ] as const;
 export type PassRowColumn = (typeof PASS_ROW_COLUMNS)[number];
 
@@ -62,7 +63,12 @@ export interface Filters {
   departure?: 0 | 1;    // origin is the home airport
   minAlt?: number;      // alt_ca >= (ft at closest approach; passes without altitude never match)
   maxAlt?: number;      // alt_ca <=
+  hasStab?: 0 | 1;      // schema 1.3: a stabilized clip is offered
+  stab?: StabStatus | "none"; // stab_status; none = not processed yet
 }
+
+export const STAB_STATUSES = ["ok", "skipped", "failed"] as const;
+export type StabStatus = (typeof STAB_STATUSES)[number];
 
 export interface Query { sql: string; params: unknown[] }
 /** Keyset cursor: the sort value and id of the last row served, for the sort it was issued under. */
@@ -146,6 +152,12 @@ export function parseFilters(p: URLSearchParams): { filters: Filters; errors: st
   set("departure", flag("departure"));
   set("minAlt", num("minAlt"));
   set("maxAlt", num("maxAlt"));
+  set("hasStab", flag("hasStab"));
+  const st = p.get("stab")?.trim().toLowerCase();
+  if (st) {
+    if (st === "none" || (STAB_STATUSES as readonly string[]).includes(st)) f.stab = st as Filters["stab"];
+    else errors.push("stab must be none, ok, skipped or failed");
+  }
   return { filters: f, errors };
 }
 
@@ -191,6 +203,9 @@ function filterClauses(f: Filters): { parts: string[]; params: unknown[] } {
   if (f.departure !== undefined) add("departure = ?", f.departure);
   if (f.minAlt !== undefined) add("alt_ca >= ?", f.minAlt);
   if (f.maxAlt !== undefined) add("alt_ca <= ?", f.maxAlt);
+  if (f.hasStab !== undefined) add("has_stab = ?", f.hasStab);
+  if (f.stab === "none") add("stab_status IS NULL");
+  else if (f.stab !== undefined) add("stab_status = ?", f.stab);
   return { parts, params };
 }
 

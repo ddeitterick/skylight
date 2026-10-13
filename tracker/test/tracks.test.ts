@@ -189,4 +189,25 @@ describe("TrackTable", () => {
     expect(v.elRateDps).toBeCloseTo(PLANE_RATE.el, 0);
     expect(v.residDeg).toBeLessThan(0.15);
   });
+
+  it("a big bird passing through a small plane's lock doesn't feed it", () => {
+    // 2026-10-12 bird pass: a 176-px gull flew through a ~5-px Falcon's
+    // position and was associated to the lock by distance alone.
+    const table = new TrackTable();
+    for (let i = 0; i < 12; i++) {
+      const t = T0 + i * TICK;
+      const p = planeAt(t);
+      table.update([obs(t, p.az, p.el, 8)], t, 2.5);
+      table.select(predAt(t), t);
+    }
+    const locked = table.lockedTrack()!;
+    expect(locked).toBeTruthy();
+    const t = T0 + 12 * TICK;
+    const p = planeAt(t);
+    // The gull is closer to the track's prediction than anything else and
+    // the plane itself is hidden this frame.
+    table.update([{ ...obs(t, p.az + 0.05, p.el, 40), areaPx: 176 }], t, 2.5);
+    expect(table.lockedTrack()!.latest().areaPx).toBe(6);
+  });
 });
+

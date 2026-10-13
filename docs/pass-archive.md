@@ -9,6 +9,7 @@ this contract; change it here first.
 | Recorder + uploader | `tracker/src/passes/` (runs on the Pi inside skylight-tracker) | tracker |
 | Archive API | `passes/` (Cloudflare Worker: R2 + D1), https://passes.skylightceiling.com | worker |
 | Site section | `skylight-site/app/passes/` (Next.js 16, Vercel) | site |
+| Stabilizer | `stabilizer/` (Python, dev box, systemd --user `skylight-stabilizer`) | stabilizer |
 
 ## Identity and blobs
 
@@ -18,6 +19,9 @@ this contract; change it here first.
   - `clip.mp4` — native camera H.264 (1920×1080, ~30 fps, `-c copy`, faststart). No audio.
   - `poster.jpg` — one frame from the clip (≤1280 px wide, q≈80).
   - `series.json` — 10 Hz telemetry (format below).
+  - `clip.stab.mp4` — stabilized copy of the clip (schema 1.3, written by the dev-box stabilizer;
+    H.264 1920×1080, same frames and timestamps as `clip.mp4`, faststart). Only when it measured better.
+  - `stab.json` — the stabilizer's per-frame shifts and metrics (schema 1.3; also for skipped passes).
 - Public URLs: `https://passes.skylightceiling.com/media/<id>/<name>` (GET, Range supported,
   immutable caching, CORS `*`).
 
@@ -78,7 +82,8 @@ Sent by the Pi as `POST /ingest/<id>`; stored verbatim in D1 `meta`; returned by
   "media": {
     "clip": "clip.mp4", "poster": "poster.jpg", "series": "series.json",
     "clipBytes": 34211776, "clipDurationSec": 44.2,
-    "clipOffsetSec": -0.8               // clip time 0 relative to startedAt (negative = clip starts earlier)
+    "clipOffsetSec": -0.8,              // clip time 0 relative to startedAt (negative = clip starts earlier)
+    "stab": null                        // schema 1.3: stabilized clip summary, see "Stabilized clips"; absent/null = not processed yet
   },
   "quality": {                         // schema 1.1 (optional; null when not scored yet)
     "score": 78,                       // 0-100 overall "worth watching" score (see Quality section)
@@ -131,9 +136,11 @@ Event kinds: `target lock lost zoom zenith wrap focus release`.
 ## Worker API (https://passes.skylightceiling.com)
 
 Ingest (Authorization: `Bearer <INGEST_KEY>`):
-- `PUT /ingest/<id>/<name>` raw body, `content-type` set by the client; name ∈ `clip.mp4 poster.jpg series.json`. Overwrites. → `{ ok, bytes }`
+- `PUT /ingest/<id>/<name>` raw body, `content-type` set by the client; name ∈ `clip.mp4 poster.jpg series.json clip.stab.mp4 stab.json`. Overwrites. → `{ ok, bytes }`
 - `POST /ingest/<id>` body = pass.json → upsert D1 row (columns below) + `meta`. `has_clip` is
-  set from an R2 HEAD of `clip.mp4`. → `{ ok }`. Idempotent: the Pi may re-POST.
+  set from an R2 HEAD of `clip.mp4`, `has_stab` from `media.stab.status` + an R2 HEAD of
+  `clip.stab.mp4`. → `{ ok }`. Idempotent: the Pi may re-POST. A pass.json whose
+  `media.stab` is absent or null keeps the stored one (the Pi does not know about stabilization).
 - `DELETE /api/passes/<id>` → removes row and blobs.
 
 Public (GET, CORS for https://skylightceiling.com, http://localhost:3000 and `*` for /media):
@@ -145,7 +152,8 @@ Public (GET, CORS for https://skylightceiling.com, http://localhost:3000 and `*`
   least this tight), `minDur`, `maxDur`, `zenith` (0|1), `wrap` (0|1), `build` (build_version
   or build_label exact), `hasClip` (0|1).
   `minQuality`, `flagged` (schema 1.1), `minAspect`, `maxAspect`, `minTurn`, `maxTurn`,
-  `turnDir` (left|right), `departure` (0|1) (schema 1.2), `minAlt`, `maxAlt` (ft at closest approach).
+  `turnDir` (left|right), `departure` (0|1) (schema 1.2), `minAlt`, `maxAlt` (ft at closest approach),
+  `hasStab` (0|1), `stab` (none|ok|skipped|failed) (schema 1.3).
   Sortable: `started_at duration_sec max_el hfov_min lock_pct center_med_az center_med_el pose_err_med tele_az_sd tele_el_sd quality aspect turn_deg alt_ca`.
 - `GET /api/passes/<id>` → `PassRow & { meta: PassJson }`.
 - `GET /api/facets` → `{ count, dateMin, dateMax, airlines:[{v,n}], types:[{v,n,name}], origins:[{v,n,name}], dests:[{v,n,name}], builds:[{v,label,n}] }`.
@@ -153,7 +161,7 @@ Public (GET, CORS for https://skylightceiling.com, http://localhost:3000 and `*`
 - `GET /health` → `{ ok, passes }`.
 
 `PassRow` (D1 columns, snake_case; the API returns them as-is):
-`id started_at ended_at duration_sec hex flight registration type_code type_name airline origin origin_name destination dest_name max_el min_slant_m az_start az_end zenith wrap lock_pct first_lock_sec center_med_az center_med_el center_p90_az center_p90_el hfov_min sec_to_hfov_min tele_sec tele_az_sd tele_el_sd pan_reversals pan_hop tilt_hop pose_err_med corr_max zoom_changes build_version build_label clip_bytes quality flagged flags best_frame_sec heading_ca aspect turn_deg turn_dir departure alt_ca has_clip created_at`
+`id started_at ended_at duration_sec hex flight registration type_code type_name airline origin origin_name destination dest_name max_el min_slant_m az_start az_end zenith wrap lock_pct first_lock_sec center_med_az center_med_el center_p90_az center_p90_el hfov_min sec_to_hfov_min tele_sec tele_az_sd tele_el_sd pan_reversals pan_hop tilt_hop pose_err_med corr_max zoom_changes build_version build_label clip_bytes quality flagged flags best_frame_sec heading_ca aspect turn_deg turn_dir departure alt_ca has_clip has_stab stab_status stab_wobble_before stab_wobble_after created_at`
 (`started_at/ended_at/created_at` ISO-8601 UTC strings; booleans as 0/1.)
 
 ## Secrets and environment
@@ -299,3 +307,71 @@ values only): 365 of 422 rows had an altitude.
 
 Site: sort "Highest" = `sort=alt_ca&dir=desc`; preset "High altitude" =
 `minAlt=8000&sort=alt_ca&dir=desc`; list cards show the altitude.
+
+## Stabilized clips (schema 1.3)
+
+At full zoom the camera can only move in coarse gears and 0.33° tilt detents, so the plane
+hops around the frame. A dev-box job (`stabilizer/`, not the Pi) re-renders each archived clip
+with the hops taken out and stores it next to the raw one; the site plays the stabilized clip
+by default with a toggle to the original. The raw `clip.mp4` is never changed.
+
+How (method `s1`, `stabilizer/skylight_stab/`): find the plane in every video frame
+(brightness residual against a smooth sky + sub-pixel phase correlation of the plane patch),
+smooth its path with a centred Gaussian (σ 1.2 s, ±3 s look-ahead, offline), and shift each
+frame so the plane follows the smooth path. Only frames at HFOV ≤ 12° (series.json `hfov`),
+outside > 2× zoom jumps, with no skyline/wires at the frame edge and a plane found (gaps ≤ 1.5 s
+bridged) are shifted; stretches shorter than 2 s stay raw and every stretch fades in/out over
+0.75 s. Shifts are soft-clamped to 18% of the frame. Exposed edges: divide out the lens
+vignette (a radial model fitted to the clip's own sky), shift, fill the edge with a blurred
+copy of the border, re-apply the vignette. Corrections are keyed to frames by PTS and the
+output keeps the source PTS, so series.json lines up with both clips (`t − clipOffsetSec`).
+
+Quality guard: the plane is re-tracked in the rendered clip. The pass gets `status: "ok"` only
+if the wobble on the stabilized frames fell by ≥ 15% and frame-to-frame shake did not rise;
+otherwise `skipped` (no `clip.stab.mp4` is offered, raw stays the default).
+
+`pass.json media.stab`:
+
+```jsonc
+"stab": {
+  "status": "ok",                    // ok = clip.stab.mp4 is better (site default) | skipped | failed
+  "reason": null,                    // skipped/failed: no-zoom | no-plane | short-coverage | not-better | not-measurable | frame-mismatch | error
+  "clip": "clip.stab.mp4",           // null unless ok
+  "clipBytes": 15438771,
+  "track": "stab.json",
+  "method": "s1",
+  "lookaheadSec": 3.0,
+  "coverage": 0.31,                  // fraction of the clip's frames stabilized (weight > 0.5)
+  "coverageSec": 33.5,
+  "wobbleBefore": 4.79,              // plane wobble RMS on those frames, % of frame width: raw clip
+  "wobbleAfter": 1.00,               //   … re-measured in clip.stab.mp4
+  "shakeBefore": 0.18, "shakeAfter": 0.06,   // frame-to-frame jitter, % of width
+  "hopBefore": 9.9, "hopAfter": 2.1,         // 90th pct plane movement in 1 s, % of width
+  "maxShiftFrac": 0.12,              // largest shift, fraction of width/height
+  "at": 1791837771906                // ms epoch processed
+}
+```
+
+`stab.json` (R2, also for skipped passes): `{ schema: 1, method, summary (= media.stab),
+params, guard, vignette, stats, width, height, fps, timeBase, t[], pts[], dx[], dy[], w[], px[],
+py[] }` — one entry per decoded frame: `t` clip seconds from the source PTS, `dx/dy` the
+picture shift as a fraction of width/height (+ = right/down; the plane at p appears at p + d),
+`w` the stabilization weight 0..1, `px/py` the plane found in the raw clip (null = not found).
+A player could apply `dx/dy` to the raw clip itself instead of downloading the copy.
+
+Worker: names `clip.stab.mp4` (video/mp4) and `stab.json` (application/json) allowed on
+`PUT /ingest`, served from `/media` with `cache-control: public, max-age=3600,
+stale-while-revalidate=86400` (re-rendered when the method changes; raw clips stay immutable)
+and the same `x-license`. D1 columns `has_stab INTEGER NOT NULL DEFAULT 0` (1 = status ok and
+R2 has the clip), `stab_status TEXT` (NULL = not processed), `stab_wobble_before REAL`,
+`stab_wobble_after REAL`; filters `hasStab=0|1`, `stab=none|ok|skipped|failed`. `PassRow`
+gains the four columns (after `has_clip`). Migrated with `ALTER TABLE passes ADD COLUMN …`.
+
+Site: `/passes/<id>` plays `clip.stab.mp4` when `has_stab` = 1 with a visible
+"Stabilized / Original" toggle; downloads offer both. The licence is unchanged and covers the
+stabilized clip (it is a rendering of the same recording).
+
+Stabilizer job (`stabilizer/README.md`): polls `GET /api/passes?hasClip=1&stab=none`
+(newest first), downloads `clip.mp4` + `series.json`, writes `clip.stab.mp4` + `stab.json`,
+uploads them (`PUT /ingest`), then re-POSTs the pass.json from `GET /api/passes/<id>` with
+`media.stab` set. Idempotent and resumable; after 3 failures a pass is marked `failed`.

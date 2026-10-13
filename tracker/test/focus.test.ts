@@ -151,3 +151,19 @@ describe("FocusController interpolation", () => {
     expect(f.learned(1500)).toBeNull(); // no neighbour above within 60
   });
 });
+
+describe("FocusController never drives a sharp plane away", () => {
+  it("holds a sharp close plane off a weak table point (DAL8926 at zoom 718)", () => {
+    const f = new FocusController(null, false);
+    // a 4-sample near-band point at 720: −170
+    run(f, { ...base, zoomUnits: 720, slantM: 1500, edgePx: 2.2, focusUnits: -170 }, 0, 1000);
+    expect(f.learned(720, 0)).toBe(-170);
+    // the 757 at 720 m arrives razor-sharp at −490 (the lens's own tracking)
+    const sharp = { ...base, zoomUnits: 718, commandedZoom: 718, slantM: 720, targetPx: 400, detected: true, edgePx: 1.5, focusUnits: -490 };
+    const acts = run(f, sharp, 5000, 8000);
+    expect(acts.filter((a) => a.kind === "nudge" || a.kind === "onePush")).toEqual([]);
+    // once it goes soft the servo corrects again
+    const soft = run(f, { ...sharp, edgePx: 6 }, 9000, 11000);
+    expect(soft.some((a) => a.kind === "nudge")).toBe(true);
+  });
+});

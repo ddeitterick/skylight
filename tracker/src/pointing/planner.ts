@@ -13,11 +13,12 @@ import {
   aircraftGeoPoint,
   azElFromSite,
   fixAgeSec as fixAge,
+  mountFrameFromWorld,
   mountFromWorld,
   norm180,
+  worldFromMountFrame,
   predictGeo,
   type Aircraft,
-  type AzEl,
   type GeoPoint,
   type MountModel,
 } from "@shared/index.js";
@@ -30,11 +31,13 @@ export const ZENITH_PASS_EL = 82;
  * (observed: a 140° swing in 4 s that overshot into the ±175° stop) — that
  * is a whip-pan, not tracking. Park on the exit side and let it fly through.
  */
-export const ZENITH_PAN_RATE_DPS = 40;
-// (22 parked too eagerly: for a pass peaking at 72-75° the predicted exit
-// azimuth was 40-60° off — the el-70 crossing sits where the azimuth changes
-// fastest — so the head waited in the wrong place and lost the plane for
-// 7 s. Up to ~40°/s the loop can sweep through continuously.)
+export const ZENITH_PAN_RATE_DPS = 25;
+// (22 once parked too eagerly: a pass peaking at 72-75° parked on the el-70
+// exit azimuth, 40-60° off the plane — the exit line sits where the azimuth
+// changes fastest. A pass peaking below the hold elevation now parks AT its
+// closest-approach point instead, so the threshold could come back down:
+// at 40 the loop chased UAL875 (36°/s, 2026-10-12, 390 m slant) and fell
+// 15-19° behind through the crossing, then overshot 30°.)
 /** While the target is above this elevation we are "in the crossing". */
 export const ZENITH_REGIME_EL = 72;
 /**
@@ -74,6 +77,12 @@ export interface PassPlan {
   tCaSec: number;
   /** Azimuth where the target exits the high-elevation cone. */
   outboundAzDeg: number;
+  /**
+   * World direction to park on for the fly-through: the exit azimuth at
+   * ZENITH_HOLD_TILT, both in the HEAD frame (the singularity is the mount's
+   * pole — on the tilted base that is not the zenith).
+   */
+  holdAzEl: { azDeg: number; elDeg: number };
   /** Azimuth of closest approach (for the UI). */
   caAzDeg: number;
   /**
@@ -124,7 +133,7 @@ export function planPass(
   let caAz = 0;
   let azRateMax = 0;
   let outboundAz: number | null = null;
-  let prev: AzEl | null = null;
+  let prev: { azDeg: number; elDeg: number } | null = null;
   // Dead-zone crossing: first step whose pan is out of the reachable range,
   // and the first in-range step after it (the exit, whichever side). A
   // graze that comes back out on the same side yields that side's stop as
@@ -135,10 +144,14 @@ export function planPass(
   let wrapOut: number | null = null;
   let wrapExitPan: number | null = null;
 
+  // Zenith statistics in the head frame (identity when level / no mount).
+  type Dir = { azDeg: number; elDeg: number };
+  const head = (w: Dir): Dir => (wrap ? mountFrameFromWorld(w.azDeg, w.elDeg, wrap.mount) : w);
   for (let t = 0; t <= horizonSec; t += stepSec) {
-    const p = azElFromSite(site, predictGeo(kin, fixAgeSec + t));
-    if (wrap && wrapOut === null && p.elDeg > 0) {
-      const pan = mountFromWorld(p.azDeg, p.elDeg, wrap.mount).panDeg;
+    const pw = azElFromSite(site, predictGeo(kin, fixAgeSec + t));
+    const p = head(pw);
+    if (wrap && wrapOut === null && pw.elDeg > 0) {
+      const pan = mountFromWorld(pw.azDeg, pw.elDeg, wrap.mount).panDeg;
       const inRange = pan >= wrap.panMinDeg && pan <= wrap.panMaxDeg;
       if (wrapIn === null) {
         if (!inRange) wrapIn = t;
@@ -165,7 +178,7 @@ export function planPass(
     ) {
       const f = (prev.elDeg - ZENITH_EXIT_EL) / Math.max(1e-6, prev.elDeg - p.elDeg);
       const tx = t - stepSec + f * stepSec;
-      outboundAz = azElFromSite(site, predictGeo(kin, fixAgeSec + tx)).azDeg;
+      outboundAz = head(azElFromSite(site, predictGeo(kin, fixAgeSec + tx))).azDeg;
     }
     prev = p;
   }
@@ -176,6 +189,17 @@ export function planPass(
     elMaxDeg: elMax,
     tCaSec: tCa,
     outboundAzDeg: outboundAz ?? caAz,
+    // ZENITH_HOLD_TILT is a MECHANICAL tilt (the auto-flip guard): on the
+    // wedge the tilt zero sits ~10° below the mount horizon, so a head-frame
+    // 84° would ask for an unreachable ~95° tilt.
+    holdAzEl: (() => {
+      // Through the pole (peak above the hold elevation): wait just under
+      // vertical on the exit side. A fast pass that peaks LOWER: wait on the
+      // closest-approach point itself — it flies through the frame centre.
+      const holdEl = wrap ? ZENITH_HOLD_TILT * wrap.mount.tiltGain + wrap.mount.tiltOffsetDeg : ZENITH_HOLD_TILT;
+      const [az, el] = elMax >= holdEl ? [outboundAz ?? caAz, holdEl] : [caAz, elMax];
+      return wrap ? worldFromMountFrame(az, el, wrap.mount) : { azDeg: az, elDeg: el };
+    })(),
     caAzDeg: caAz,
     wrapInSec: wrapOut !== null ? wrapIn : null,
     wrapOutSec: wrapOut,
@@ -206,6 +230,7 @@ export interface ZenithHold {
  */
 export function zenithHold(
   plan: PassPlan | null,
+  /** Target's elevation in the HEAD frame (see PassPlan.holdAzEl). */
   currentElDeg: number,
   /**
    * The pass WAS classified as a zenith pass on the way in. Needed because
@@ -226,8 +251,8 @@ export function zenithHold(
   const inbound = plan.tCaSec > 0;
   if (inbound) {
     if (!plan.zenithPass || plan.tCaSec > ZENITH_PRE_SEC) return null;
-    return { azDeg: plan.outboundAzDeg, elDeg: ZENITH_HOLD_TILT, phase: "park" };
+    return { ...plan.holdAzEl, phase: "park" };
   }
   if (currentElDeg < ZENITH_REGIME_EL) return null;
-  return { azDeg: plan.outboundAzDeg, elDeg: ZENITH_HOLD_TILT, phase: "follow" };
+  return { ...plan.holdAzEl, phase: "follow" };
 }

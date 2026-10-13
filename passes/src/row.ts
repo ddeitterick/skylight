@@ -9,8 +9,8 @@ import { ID_RE, PASS_ROW_COLUMNS, type PassRowColumn, type Query } from "./query
 
 type Obj = Record<string, unknown>;
 export type ColumnValue = string | number | null;
-/** Columns derived from pass.json; the handler adds has_clip, created_at and meta. */
-export type DerivedColumn = Exclude<PassRowColumn, "has_clip" | "created_at">;
+/** Columns derived from pass.json; the handler adds has_clip, has_stab (R2 HEADs), created_at and meta. */
+export type DerivedColumn = Exclude<PassRowColumn, "has_clip" | "has_stab" | "created_at">;
 export type DerivedRow = Record<DerivedColumn, ColumnValue>;
 
 const obj = (v: unknown): Obj => (v && typeof v === "object" && !Array.isArray(v) ? (v as Obj) : {});
@@ -87,6 +87,7 @@ export function passToRow(meta: unknown): { ok: true; row: DerivedRow } | { ok: 
       ...q,
       ...g,
       alt_ca: num(p.altFtAtCa),
+      ...stabColumns(md.stab),
     },
   };
 }
@@ -126,6 +127,37 @@ export function geometryColumns(v: unknown): Pick<DerivedRow, "heading_ca" | "as
     turn_dir: p.turnDir === "left" || p.turnDir === "right" ? p.turnDir : null,
     departure: flag(p.departure),
   };
+}
+
+/**
+ * pass.json `media.stab` (schema 1.3) → stab_status / stab_wobble_before / stab_wobble_after.
+ * Absent or null = not processed: all NULL. has_stab is decided by the handler (status ok AND
+ * an R2 HEAD of clip.stab.mp4), see stabOffered().
+ */
+export function stabColumns(v: unknown): Pick<DerivedRow, "stab_status" | "stab_wobble_before" | "stab_wobble_after"> {
+  const s = obj(v);
+  const status = s.status === "ok" || s.status === "skipped" || s.status === "failed" ? s.status : null;
+  if (status === null) return { stab_status: null, stab_wobble_before: null, stab_wobble_after: null };
+  return { stab_status: status, stab_wobble_before: num(s.wobbleBefore), stab_wobble_after: num(s.wobbleAfter) };
+}
+
+/** True when pass.json says a stabilized clip is offered (the handler also checks R2 has it). */
+export function stabOffered(meta: unknown): boolean {
+  const s = obj(obj(obj(meta).media).stab);
+  return s.status === "ok" && s.clip === "clip.stab.mp4";
+}
+
+/**
+ * The Pi does not know about stabilization: when it re-POSTs a pass.json whose media.stab is
+ * absent or null, keep the stored one. Returns the document to store (unchanged when there is
+ * nothing to carry over).
+ */
+export function carryStab(incoming: Obj, stored: unknown): { meta: Obj; carried: boolean } {
+  const md = obj(incoming.media);
+  if (md.stab !== undefined && md.stab !== null) return { meta: incoming, carried: false };
+  const prev = obj(stored);
+  if (!Object.keys(prev).length) return { meta: incoming, carried: false };
+  return { meta: { ...incoming, media: { ...md, stab: prev } }, carried: true };
 }
 
 export const INSERT_COLUMNS = [...PASS_ROW_COLUMNS, "meta"] as const;

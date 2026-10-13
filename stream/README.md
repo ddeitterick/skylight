@@ -55,6 +55,7 @@ The Pi can encode 720×1280@30 (the default) alongside the tracker. For
 | Show origin/destination | `PAGE_URL=...?route=1` — hidden by default (the route data is too unreliable to broadcast). |
 | Resolution / bitrate | `RES=1080x1920 VBITRATE=4500k` in `.env`. |
 | Encoder | auto: Pi 4 hardware (`h264_v4l2m2m`) when present, else `libx264 superfast`. |
+| Live stabilization (TV page) | `PAGE_URL=http://ceiling.local:3000/tv.html?route=0&stab=1` plus `CHROME_FLAGS="--use-angle=vulkan --enable-features=Vulkan --ignore-gpu-blocklist"` — WebGL on a real GPU (not the Pi). The picture runs `tracker.liveStab.delayMs` (1.5 s) late and the overlays replay in step; `tracker.liveStab.enabled=false` turns it off live. |
 
 ## Privacy floor (don't film below the sky)
 

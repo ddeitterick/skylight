@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { buildUpsert, geometryColumns, INSERT_COLUMNS, passToRow, qualityColumns } from "../src/row";
+import { buildUpsert, carryStab, geometryColumns, INSERT_COLUMNS, passToRow, qualityColumns, stabColumns, stabOffered } from "../src/row";
 import { PASS_ROW_COLUMNS } from "../src/query";
 
 const example = () => JSON.parse(readFileSync(resolve(__dirname, "fixtures/pass.example.json"), "utf8"));
@@ -63,8 +63,8 @@ describe("passToRow", () => {
       departure: 0,
       alt_ca: 11175,
     });
-    // Every derived column is present (has_clip / created_at are added at ingest).
-    const expected = PASS_ROW_COLUMNS.filter((c) => c !== "has_clip" && c !== "created_at");
+    // Every derived column is present (has_clip / has_stab / created_at are added at ingest).
+    const expected = PASS_ROW_COLUMNS.filter((c) => c !== "has_clip" && c !== "has_stab" && c !== "created_at");
     expect(Object.keys(r.row).sort()).toEqual([...expected].sort());
   });
 
@@ -127,7 +127,7 @@ describe("buildUpsert", () => {
   it("inserts every column and updates all but id and created_at on conflict", () => {
     const r = passToRow(example());
     if (!r.ok) throw new Error(r.error);
-    const q = buildUpsert({ ...r.row, has_clip: 1, created_at: "2026-10-11T00:00:00.000Z", meta: "{}" });
+    const q = buildUpsert({ ...r.row, has_clip: 1, has_stab: 0, created_at: "2026-10-11T00:00:00.000Z", meta: "{}" });
     expect(INSERT_COLUMNS).toEqual([...PASS_ROW_COLUMNS, "meta"]);
     expect(q.sql.startsWith(`INSERT INTO passes (${INSERT_COLUMNS.join(", ")}) VALUES (`)).toBe(true);
     expect((q.sql.match(/\?/g) ?? []).length).toBe(INSERT_COLUMNS.length);
@@ -139,5 +139,33 @@ describe("buildUpsert", () => {
     expect(q.sql).toContain("meta = excluded.meta");
     expect(q.sql).not.toContain("id = excluded.id");
     expect(q.sql).not.toContain("created_at = excluded.created_at");
+  });
+
+  it("maps media.stab (schema 1.3) and leaves unprocessed passes NULL", () => {
+    const p = example();
+    p.media = { ...p.media, stab: { status: "ok", clip: "clip.stab.mp4", wobbleBefore: 4.79, wobbleAfter: 1.0 } };
+    const r = passToRow(p);
+    expect(r.ok && r.row).toMatchObject({ stab_status: "ok", stab_wobble_before: 4.79, stab_wobble_after: 1.0 });
+    expect(stabOffered(p)).toBe(true);
+    expect(stabColumns(null)).toEqual({ stab_status: null, stab_wobble_before: null, stab_wobble_after: null });
+    expect(stabColumns({ status: "weird", wobbleBefore: 3 })).toEqual({ stab_status: null, stab_wobble_before: null, stab_wobble_after: null });
+    expect(stabColumns({ status: "skipped", reason: "no-zoom" })).toEqual({ stab_status: "skipped", stab_wobble_before: null, stab_wobble_after: null });
+    expect(stabOffered({ media: { stab: { status: "skipped", clip: null } } })).toBe(false);
+    expect(stabOffered({ media: { stab: { status: "ok", clip: "../x.mp4" } } })).toBe(false);
+  });
+
+  it("keeps the stored media.stab when a re-POST has none (the Pi does not know about it)", () => {
+    const stored = { status: "ok", clip: "clip.stab.mp4" };
+    const p = example();
+    const a = carryStab(p, stored);
+    expect(a.carried).toBe(true);
+    expect((a.meta.media as { stab: unknown }).stab).toEqual(stored);
+    expect((a.meta.media as { clip: string }).clip).toBe("clip.mp4");
+    expect(carryStab({ ...p, media: { ...p.media, stab: null } }, stored).carried).toBe(true);
+    const fresh = { status: "skipped" };
+    const b = carryStab({ ...p, media: { ...p.media, stab: fresh } }, stored);
+    expect(b.carried).toBe(false);
+    expect((b.meta.media as { stab: unknown }).stab).toEqual(fresh);
+    expect(carryStab(p, null).carried).toBe(false);
   });
 });
