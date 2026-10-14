@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 
+from . import METHOD
 from . import archive as A
 
 WORK = os.environ.get("STAB_WORK_DIR", os.path.expanduser("~/.cache/skylight-stabilizer"))
@@ -137,7 +138,7 @@ def run(*, jobs: int = 4, threads: int = 4, once: bool = False, limit: int = 0, 
                 _log(pid, f"failed (exit {rc}, attempt {n})")
                 if n >= MAX_FAILURES:
                     try:
-                        mark(pid, {"status": "failed", "reason": "error", "clip": None, "method": "s1",
+                        mark(pid, {"status": "failed", "reason": "error", "clip": None, "method": METHOD,
                                    "at": int(time.time() * 1000)})
                         _log(pid, "marked failed")
                     except Exception as e:

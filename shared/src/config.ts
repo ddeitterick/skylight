@@ -175,6 +175,13 @@ export interface TrackerConfig {
      * steadier, sharper-looking shot.
      */
     minHfovDeg: number;
+    /**
+     * minHfovDeg applies only while the plane moves across the sky faster
+     * than this, deg/s (0 = always). Wobble is worst on fast planes; a slow,
+     * distant plane can use the full tele (3.4°) — at 4.1° it was 18%
+     * smaller for no steadiness gain (2026-10-13 quality audit).
+     */
+    minHfovAboveRateDps: number;
     /** HFOV used when auto is off, deg. */
     manualHfovDeg: number;
     /** Measured zoom-units -> HFOV samples (endpoints from the datasheet). */
@@ -282,6 +289,27 @@ export interface TrackerConfig {
     /** Fade in/out time when the plane is found/lost (uses the look-ahead,
      *  so the fade starts before a loss), ms. */
     fadeMs: number;
+    /**
+     * Sky clean-up in the same shader, on every frame (also while not
+     * stabilizing): the camera's H.264 turns the lens vignette into rings one
+     * code apart (strong at dusk). Deband flat sky, divide out the per-zoom
+     * flat-field, add a STATIC dither the Twitch encoder keeps. Research:
+     * https://claude.ai/artifact/5ZxgPf1ZuN5PfVtWucmTWu
+     */
+    deband: {
+      enabled: boolean;
+      /** Deband only where every tap is within this many code values (flat sky). */
+      thresholdLevels: number;
+      /** Outer tap radius, px of the 1080p frame. */
+      radiusPx: number;
+      /** Static dither amplitude, ± code values (0 = none; 2 measured best). */
+      ditherLevels: number;
+      /** Dither cell size, px (2 measured best through x264 superfast). */
+      ditherCellPx: number;
+      /** Share of the lens vignette put back after the flat-field (0 = flat
+       *  sky; 1 = the camera's oval band, as before). */
+      vignetteKeep: number;
+    };
   };
 
   /** Idle "ready position" when auto mode has no target. */
@@ -580,6 +608,7 @@ export const DEFAULT_CONFIG: Config = {
       lockedSigmaDeg: 0.35,
       fillFrac: 0.28,
       minHfovDeg: 0,
+      minHfovAboveRateDps: 0,
       manualHfovDeg: 20,
       // Datasheet endpoints; refined empirically at M4.
       fovLut: [
@@ -620,6 +649,14 @@ export const DEFAULT_CONFIG: Config = {
       fillMinElDeg: 8,
       maxCropZoom: 1.45,
       fadeMs: 1000,
+      deband: {
+        enabled: true,
+        thresholdLevels: 3,
+        radiusPx: 16,
+        ditherLevels: 2,
+        ditherCellPx: 2,
+        vignetteKeep: 0,
+      },
     },
     home: {
       enabled: true,
@@ -664,6 +701,18 @@ function withoutKeys<T extends object>(obj: T, keys: readonly string[]): T {
   return out as T;
 }
 
+/** liveStab with its nested `deband` section (either may be partial / absent). */
+export function mergeLiveStab(
+  base: TrackerConfig["liveStab"],
+  patch: Partial<TrackerConfig["liveStab"]> | undefined,
+): TrackerConfig["liveStab"] {
+  return {
+    ...base,
+    ...(patch ?? {}),
+    deband: { ...base.deband, ...(patch?.deband ?? {}) },
+  };
+}
+
 /** Deep-merge a tracker patch (each nested section may be partial). */
 export function mergeTrackerConfig(
   base: TrackerConfig,
@@ -684,7 +733,7 @@ export function mergeTrackerConfig(
     zoom: { ...base.zoom, ...(patch.zoom ?? {}) },
     vision: withoutKeys({ ...base.vision, ...(patch.vision ?? {}) }, RETIRED_TRACKER_KEYS.vision),
     leveling: { ...base.leveling, ...(patch.leveling ?? {}) },
-    liveStab: { ...base.liveStab, ...(patch.liveStab ?? {}) },
+    liveStab: mergeLiveStab(base.liveStab, patch.liveStab),
     home: { ...base.home, ...(patch.home ?? {}) },
   } as TrackerConfig;
 }

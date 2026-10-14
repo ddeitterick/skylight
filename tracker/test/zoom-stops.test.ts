@@ -30,3 +30,19 @@ describe("zoom stops", () => {
     expect(snapToStop(80, s)).toBe(56.48);
   });
 });
+
+import { chooseZoom } from "../src/pointing/zoom.js";
+
+describe("minHfovDeg only above a rate", () => {
+  const LUT2 = [{ units: 0, hfovDeg: 56.48 }, { units: 1437, hfovDeg: 3.4 }];
+  const base = { ...DEFAULT_CONFIG.tracker, zoom: { ...DEFAULT_CONFIG.tracker.zoom, fovLut: LUT2, minHfovDeg: 4.1, minHfovAboveRateDps: 0.6, lockedSigmaDeg: 0.05, fillFrac: 0.9 } };
+  // A distant airliner (tiny): framing wants the tightest zoom.
+  const ac = { hex: "x", typeCode: "B738", lat: 0, lon: 0 } as never;
+  const far = { azDeg: 0, elDeg: 30, slantM: 12000 } as never;
+  it("slow plane may use the full tele", () => {
+    expect(chooseZoom(ac, far, base, 0.2, 0, 0.05).hfovDeg).toBeLessThan(3.6);
+  });
+  it("fast plane keeps the 4.1° limit", () => {
+    expect(chooseZoom(ac, far, base, 1.5, 0, 0.05).hfovDeg).toBeGreaterThanOrEqual(4.09);
+  });
+});

@@ -246,6 +246,12 @@ describe("scorePass", () => {
     expect(flags({}, frame(), 10, jumpy)).toContain("jumpy");
   });
 
+  it("flags a pass recorded while the lens ignored zoom commands", () => {
+    const pass = { ...basePass(), tracking: { lockPct: 85, hfovMinDeg: 4, lensStuckSec: 42 } } as never;
+    expect(scorePass({ pass, rows: steadyRows(), best: frame(), framesWithPlane: 12 }).flags).toContain("lens-stuck");
+    expect(scorePass({ pass: basePass(), rows: steadyRows(), best: frame(), framesWithPlane: 12 }).flags).not.toContain("lens-stuck");
+  });
+
   it("caps no-plane passes near the bottom and short passes at 40", () => {
     expect(scorePass({ pass: basePass(), rows: steadyRows(), best: frame({ present: false }), framesWithPlane: 0 }).score).toBeLessThanOrEqual(10);
     expect(scorePass({ pass: { ...basePass(), durationSec: 11 }, rows: steadyRows(), best: frame(), framesWithPlane: 9 }).score).toBeLessThanOrEqual(40);

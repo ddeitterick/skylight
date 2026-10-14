@@ -58,6 +58,17 @@ describe("mergeTrackerConfig", () => {
     expect(merged.liveStab.delayMs).toBe(2000);
     expect(merged.liveStab.maxHfovDeg).toBe(DEFAULT_CONFIG.tracker.liveStab.maxHfovDeg);
     expect(merged.liveStab.edge).toBe("auto");
+    expect(merged.liveStab.deband).toEqual(DEFAULT_CONFIG.tracker.liveStab.deband);
+  });
+
+  it("deep-merges a partial liveStab.deband patch (older configs have none)", () => {
+    const merged = mergeTrackerConfig(DEFAULT_CONFIG.tracker, {
+      liveStab: { deband: { ditherLevels: 1.5 } },
+    } as never);
+    expect(merged.liveStab.deband.ditherLevels).toBe(1.5);
+    expect(merged.liveStab.deband.enabled).toBe(true);
+    expect(merged.liveStab.deband.vignetteKeep).toBe(DEFAULT_CONFIG.tracker.liveStab.deband.vignetteKeep);
+    expect(merged.liveStab.delayMs).toBe(DEFAULT_CONFIG.tracker.liveStab.delayMs);
   });
 });
 

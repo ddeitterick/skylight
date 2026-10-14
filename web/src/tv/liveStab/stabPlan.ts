@@ -19,6 +19,8 @@ export interface FrameRec {
   bh: number;
   /** HFOV at the time, deg (null = unknown). */
   hf: number | null;
+  /** Lens zoom position at the time, units (picks the flat-field; null = unknown). */
+  zu?: number | null;
   /** The tracker holds a vision lock (its detection is fresh). */
   locked: boolean;
   /** This frame wants crop-zoom rather than edge fill (skyline/texture). */

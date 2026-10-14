@@ -65,7 +65,9 @@ export function chooseZoom(
 
   let hfov = requiredHfovDeg(theta, sigma, cfg.zoom.fillFrac);
   const wide = Math.max(...lut.map((p) => p.hfovDeg));
-  const tele = Math.max(Math.min(...lut.map((p) => p.hfovDeg)), cfg.zoom.minHfovDeg || 0);
+  const lensTele = Math.min(...lut.map((p) => p.hfovDeg));
+  const limitOn = !(cfg.zoom.minHfovAboveRateDps > 0) || angularRateDps >= cfg.zoom.minHfovAboveRateDps;
+  const tele = Math.max(lensTele, limitOn ? cfg.zoom.minHfovDeg || 0 : 0);
   hfov = Math.min(wide, Math.max(tele, hfov));
 
   const zoomUnits = zoomUnitsFromHfov(hfov, lut);

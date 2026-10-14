@@ -12,6 +12,9 @@ Rendering works on the YUV planes directly (no RGB round trip):
 - shift by a sub-pixel translation;
 - fill the exposed edge with the replicated, heavily blurred border (invisible on flat sky);
 - multiply the vignette back in.
+Since method s2 every frame's luma is also debanded (deband.py): deband, divide by the per-zoom
+flat-field (only `vig_keep` of it goes back), static dither. With a known zoom the flat-field
+replaces the fitted vignette for the shift.
 """
 from __future__ import annotations
 
@@ -180,7 +183,11 @@ def vignette_map(coeffs, w: int, h: int) -> np.ndarray:
 # ------------------------------------------------------------------ render
 
 class PlaneWarper:
-    """Shift one plane (Y or a chroma plane) with flat-field-aware soft edge fill."""
+    """Shift one plane (Y or a chroma plane) with flat-field-aware soft edge fill.
+
+    `shift_fill` works on an already flat-fielded float plane and returns a float plane; the
+    caller divides the vignette out before and puts (some of) it back after. `__call__` is the
+    whole round trip for a uint8 plane with this warper's own vignette (used for chroma)."""
 
     def __init__(self, V: np.ndarray, offset: float):
         self.V = V
@@ -194,12 +201,9 @@ class PlaneWarper:
         self.out = np.empty((self.h, self.w), np.uint8)
         self.small = np.empty((max(2, self.h // 16), max(2, self.w // 16)), np.float32)
 
-    def __call__(self, p: np.ndarray, dx: float, dy: float) -> np.ndarray:
+    def shift_fill(self, f: np.ndarray, dx: float, dy: float) -> np.ndarray:
         h, w = self.h, self.w
-        f, g = self.f, self.g
-        f[...] = p
-        cv2.subtract(f, self.off, dst=f)
-        cv2.multiply(f, self.inv, dst=f)
+        g = self.g
         M = np.float32([[1, 0, dx], [0, 1, dy]])
         cv2.warpAffine(f, M, (w, h), dst=g, flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
         bl, br = max(0.0, dx), max(0.0, -dx)
@@ -224,6 +228,14 @@ class PlaneWarper:
             for sl in strips:
                 m = np.maximum(mx[None, sl[1]], my[sl[0], None])
                 g[sl] += (sm[sl] - g[sl]) * m
+        return g
+
+    def __call__(self, p: np.ndarray, dx: float, dy: float) -> np.ndarray:
+        f = self.f
+        f[...] = p
+        cv2.subtract(f, self.off, dst=f)
+        cv2.multiply(f, self.inv, dst=f)
+        g = self.shift_fill(f, dx, dy)
         cv2.multiply(g, self.V, dst=g)
         cv2.add(g, self.off, dst=g)
         return cv2.convertScaleAbs(g, dst=self.out)
@@ -243,10 +255,61 @@ def _ramp(d: np.ndarray, feather: float) -> np.ndarray:
     return (t * t * (3 - 2 * t)).astype(np.float32)
 
 
+@dataclass
+class Clean:
+    """Debanding settings for the render (method s2; see deband.py). enabled=False renders the
+    s1 way (luma codes untouched on unshifted frames, fitted vignette fully re-applied)."""
+    enabled: bool = True
+    sigma: float = 16.0        # deband blur, px at 1080p
+    range_lo: float = 3.0      # flat-sky test: local range (levels) fully / not at all debanded
+    range_hi: float = 5.0
+    amp: float = 2.0           # static dither, +- levels
+    cell: int = 2              # dither cell, px
+    vig_keep: float = 0.0      # share of the lens vignette put back after the flat-field (0 = flat)
+    flatfield: bool = True
+
+    def to_dict(self) -> dict:
+        return dict(self.__dict__)
+
+
+class _LumaGains:
+    """Per-zoom luma maps: pre (1 / F) before the shift, post (F^keep) after, net = pre * post."""
+
+    def __init__(self, w: int, h: int, keep: float, use: bool):
+        from .deband import FlatField
+        self.ff = FlatField(w, h) if use else None
+        self.keep = keep
+        self._c: dict = {}
+
+    def __call__(self, zoom):
+        if self.ff is None or zoom is None or not np.isfinite(zoom):
+            return None
+        key = int(round(zoom))
+        if key not in self._c:
+            F = self.ff.full(key)
+            if F is None:
+                self._c[key] = None
+            else:
+                F = np.maximum(F, 0.2)
+                post = None if self.keep == 0 else np.power(F, self.keep).astype(np.float32)
+                net = np.power(F, self.keep - 1.0).astype(np.float32)
+                self._c[key] = ((1.0 / F).astype(np.float32), post, net)
+            if len(self._c) > 24:
+                self._c = {key: self._c[key]}
+        return self._c[key]
+
+
 def render(src: str, dst: str, shifts: dict[int, tuple[float, float]], vig_coeffs, *,
-           crf: int = 21, preset: str = "veryfast", threads: int = 4, dec_threads: int = 2) -> dict:
-    """Re-encode `src` to `dst` applying shifts[pts] = (dx_frac, dy_frac). Frames without a shift
-    (or a negligible one) pass through untouched. Output keeps the source PTS and time base."""
+           zooms: dict[int, float] | None = None, clean: Clean | None = None,
+           crf: int = 21, preset: str = "veryfast", x264_extra: str = "", tune: str | None = "film",
+           threads: int = 4, dec_threads: int = 2) -> dict:
+    """Re-encode `src` to `dst` applying shifts[pts] = (dx_frac, dy_frac). Output keeps the source
+    PTS and time base.
+
+    With `clean` enabled (default), EVERY frame's luma is debanded, flat-fielded for its zoom
+    (zooms[pts], series.json units) and given the static dither, shifted or not, so the look does
+    not change when stabilization fades in. Frames without a shift keep their chroma untouched."""
+    cl = clean or Clean()
     ic, ist = _open(src, dec_threads)
     oc = av.open(dst, mode="w", format="mp4", options={"movflags": "+faststart"})
     rate = ist.guessed_rate or ist.average_rate or Fraction(30)
@@ -257,41 +320,78 @@ def render(src: str, dst: str, shifts: dict[int, tuple[float, float]], vig_coeff
     ost.time_base = ist.time_base
     ost.codec_context.time_base = ist.time_base
     ost.codec_context.thread_count = threads
-    ost.options = {"crf": str(crf), "preset": preset, "profile": "high", "tune": "film"}
+    ost.options = {"crf": str(crf), "preset": preset, "profile": "high"}
+    if tune:
+        ost.options["tune"] = tune
     # The camera's codes are FULL range (the Pi tags clips as such since
     # 2026-10-12; older clips are untagged but full range too): carry the
     # codes through untouched and tag the output to match.
-    ost.options["x264-params"] = "fullrange=on:colorprim=bt709:transfer=bt709:colormatrix=bt709"
+    ost.options["x264-params"] = "fullrange=on:colorprim=bt709:transfer=bt709:colormatrix=bt709" + (
+        ":" + x264_extra if x264_extra else "")
     ost.codec_context.color_range = 2  # AVCOL_RANGE_JPEG (full)
     W, H = ost.width, ost.height
     Vy = vignette_map(vig_coeffs, W, H)
     Vc = cv2.resize(Vy, (W // 2, H // 2), interpolation=cv2.INTER_AREA)
     wy, wc = PlaneWarper(Vy, 16.0), PlaneWarper(Vc, 128.0)
-    n = shifted = 0
+    db = None
+    gains = None
+    if cl.enabled:
+        from .deband import Debander
+        db = Debander(W, H, sigma=cl.sigma, range_lo=cl.range_lo, range_hi=cl.range_hi, amp=cl.amp, cell=cl.cell)
+        gains = _LumaGains(W, H, cl.vig_keep, cl.flatfield)
+    yf = np.empty((H, W), np.float32)
+    n = shifted = flat_fielded = 0
+    flat_sum = 0.0
     for fr in monotonic_frames(ic.decode(ist)):
         if fr.pts is None:
             continue
         dx, dy = shifts.get(fr.pts, (0.0, 0.0))
         pdx, pdy = dx * W, dy * H
-        if abs(pdx) >= 0.05 or abs(pdy) >= 0.05:
-            if fr.format.name not in ("yuv420p", "yuvj420p"):
-                fr = fr.reformat(format="yuv420p")
-            a = fr.to_ndarray()
-            Y = a[:H]
-            U = a[H:H + H // 4].reshape(H // 2, W // 2)
-            Vp = a[H + H // 4:].reshape(H // 2, W // 2)
-            out = np.empty_like(a)
-            out[:H] = wy(Y, pdx, pdy)
-            out[H:H + H // 4] = wc(U, pdx / 2, pdy / 2).reshape(-1, W)
-            out[H + H // 4:] = wc(Vp, pdx / 2, pdy / 2).reshape(-1, W)
-            nf = av.VideoFrame.from_ndarray(out, format="yuv420p")
-            shifted += 1
+        move = abs(pdx) >= 0.05 or abs(pdy) >= 0.05
+        if fr.format.name not in ("yuv420p", "yuvj420p"):
+            fr = fr.reformat(format="yuv420p")
+        # Same raw codes either way (yuvj420p = full-range 4:2:0: reformatting it would
+        # rescale to TV range and flicker vs processed frames).
+        a = fr.to_ndarray()
+        if db is None and not move:
+            out = a
         else:
-            # Same raw codes as the shifted path (yuvj420p = full-range 4:2:0:
-            # reformatting it would rescale to TV range and flicker vs shifted
-            # frames).
-            nf = fr if fr.format.name in ("yuv420p", "yuvj420p") else fr.reformat(format="yuv420p")
-            nf = av.VideoFrame.from_ndarray(nf.to_ndarray(), format="yuv420p")
+            out = a if not move else np.empty_like(a)
+            Y = a[:H]
+            if db is None:
+                out[:H] = wy(Y, pdx, pdy)
+            else:
+                yf[...] = Y
+                db.deband(yf)
+                flat_sum += db.last_flat
+                g = gains(zooms.get(fr.pts) if zooms else None)
+                if g is not None:
+                    flat_fielded += 1
+                if move:
+                    if g is not None:
+                        pre, post, _ = g
+                        cv2.multiply(yf, pre, dst=yf)
+                        r = wy.shift_fill(yf, pdx, pdy)
+                        if post is not None:
+                            cv2.multiply(r, post, dst=r)
+                    else:  # zoom unknown: the clip's fitted vignette, fully re-applied (s1)
+                        cv2.subtract(yf, 16.0, dst=yf)
+                        cv2.multiply(yf, wy.inv, dst=yf)
+                        r = wy.shift_fill(yf, pdx, pdy)
+                        cv2.multiply(r, wy.V, dst=r)
+                        cv2.add(r, 16.0, dst=r)
+                    out[:H] = db.dither_round(r)
+                else:
+                    if g is not None:
+                        cv2.multiply(yf, g[2], dst=yf)
+                    out[:H] = db.dither_round(yf)
+            if move:
+                U = a[H:H + H // 4].reshape(H // 2, W // 2)
+                Vp = a[H + H // 4:].reshape(H // 2, W // 2)
+                out[H:H + H // 4] = wc(U, pdx / 2, pdy / 2).reshape(-1, W)
+                out[H + H // 4:] = wc(Vp, pdx / 2, pdy / 2).reshape(-1, W)
+                shifted += 1
+        nf = av.VideoFrame.from_ndarray(out, format="yuv420p")
         nf.pts = fr.pts
         nf.time_base = ist.time_base
         for pkt in ost.encode(nf):
@@ -301,7 +401,8 @@ def render(src: str, dst: str, shifts: dict[int, tuple[float, float]], vig_coeff
         oc.mux(pkt)
     oc.close()
     ic.close()
-    return {"frames": n, "shifted": shifted}
+    return {"frames": n, "shifted": shifted, "flatFielded": flat_fielded,
+            "debandedShare": round(flat_sum / n, 3) if n and db is not None else None}
 
 
 def track(path: str, threads: int = 2) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

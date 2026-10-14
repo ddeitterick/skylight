@@ -16,4 +16,4 @@ import cv2  # noqa: E402
 
 cv2.setNumThreads(1)
 
-METHOD = "s1"
+METHOD = "s2"  # s2 (2026-10-12): + deband, per-zoom flat-field, static dither (deband.py)

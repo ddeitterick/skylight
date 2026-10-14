@@ -159,3 +159,25 @@ describe("StabPlanner", () => {
     expect(z).toBeLessThanOrEqual(1.45);
   });
 });
+
+describe("flatFieldSel (deband flat-field per zoom)", async () => {
+  const { flatFieldSel } = await import("../src/tv/liveStab/LiveStabilizer.js");
+  const { FF_STOPS, FF_FADE_LO, FF_DATA, FF_W, FF_H } = await import("../src/tv/liveStab/flatfield.js");
+  it("has one map per stop", () => {
+    expect(atob(FF_DATA).length).toBe(FF_W * FF_H * FF_STOPS.length);
+  });
+  it("is off for unknown or wide zoom, fades in below the widest stop", () => {
+    expect(flatFieldSel(null)).toBeNull();
+    expect(flatFieldSel(FF_FADE_LO - 1)).toBeNull();
+    const mid = flatFieldSel((FF_FADE_LO + FF_STOPS[0]) / 2)!;
+    expect(mid.a).toBe(0);
+    expect(mid.amp).toBeCloseTo(0.5);
+  });
+  it("interpolates between stops and clamps at full tele", () => {
+    const s = flatFieldSel((FF_STOPS[2] + FF_STOPS[3]) / 2)!;
+    expect([s.a, s.b, s.amp]).toEqual([2, 3, 1]);
+    expect(s.mix).toBeCloseTo(0.5);
+    const t = flatFieldSel(FF_STOPS[FF_STOPS.length - 1] + 50)!;
+    expect([t.a, t.b, t.mix]).toEqual([FF_STOPS.length - 1, FF_STOPS.length - 1, 0]);
+  });
+});

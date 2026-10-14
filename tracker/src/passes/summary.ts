@@ -10,7 +10,7 @@ import type { PassQuality } from "./quality.js";
 export const SERIES_HZ = 10;
 export const SERIES_COLS = [
   "t", "pan", "tilt", "cPan", "cTilt", "zoom", "hfov", "pAz", "pEl", "slant",
-  "dcx", "dcy", "dage", "corrAz", "corrEl", "lead", "fe", "fpos",
+  "dcx", "dcy", "dage", "corrAz", "corrEl", "lead", "fe", "fpos", "zw",
 ] as const;
 /** A detection older than this is not a lock (contract: "< 1.5 s old"). */
 export const LOCK_MAX_AGE_MS = 1500;
@@ -49,6 +49,8 @@ export interface Sample {
   fe?: number | null;
   /** Lens focus position, raw units. */
   fpos?: number | null;
+  /** Zoom rule that set the zoom this sample (diagnostic string). */
+  zw?: string | null;
   gsKt?: number | null;
   altFt?: number | null;
   baroRateFpm?: number | null;
@@ -172,6 +174,9 @@ export interface PassJson {
     poseErrMedDeg: number | null;
     corrMaxDeg: number | null;
     zoomChanges: number;
+    /** Longest stretch the lens ignored zoom commands during the pass, s
+     *  (driver lens-stuck detector; null/absent = never). */
+    lensStuckSec?: number | null;
   };
   build: PassBuild;
   tuning: PassTuning;
@@ -188,7 +193,7 @@ export interface SeriesJson {
   t0: number;
   hz: number;
   cols: string[];
-  rows: (number | null)[][];
+  rows: (number | string | null)[][];
 }
 
 export interface PassInput {
@@ -207,6 +212,8 @@ export interface PassInput {
   camera: PassCamera;
   media: PassMedia;
   notes?: string[];
+  /** Longest lens-stuck stretch seen during the pass, s (null = none). */
+  lensStuckSec?: number | null;
 }
 
 // --- helpers ---
@@ -274,6 +281,7 @@ export function buildSeries(t0: number, samples: Sample[]): SeriesJson {
       r2(s.t), r2(s.pan), r2(s.tilt), r2(s.cPan), r2(s.cTilt), rInt(s.zoom), r2(s.hfov),
       r2(s.pAz), r2(s.pEl), rInt(s.slant), r3(s.dcx), r3(s.dcy), rInt(s.dage),
       r3(s.corrAz), r3(s.corrEl), r2(s.lead), s.fe == null ? null : r2(s.fe), s.fpos ?? null,
+      s.zw ?? null,
     ]),
   };
 }
@@ -483,6 +491,7 @@ export function buildPass(input: PassInput): PassJson {
       poseErrMedDeg: r2(median(poseErr)),
       corrMaxDeg: r2(corrMax),
       zoomChanges,
+      lensStuckSec: r1(input.lensStuckSec ?? null),
     },
     build: input.build,
     tuning: input.tuning,

@@ -18,7 +18,14 @@ import numpy as np
 
 from . import METHOD
 from .plan import Params, make_plan, metrics
-from .video import analyse, fit_vignette, render, track
+from .video import Clean, analyse, fit_vignette, render, track
+
+
+# Method s2 (debanded): the static dither only survives an encoder that spends bits on flat
+# areas. Dusk 6 s clip, CAMBI after encode: crf 21 veryfast tune=film (s1) 2.3, crf 20 medium
+# aq-mode 3 0.09, crf 20 slow 0.03 (raw camera 14). medium is ~20% faster than slow for the same
+# look; tune=film costs +50% bits for nothing visible here.
+ENCODE = {"crf": 20, "preset": "medium", "tune": None, "x264_extra": "aq-mode=3"}
 
 
 @dataclass
@@ -30,9 +37,14 @@ class Guard:
 
 def series_hfov(series: dict | None, t_clip: np.ndarray, clip_offset: float) -> np.ndarray:
     """HFOV per video frame from series.json (video time = t - clipOffsetSec)."""
-    if not series or "cols" not in series or "hfov" not in series["cols"]:
+    return series_col(series, "hfov", t_clip, clip_offset)
+
+
+def series_col(series: dict | None, col: str, t_clip: np.ndarray, clip_offset: float) -> np.ndarray:
+    """A series.json column per video frame (held between samples; NaN outside the series)."""
+    if not series or "cols" not in series or col not in series["cols"]:
         return np.full(len(t_clip), np.nan)
-    ci = series["cols"].index("hfov")
+    ci = series["cols"].index(col)
     ti = series["cols"].index("t")
     rows = [(r[ti], r[ci]) for r in series["rows"] if r[ti] is not None and r[ci] is not None]
     if len(rows) < 2:
@@ -51,11 +63,12 @@ def _r(v, nd=4):
 
 
 def stabilize(clip: str, series: dict | None, clip_offset: float, out_dir: str, *,
-              params: Params | None = None, guard: Guard | None = None, threads: int = 4,
-              log=print) -> dict:
+              params: Params | None = None, guard: Guard | None = None, clean: Clean | None = None,
+              threads: int = 4, log=print) -> dict:
     """Returns the pass.json `media.stab` summary; writes stab.json (+ clip.stab.mp4 when ok) to out_dir."""
     p = params or Params()
     g = guard or Guard()
+    cl = clean or Clean()
     t0 = time.time()
     os.makedirs(out_dir, exist_ok=True)
     an = analyse(clip, threads=min(2, threads))
@@ -87,7 +100,9 @@ def stabilize(clip: str, series: dict | None, clip_offset: float, out_dir: str, 
         shifts = {int(an.pts[i]): (float(plan.dx[i]), float(plan.dy[i])) for i in range(n) if plan.w[i] > 0}
         dst = os.path.join(out_dir, "clip.stab.mp4")
         t1 = time.time()
-        rr = render(clip, dst, shifts, coeffs, threads=threads)
+        zu = series_col(series, "zoom", an.t, clip_offset)
+        zooms = {int(an.pts[i]): float(zu[i]) for i in range(n) if np.isfinite(zu[i])}
+        rr = render(clip, dst, shifts, coeffs, zooms=zooms, clean=cl, threads=threads, **ENCODE)
         t_render = time.time() - t1
         t2 = time.time()
         opts, ox, oy = track(dst, threads=min(2, threads))
@@ -106,7 +121,8 @@ def stabilize(clip: str, series: dict | None, clip_offset: float, out_dir: str, 
         after = metrics(ax, ay, on)
         predicted = metrics(an.px + plan.dx, an.py + plan.dy, on)
         extra.update(renderSec=round(t_render, 1), measureSec=round(t_measure, 1), outFrames=len(opts),
-                     ptsMissing=missing, shifted=rr["shifted"], wobblePredicted=predicted["wobble"],
+                     ptsMissing=missing, shifted=rr["shifted"], flatFielded=rr["flatFielded"],
+                     debandedShare=rr["debandedShare"], wobblePredicted=predicted["wobble"],
                      foundAfter=_r(np.isfinite(ax[on]).mean() if on.any() else 0, 3))
         summary.update(wobbleAfter=after["wobble"], shakeAfter=after["shake"], hopAfter=after["hop"])
         wb, wa = before["wobble"], after["wobble"]
@@ -128,6 +144,8 @@ def stabilize(clip: str, series: dict | None, clip_offset: float, out_dir: str, 
         "summary": summary,
         "params": p.to_dict(),
         "guard": g.__dict__,
+        "clean": cl.to_dict(),
+        "encode": ENCODE,
         "vignette": vig_info,
         "stats": extra,
         "width": an.width, "height": an.height, "fps": an.fps,

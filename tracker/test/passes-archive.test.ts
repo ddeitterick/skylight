@@ -141,7 +141,7 @@ describe("PassArchive", () => {
     expect(pass.quality!.flags).toContain("short");
     expect(series.rows).toHaveLength(120);
     expect(series.t0).toBe(T0);
-    expect(series.rows[0]).toEqual([0.1, 10, 30, 10.3, 30.4, 0, 56.5, 120, 40, 8000, null, null, null, 0, 0, 0.5, null, null]);
+    expect(series.rows[0]).toEqual([0.1, 10, 30, 10.3, 30.4, 0, 56.5, 120, 40, 8000, null, null, null, 0, 0, 0.5, null, null, null]);
     expect(existsSync(join(pdir, ".pending"))).toBe(true);
     expect(archive.status()).toMatchObject({ recording: false, passId: null, queued: 1 });
   });

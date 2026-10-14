@@ -91,7 +91,7 @@ Sent by the Pi as `POST /ingest/<id>`; stored verbatim in D1 `meta`; returned by
     "planeSizeFrac": 0.21,             // plane width as a fraction of the frame width in the best frame
     "centredSec": 12.4,                // seconds the plane sat inside the central 50% of the frame
     "bestFrameSec": 23.8,              // CLIP time of the beauty shot (= poster frame)
-    "flags": [],                       // any of: soft-focus no-plane short lost-lock jumpy wrap-pinned low-zoom
+    "flags": [],                       // any of: soft-focus no-plane short lost-lock jumpy wrap-pinned low-zoom lens-stuck
     "method": "q1"
   },
   "events": [                          // seconds from startedAt, sorted
@@ -116,7 +116,7 @@ Event kinds: `target lock lost zoom zenith wrap focus release`.
 {
   "t0": 1791676445000,                 // = startedAt (ms epoch)
   "hz": 10,
-  "cols": ["t","pan","tilt","cPan","cTilt","zoom","hfov","pAz","pEl","slant","dcx","dcy","dage","corrAz","corrEl","lead","fe","fpos"],
+  "cols": ["t","pan","tilt","cPan","cTilt","zoom","hfov","pAz","pEl","slant","dcx","dcy","dage","corrAz","corrEl","lead","fe","fpos","zw"],
   "rows": [[0.0, -61.1, 23.5, -57.4, 18.8, 0, 56.5, 122.3, 17.2, 9120, null, null, null, 0, 0, 0.5, null, -1991], ...]
 }
 ```
@@ -127,6 +127,7 @@ Event kinds: `target lock lost zoom zenith wrap focus release`.
   applied vision correction (deg); `lead` seconds; `fe` focus edge width on the plane in
   full-res px (≈2–3 sharp at stream resolution, larger = softer; null when not zoomed in or
   not measured); `fpos` lens focus position, signed raw camera units (≈ −2100…−100, larger = nearer) — both added
+  `zw` (since 2026-10-13, diagnostic string): which zoom rule set the zoom that sample — `frameLocked` / `frameOpen` (ADS-B framing with the locked / open-loop pointing sigma), `ladderN` (vision ladder rung N), `rateFloor` / `gearFloor` (motor-smoothness floors), `zenith`; a `+held` suffix means the debounce held the previous zoom.
   2026-10-11, absent from older series. Readers must look columns up
   by name: new columns are only ever appended.
 - Derived on the site: centring error az = `(dcx−0.5)·hfov`, el = `−(dcy−0.5)·hfov·9/16`
@@ -241,6 +242,8 @@ As implemented (q1, `tracker/src/passes/quality.ts`, re-scorer `passes/tools/res
   HFOV ≤ 5.5°; `jumpy` > 6 in-frame jumps/min at HFOV ≤ 8° (detection moves > 15% of the
   frame width within 0.6 s); `wrap-pinned` dead-zone anticipation engaged and lock % < 55;
   `low-zoom` tightest HFOV > 9°.
+  `lens-stuck` (since 2026-10-13) the camera ignored zoom/focus commands for ≥10 s during the
+  pass (`tracking.lensStuckSec`) — a hardware wedge, not a tracking fault; needs a power-cycle.
 - `poster.jpg` is served with `cache-control: public, max-age=3600, stale-while-revalidate=86400`
   (not immutable) because re-scoring replaces it; clips and series stay immutable.
 
@@ -315,16 +318,27 @@ hops around the frame. A dev-box job (`stabilizer/`, not the Pi) re-renders each
 with the hops taken out and stores it next to the raw one; the site plays the stabilized clip
 by default with a toggle to the original. The raw `clip.mp4` is never changed.
 
-How (method `s1`, `stabilizer/skylight_stab/`): find the plane in every video frame
+How (method `s2`, `stabilizer/skylight_stab/`): find the plane in every video frame
 (brightness residual against a smooth sky + sub-pixel phase correlation of the plane patch),
 smooth its path with a centred Gaussian (σ 1.2 s, ±3 s look-ahead, offline), and shift each
-frame so the plane follows the smooth path. Only frames at HFOV ≤ 12° (series.json `hfov`),
+frame so the plane follows the smooth path. Only frames at HFOV ≤ 20° (series.json `hfov`),
 outside > 2× zoom jumps, with no skyline/wires at the frame edge and a plane found (gaps ≤ 1.5 s
 bridged) are shifted; stretches shorter than 2 s stay raw and every stretch fades in/out over
 0.75 s. Shifts are soft-clamped to 18% of the frame. Exposed edges: divide out the lens
-vignette (a radial model fitted to the clip's own sky), shift, fill the edge with a blurred
-copy of the border, re-apply the vignette. Corrections are keyed to frames by PTS and the
-output keeps the source PTS, so series.json lines up with both clips (`t − clipOffsetSec`).
+vignette, shift, fill the edge with a blurred copy of the border. Corrections are keyed to
+frames by PTS and the output keeps the source PTS, so series.json lines up with both clips
+(`t − clipOffsetSec`). Codes stay full range (yuvj420p in, `fullrange=on` out).
+
+Debanding (new in `s2`, 2026-10-13): at dusk the camera's H.264 stair-steps the lens vignette
+into rings one code value apart. Every output frame's luma (shifted or not) is debanded on flat
+sky, divided by the per-zoom lens flat-field (series.json `zoom`; maps in
+`skylight_stab/flatfield.npz`, the vignette is not put back; with no zoom or wider than the
+calibrated stops the shift uses the clip's fitted vignette as in s1) and given a static ±2-level
+dither, then encoded at crf 20 / medium / aq-mode 3. Dusk CAMBI 15 → 0.2-0.35; daytime plane
+detail unchanged (measurements in `stabilizer/README.md`). Not gated by time of day. `s1` was
+the same without debanding: the clip's own fitted radial vignette, fully re-applied, crf 21
+veryfast tune=film. Only passes that get a stabilized clip (`status: ok`) are debanded; a
+skipped pass plays its raw clip.
 
 Quality guard: the plane is re-tracked in the rendered clip. The pass gets `status: "ok"` only
 if the wobble on the stabilized frames fell by ≥ 15% and frame-to-frame shake did not rise;
@@ -339,7 +353,7 @@ otherwise `skipped` (no `clip.stab.mp4` is offered, raw stays the default).
   "clip": "clip.stab.mp4",           // null unless ok
   "clipBytes": 15438771,
   "track": "stab.json",
-  "method": "s1",
+  "method": "s2",                    // s1 = before debanding (still on older passes)
   "lookaheadSec": 3.0,
   "coverage": 0.31,                  // fraction of the clip's frames stabilized (weight > 0.5)
   "coverageSec": 33.5,
@@ -353,8 +367,8 @@ otherwise `skipped` (no `clip.stab.mp4` is offered, raw stays the default).
 ```
 
 `stab.json` (R2, also for skipped passes): `{ schema: 1, method, summary (= media.stab),
-params, guard, vignette, stats, width, height, fps, timeBase, t[], pts[], dx[], dy[], w[], px[],
-py[] }` — one entry per decoded frame: `t` clip seconds from the source PTS, `dx/dy` the
+params, guard, clean (s2 deband settings), encode, vignette, stats, width, height, fps,
+timeBase, t[], pts[], dx[], dy[], w[], px[], py[] }` — one entry per decoded frame: `t` clip seconds from the source PTS, `dx/dy` the
 picture shift as a fraction of width/height (+ = right/down; the plane at p appears at p + d),
 `w` the stabilization weight 0..1, `px/py` the plane found in the raw clip (null = not found).
 A player could apply `dx/dy` to the raw clip itself instead of downloading the copy.

@@ -639,9 +639,15 @@ export class ViscaCamera implements CameraDriver {
   /** Re-send an unchanged direct focus after this long (it lands in ~2-3 s). */
   private static readonly FOCUS_RESEND_MS = 2500;
 
-  setFocusDirect(focusUnits: number): void {
-    const z = this.lastSentZoom ?? this.pose?.zoomUnits;
-    if (z == null) return;
+  setFocusDirect(focusUnits: number): boolean {
+    // Only with the lens AT the commanded zoom. Zoom-Focus Direct carries a
+    // zoom too: sent mid zoom-out it paired the NEW mid stop (e.g. 976) with
+    // a tele focus (−1956…−3874) — an impossible combination — and both lens
+    // wedges (2026-10-12 14:55 at 976/184, 2026-10-13 10:52 at 1076/183)
+    // began on exactly such a zoom-out. The caller falls back to a timed drive.
+    const z = this.lastSentZoom;
+    const lens = this.pose?.zoomUnits;
+    if (z == null || lens == null || Math.abs(lens - z) > 15) return false;
     // The servo asks again only when the lens is still off the point; an
     // identical command already sent was swallowed by setZoomFocus's dedupe,
     // so a lens that wandered off (a drive, a missed command) was never
@@ -652,6 +658,7 @@ export class ViscaCamera implements CameraDriver {
       !this.sweptSinceFocus && Date.now() - this.lastSentFocusAt >= ViscaCamera.FOCUS_RESEND_MS
     ) this.lastSentFocus = null;
     this.setZoomFocus(z, focusUnits);
+    return true;
   }
 
   /** Focus state: null = unknown (assert on first call). "onepush" means a

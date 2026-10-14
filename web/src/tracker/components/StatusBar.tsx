@@ -58,6 +58,11 @@ export function StatusBar({
         {d.kind === "visca" &&
           ` · seq ${d.lastSeq} · inq ${d.lastInquiryAgoMs != null ? `${(d.lastInquiryAgoMs / 1000).toFixed(1)}s` : "—"}`}
         {d.lastError && <span className="err"> · {d.lastError}</span>}
+        {d.lensStuckSec != null && d.lensStuckSec >= 10 && (
+          <span className="err" title="Zoom/focus commands are being ignored — power-cycle the camera">
+            {" "}· LENS STUCK {Math.round(d.lensStuckSec)}s — power-cycle the camera
+          </span>
+        )}
       </div>
 
       {state.pose && (

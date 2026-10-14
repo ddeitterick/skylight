@@ -86,8 +86,9 @@ describe("timed focus drives always end with a STOP", () => {
 
 describe("direct focus re-sends", () => {
   it("re-sends an unchanged learned point once the last one had time to land", () => {
-    const { cam, sent } = makeCam();
+    const { cam, sent, c } = makeCam();
     cam.setZoomFocus(1385, -1956);
+    c.pose = { panDeg: 0, tiltDeg: 0, zoomUnits: 1385 }; // lens arrived
     sent.length = 0;
     cam.setFocusDirect(-1956); // immediately: still landing → deduped
     expect(sent).toEqual([]);
@@ -103,6 +104,21 @@ describe("direct focus re-sends", () => {
     vi.advanceTimersByTime(3000);
     sent.length = 0;
     cam.setFocusDirect(-1956);
+    expect(sent).toEqual([]);
+  });
+});
+
+describe("direct focus vs a moving lens", () => {
+  it("never pairs a tele focus with a new mid-stop zoom while the lens is still zooming out", () => {
+    // Both lens wedges began on a zoom-out from >=1173 to a mid stop: the
+    // lens still READ 1385 (so the caller trusted a tele focus) while the
+    // driver would have sent zoom 976 + focus −1956 together.
+    const { cam, sent, c } = makeCam();
+    cam.setZoomFocus(1385, -1956);
+    c.pose = { panDeg: 0, tiltDeg: 0, zoomUnits: 1385 };
+    cam.setZoom(976); // zoom-out commanded; lens hasn't moved yet
+    sent.length = 0;
+    expect(cam.setFocusDirect(-1956)).toBe(false);
     expect(sent).toEqual([]);
   });
 });

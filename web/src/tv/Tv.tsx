@@ -12,6 +12,7 @@ import {
   norm180,
   worldFromMount,
   DEFAULT_CONFIG,
+  mergeLiveStab,
   type Aircraft,
 } from "@shared/index.js";
 import { useStream } from "../lib/useStream.js";
@@ -116,7 +117,7 @@ export function Tv() {
   // ?stab=1 (the Twitch stream; it needs a real GPU — not the Pi's TV), and
   // tracker.liveStab.enabled is the global switch. The video is shown
   // liveStab.delayMs late, so the plane-in-frame overlays replay as late.
-  const stabCfg = { ...DEFAULT_CONFIG.tracker.liveStab, ...(config?.liveStab ?? {}) };
+  const stabCfg = mergeLiveStab(DEFAULT_CONFIG.tracker.liveStab, config?.liveStab);
   const stabWanted = params.get("stab") === "1" && stabCfg.enabled && mse.ok;
   // Legacy CSS crop-follow (re-centre on the 10 Hz vision detection). OFF by
   // default since 2026-10-10 — it read as shake; ?crop=1 re-enables it.
@@ -133,13 +134,13 @@ export function Tv() {
   // newest frame); everything drawn over the picture uses the delayed state.
   const stabCtx = (() => {
     const pose = liveState?.pose;
-    if (!pose || !config) return { det: liveState?.vision?.detection ?? null, hfovDeg: null, bottomElDeg: null };
+    if (!pose || !config) return { det: liveState?.vision?.detection ?? null, hfovDeg: null, bottomElDeg: null, zoomUnits: pose?.zoomUnits ?? null };
     const hf = hfovFromZoomUnits(pose.zoomUnits, config.zoom.fovLut);
     const el = worldFromMount({ panDeg: pose.panDeg, tiltDeg: pose.tiltDeg }, config.mount).elDeg;
     const roll = config.leveling?.enabled ? Math.abs(displayRollDeg(pose, config.mount, config.leveling)) : 0;
     const r = (roll * Math.PI) / 180;
     const half = ((hf * 9) / 16 / 2) * Math.cos(r) + (hf / 2) * Math.sin(r);
-    return { det: liveState?.vision?.detection ?? null, hfovDeg: hf, bottomElDeg: el - half };
+    return { det: liveState?.vision?.detection ?? null, hfovDeg: hf, bottomElDeg: el - half, zoomUnits: pose.zoomUnits };
   })();
   const live = useLiveStab(mse.videoRef, canvasRef, {
     active: stabWanted,
@@ -155,11 +156,13 @@ export function Tv() {
     levelOn && config?.leveling?.enabled && state?.pose
       ? displayRollDeg(state.pose, config.mount, config.leveling)
       : null;
-  // Leveling (and the legacy crop-follow) transform whichever element shows
-  // the picture: the stabilized canvas, or the raw video.
-  useStabilize(stabOn ? canvasRef : mse.videoRef, state?.vision?.detection, {
+  // Leveling: the stabilized canvas draws it in its shader (its static dither
+  // must stay on fixed screen pixels); the raw video gets a CSS transform
+  // (with the legacy crop-follow).
+  live.setLevel(stabOn ? rollDeg : null);
+  useStabilize(mse.videoRef, state?.vision?.detection, {
     enabled: mse.ok && cropOn && !stabOn,
-    rollDeg,
+    rollDeg: stabOn ? null : rollDeg,
   });
   /** Frame fraction -> screen fraction under the leveling (16:9 screen). */
   const toScreen = (fx: number, fy: number): { x: number; y: number } => {

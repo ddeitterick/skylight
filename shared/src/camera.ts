@@ -271,6 +271,8 @@ export interface TrackerState {
     hfovDeg: number | null;
     /** Angular size of the aircraft, deg (for framing display). */
     angularSizeDeg: number | null;
+    /** Which rule set the zoom (frameLocked/frameOpen/ladderN/rateFloor/gearFloor/zenith, "+held" = debounce). */
+    zoomWhy?: string;
   };
   candidates: Candidate[];
   calibration: CalibrationState;

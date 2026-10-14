@@ -69,7 +69,8 @@ export interface CameraDriver {
    */
   setZoomFocus?(zoomUnits: number, focusUnits: number): void;
   /** Move focus to an absolute position at the current zoom (via Zoom-Focus Direct). */
-  setFocusDirect?(focusUnits: number): void;
+  /** false = not sent (lens not at the commanded zoom) — use a timed drive. */
+  setFocusDirect?(focusUnits: number): boolean;
 
   /** Stop all motion. */
   stopMotion(): void;

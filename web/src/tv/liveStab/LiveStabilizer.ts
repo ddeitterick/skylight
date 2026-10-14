@@ -9,17 +9,47 @@
 // display use the very same frame, so there's no alignment error (a 2-frame
 // offset made the prototype worse than raw).
 //
-// The shader: undo the lens vignette (radial profile learned live from sky
-// frames), shift (+ crop zoom), soft-fill any exposed edge from a blurred mip,
-// re-apply the vignette. Horizon leveling stays a CSS transform on the canvas.
+// The shader: deband flat sky, undo the lens vignette (the calibrated
+// per-zoom flat-field; the radial profile learned live from sky frames when the
+// zoom is unknown), shift (+ crop zoom), soft-fill any exposed edge from a
+// blurred mip, re-apply `vignetteKeep` of the vignette, add a static dither.
+// The deband/flat-field/dither part runs on every displayed frame, also while
+// nothing is being stabilized (the rings show at every zoom). Horizon leveling
+// (rotate + cover scale) is drawn by the shader too, not by CSS: the dither
+// must sit on fixed SCREEN pixels, or the encoder sees it move whenever the
+// roll changes and throws it away.
 
 import { BlobDetector, PlaneFollower } from "./planeTrack.js";
 import { PhaseCorrelator } from "./phaseCorr.js";
 import { StabPlanner, type PlanOpts, type FrameRec } from "./stabPlan.js";
+import { levelingTransform } from "@shared/index.js";
+import { FF_DATA, FF_FADE_LO, FF_H, FF_LO, FF_STEP, FF_STOPS, FF_W } from "./flatfield.js";
+
+/** Sky clean-up (tracker.liveStab.deband; research: claude.ai/artifact/5ZxgPf1ZuN5PfVtWucmTWu). */
+export interface DebandOpts {
+  enabled: boolean;
+  thresholdLevels: number;
+  radiusPx: number;
+  ditherLevels: number;
+  ditherCellPx: number;
+  vignetteKeep: number;
+}
 
 export interface LiveStabOpts extends PlanOpts {
   /** Frame bottom must be above this elevation to fill (edge "auto"). */
   fillMinElDeg: number;
+  deband: DebandOpts;
+}
+
+/** Flat-field lookup for a zoom: atlas rows a, b mixed by `mix`, faded by `amp` (null = none). */
+export function flatFieldSel(zu: number | null | undefined): { a: number; b: number; mix: number; amp: number } | null {
+  if (zu == null || !Number.isFinite(zu) || zu < FF_FADE_LO) return null;
+  const st = FF_STOPS;
+  if (zu <= st[0]) return { a: 0, b: 0, mix: 0, amp: (zu - FF_FADE_LO) / (st[0] - FF_FADE_LO) };
+  if (zu >= st[st.length - 1]) return { a: st.length - 1, b: st.length - 1, mix: 0, amp: 1 };
+  let i = 0;
+  while (zu > st[i + 1]) i++;
+  return { a: i, b: i + 1, mix: (zu - st[i]) / (st[i + 1] - st[i]), amp: 1 };
 }
 
 export interface StabContext {
@@ -28,6 +58,8 @@ export interface StabContext {
   hfovDeg: number | null;
   /** Elevation of the frame's bottom edge, deg (null = unknown). */
   bottomElDeg: number | null;
+  /** Lens zoom position, units (pose.zoomUnits; picks the flat-field). */
+  zoomUnits?: number | null;
 }
 
 export interface StabFrameInfo {
@@ -89,17 +121,63 @@ void main(){
   o = r;
 }`;
 
+const FF_N = FF_STOPS.length;
 const FS_WARP = `#version 300 es
-precision highp float; in vec2 uv; uniform sampler2D t; uniform sampler2D vig; uniform vec2 shift; uniform float zoom; uniform vec2 texel; uniform float lod; out vec4 o;
+precision highp float; in vec2 uv; uniform sampler2D t; uniform sampler2D vig; uniform sampler2D nz; uniform sampler2D ffm;
+uniform vec2 shift; uniform float zoom; uniform vec2 texel; uniform float lod;
+uniform vec2 px; uniform float dbThr; uniform float dbRad; uniform float dbAmp; uniform float dbCell;
+uniform vec2 ffRows; uniform float ffMix; uniform float ffAmp; uniform float ffOn; uniform float keep;
+uniform float lvRot; uniform float lvScale;
+out vec4 o;
 float vn(vec2 p){ float r = clamp(length((p-.5)*vec2(16.,9.))/9.1788, 0., 1.); return max(.2, texture(vig, vec2(r*${(VIG_BINS - 1) / VIG_BINS}+${0.5 / VIG_BINS}, .5)).r); }
+float ff(vec2 p){
+  vec2 c = clamp(p, vec2(${0.5 / FF_W}, ${0.5 / FF_H}), vec2(${1 - 0.5 / FF_W}, ${1 - 0.5 / FF_H}));
+  float a = texture(ffm, vec2(c.x, (ffRows.x + c.y) / ${FF_N}.)).r;
+  float b = texture(ffm, vec2(c.x, (ffRows.y + c.y) / ${FF_N}.)).r;
+  return 1. + (${FF_LO} + mix(a, b, ffMix) * ${255 * FF_STEP} - 1.) * ffAmp;
+}
+float h(vec2 p){ return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+// deband: 2 rounds of 4 taps on a randomly rotated cross (static per pixel);
+// a round is taken only where every tap is within dbThr (flat sky), so the
+// plane, wires and cloud edges are untouched
+vec3 deband(vec2 q){
+  vec3 c = textureLod(t, q, 0.).rgb;
+  for (int i = 1; i <= 2; i++) {
+    float a = 6.2831853 * h(gl_FragCoord.xy + float(i) * 17.);
+    float r = dbRad * float(i) * .5 * (.5 + .5 * h(gl_FragCoord.yx + float(i) * 31.));
+    vec2 d = vec2(cos(a), sin(a)) * r * px, e = vec2(-d.y * px.x / px.y, d.x * px.y / px.x);
+    vec3 s1 = textureLod(t, q + d, 0.).rgb, s2 = textureLod(t, q - d, 0.).rgb, s3 = textureLod(t, q + e, 0.).rgb, s4 = textureLod(t, q - e, 0.).rgb;
+    vec3 m = max(max(abs(s1 - c), abs(s2 - c)), max(abs(s3 - c), abs(s4 - c)));
+    c = mix(c, (s1 + s2 + s3 + s4) * .25, step(max(m.r, max(m.g, m.b)), dbThr));
+  }
+  return c;
+}
 void main(){
-  vec2 q = (uv-.5)/zoom + .5 - shift;
+  // screen -> picture through the leveling (CSS-equivalent rotate(lvRot) scale(lvScale))
+  vec2 sp = (uv - .5) * vec2(16., 9.);
+  float cr = cos(lvRot), sr = sin(lvRot);
+  vec2 ul = vec2(cr * sp.x + sr * sp.y, -sr * sp.x + cr * sp.y) / lvScale / vec2(16., 9.) + .5;
+  vec2 q = (ul-.5)/zoom + .5 - shift;
   vec2 qc = clamp(q, texel, 1.-texel);
   float d = length((q-qc)*vec2(16.,9.))/9.;
-  vec3 c = texture(t, qc).rgb;
+  vec3 c = dbThr > 0. ? deband(qc) : texture(t, qc).rgb;
   if (d > 0.) c = mix(c, textureLod(t, qc, lod).rgb, smoothstep(0., .04, d));
-  o = vec4(c / vn(qc) * vn(uv), 1.);
+  if (ffOn > .5) c = c / ff(qc) * pow(ff(ul), keep);
+  else c = c / vn(qc) * vn(ul);
+  if (dbAmp > 0.) {
+    // static triangular dither in dbCell px cells: the same pattern every
+    // frame, so the stream encoder keeps it (per-frame grain gets discarded).
+    // Grey (equal in R, G, B) = luma-only, like the archive: independent
+    // per-channel noise would put a third of it into chroma.
+    ivec2 k = ivec2(gl_FragCoord.xy / dbCell);
+    float n = texelFetch(nz, k & 255, 0).r + texelFetch(nz, (k + ivec2(97, 61)) & 255, 0).r - 1.;
+    c += n * dbAmp / 255.;
+  }
+  o = vec4(c, 1.);
 }`;
+
+/** Most the display may trail live beyond the look-ahead (MSE cushion etc.). */
+const MAX_EXTRA_LAG_MS = 6000;
 
 export class LiveStabilizer {
   onFrame: ((info: StabFrameInfo) => void) | null = null;
@@ -129,7 +207,11 @@ export class LiveStabilizer {
   private dispTex: WebGLTexture | null = null;
   private dispFb: WebGLFramebuffer | null = null;
   private readFb!: WebGLFramebuffer;
+  private levelTarget: number | null = null;
+  private levelRoll: number | null = null;
   private vigTex!: WebGLTexture;
+  private noiseTex!: WebGLTexture;
+  private ffTex!: WebGLTexture;
   private ring: WebGLTexture[] = [];
   private ringSeq: number[] = [];
   private vw = 0;
@@ -259,6 +341,22 @@ export class LiveStabilizer {
     gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
     this.vigTex = this.tex(VIG_BINS, 1, 1, gl.R16F);
     this.uploadVig(1);
+    // static dither source: 256² random bytes (fixed seed), fetched per 2×2 cell
+    this.noiseTex = this.tex(256, 256);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    const nz = new Uint8Array(256 * 256 * 4);
+    let seed = 12345;
+    for (let i = 0; i < nz.length; i++) { seed = (Math.imul(seed, 1103515245) + 12345) >>> 0; nz[i] = seed >>> 24; }
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 256, 256, gl.RGBA, gl.UNSIGNED_BYTE, nz);
+    // per-zoom flat-field atlas (R8, maps stacked vertically)
+    const bin = atob(FF_DATA);
+    const ff = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) ff[i] = bin.charCodeAt(i);
+    this.ffTex = this.tex(FF_W, FF_H * FF_N, 1, gl.R8);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, FF_W, FF_H * FF_N, gl.RED, gl.UNSIGNED_BYTE, ff);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
   }
 
   /** (Re)allocate the frame ring for the video size and delay. */
@@ -302,6 +400,9 @@ export class LiveStabilizer {
   }
 
   setContext(c: StabContext): void { this.ctx = c; }
+
+  /** Picture roll to cancel for the DISPLAYED frame, deg (null = none). Eased per frame. */
+  setLevel(rollDeg: number | null): void { this.levelTarget = rollDeg; }
 
   start(): void {
     if (this.alive || this.failed) return;
@@ -388,7 +489,15 @@ export class LiveStabilizer {
     }
     const t0 = performance.now();
     const t = meta.mediaTime;
-    if (this.lastT >= 0 && (t < this.lastT - 0.005 || t - this.lastT > 1)) { this.seg++; this.follow.reset(); }
+    if (this.lastT >= 0 && (t < this.lastT - 0.005 || t - this.lastT > 1)) {
+      this.seg++;
+      this.follow.reset();
+      // A new media timeline (the MSE relay restarted — e.g. a tracker
+      // restart): the old wall−media offset no longer applies. Keeping it
+      // (min() only creeps up 1.5 ms/s) made overlays replay state from
+      // minutes ago — "SCANNING" while a plane was tracked (2026-10-13).
+      this.liveOff = null;
+    }
     if (Math.abs(t - this.lastT) < 1e-4) return; // same frame re-presented
     this.lastT = t;
 
@@ -480,11 +589,36 @@ export class LiveStabilizer {
     gl.activeTexture(gl.TEXTURE1);
     gl.bindTexture(gl.TEXTURE_2D, this.vigTex);
     gl.uniform1i(gl.getUniformLocation(this.progWarp, "vig"), 1);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, this.noiseTex);
+    gl.uniform1i(gl.getUniformLocation(this.progWarp, "nz"), 2);
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D, this.ffTex);
+    gl.uniform1i(gl.getUniformLocation(this.progWarp, "ffm"), 3);
+    const drec = this.planner.at(this.planner.indexOf(ds));
+    const db = this.opts.deband;
+    const on = db?.enabled === true;
+    const sel = on ? flatFieldSel(drec?.zu) : null;
+    // leveling: ease toward the pose's roll (pose updates arrive at a few Hz;
+    // a step-wise rotation would read as a twitch)
+    const lt = this.levelTarget;
+    this.levelRoll = lt == null ? null : this.levelRoll == null ? lt : this.levelRoll + (lt - this.levelRoll) * 0.28;
+    const lv = this.levelRoll == null ? { rotateDeg: 0, scale: 1 } : levelingTransform(this.levelRoll);
     this.draw(this.progWarp, this.dispTex!, {
       shift: [plan.cx, plan.cy], zoom: [plan.zoom], texel: [0.5 / w, 0.5 / h], lod: [Math.max(0, this.mipLevels - 6)],
+      px: [1 / w, 1 / h],
+      dbThr: [on ? Math.max(0, db.thresholdLevels) / 255 : 0],
+      dbRad: [on ? db.radiusPx * (w / 1920) : 0],
+      dbAmp: [on ? Math.max(0, db.ditherLevels) : 0],
+      dbCell: [on ? Math.max(1, db.ditherCellPx) : 1],
+      ffRows: [sel?.a ?? 0, sel?.b ?? 0], ffMix: [sel?.mix ?? 0], ffAmp: [sel?.amp ?? 0],
+      ffOn: [sel ? 1 : 0], keep: [on ? Math.min(1, Math.max(0, db.vignetteKeep)) : 1],
+      lvRot: [(lv.rotateDeg * Math.PI) / 180], lvScale: [lv.scale],
     });
-    const drec = this.planner.at(this.planner.indexOf(ds));
-    const lagMs = drec && this.liveOff != null ? performance.now() - (drec.t * 1000 + this.liveOff) : this.opts.delaySec * 1000;
+    const rawLag = drec && this.liveOff != null ? performance.now() - (drec.t * 1000 + this.liveOff) : this.opts.delaySec * 1000;
+    // Safety net: the display can't plausibly trail live by more than the
+    // look-ahead plus a generous MSE cushion.
+    const lagMs = Math.max(0, Math.min(rawLag, this.opts.delaySec * 1000 + MAX_EXTRA_LAG_MS));
     const info: StabFrameInfo = { cx: plan.cx, cy: plan.cy, zoom: plan.zoom, gain: plan.gain, plane: plan.plane, lagMs };
     this.stat(tDet, performance.now() - t1);
     this.rows.push([ds, drec?.t ?? 0, plan.plane?.x ?? NaN, plan.plane?.y ?? NaN, plan.cx, plan.cy, plan.zoom, plan.gain, lagMs, drec?.wantCrop ? 1 : 0, this.lastEdgeTex]);
@@ -557,7 +691,7 @@ export class LiveStabilizer {
     const rec = {
       seq: pd.seq, t: pd.t, x: pos?.x ?? null, y: pos?.y ?? null,
       bw: r?.blob?.w ?? 0, bh: r?.blob?.h ?? 0,
-      hf, locked: locked && pos != null, wantCrop, seg: pd.seg,
+      hf, zu: ctx.zoomUnits ?? null, locked: locked && pos != null, wantCrop, seg: pd.seg,
     };
     this.planner.push(rec);
     this.recLog.push(rec);

@@ -27,7 +27,9 @@ ASPECT = 9 / 16  # height / width, to express y in width units
 
 @dataclass
 class Params:
-    tele_max_hfov: float = 12.0   # deg; stabilize only at or below this field of view
+    tele_max_hfov: float = 20.0   # deg; stabilize only at or below this field of view
+    # (12 left ~70% of a typical pass raw; 20 measured on 3 passes 2026-10-13:
+    # coverage 26→41%, 34→54%, 55→86%, two skipped clips now pass the guard)
     sigma_sec: float = 1.2        # Gaussian sigma of the target path
     lookahead_sec: float = 3.0    # truncation: frames further than this never influence the target
     bridge_sec: float = 1.5       # bridge plane-detection gaps up to this long
