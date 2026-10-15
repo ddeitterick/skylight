@@ -18,18 +18,13 @@
 // nothing has been learned for this zoom yet.
 
 import fs from "node:fs";
+import type { CameraProfile } from "@shared/index.js";
 import { dirname } from "node:path";
 
 /** Edge width (full-res px) at or below which the plane counts as sharp. */
 export const FE_SHARP = 3.0;
 /** ...and above which it counts as soft (needs correcting). */
 export const FE_SOFT = 4.0;
-/** Zoom buckets for the learned table, units. Near tele the zoom-tracking
- *  curve is ~37 focus units per zoom unit (zoom 1385 → −1924, 1437 → −3870),
- *  so only the exact zoom is meaningful: the ladder's rungs recur exactly.
- *  (A 32-unit bucket with neighbour fallback nudged a 1437 plane to the
- *  focus learned at 1404 — 1700 units off — and blurred a whole pass.) */
-export const LUT_BUCKET = 4;
 /** Distance bands (slant range, m): at 20× a plane 2 km away needs a
  *  visibly nearer focus than one at 8 km (LOT35 at ~2.5 km stayed a blur
  *  at the far-band point −3722). Keys are bucket*10 + band. */
@@ -38,28 +33,14 @@ export function distanceBand(slantM: number | null | undefined): number {
   if (slantM == null) return 2;
   return slantM < BAND_EDGES_M[0] ? 0 : slantM < BAND_EDGES_M[1] ? 1 : 2;
 }
-/** Seed: full tele, far band, measured sharp at −3857…−3905 (two passes + probe). */
-export const TELE_SEED: [number, number] = [1437, -3870];
 /** Believable measurements only: sub-pixel edges are compression/tiny-plane
  *  artefacts, low contrast is haze. */
 const LEARN_MIN_EDGE = 1.2;
 const LEARN_MIN_CONTRAST = 25;
-/** Samples farther than this from an existing entry are ignored (the depth
- *  of field at tele is ~300 units; a −2630 "sharp" sample once moved the
- *  far-band 1437 point by 190 units in two updates). */
-const LEARN_MAX_JUMP = 250;
-/** Nudge only when the lens is at least this far from the learned point. */
-export const NUDGE_MIN_UNITS = 30;
-/** Beyond this a nudge takes >4 s at ~85 u/s; a one-push sweep with the
- *  plane centred lands in ~1-3 s (UAL2317: 1.2 s), so use that instead. */
-export const ONEPUSH_ABOVE_UNITS = 350;
-/** Pass-start far-stop reference only while this wide. */
-export const WIDE_REFERENCE_MAX_ZOOM = 400;
 /** The camera keeps moving focus for ~6 s after a zoom change (its zoom
  *  tracking catching up): judge / nudge only once the lens has been still
- *  this long (within FOCUS_STILL_UNITS). */
+ *  this long (within FocusTuning.stillUnits). */
 const FOCUS_STILL_MS = 800;
-const FOCUS_STILL_UNITS = 20;
 /** One-push only when the plane spans at least this many full-res px. */
 export const SWEEP_MIN_TARGET_PX = 60;
 const SOFT_HOLD_MS = 700;
@@ -68,16 +49,58 @@ const ACTION_COOLDOWN_MS = 1500;
  *  (focus drives top out at ~100 u/s — speed bytes above 7 are ignored —
  *  so starting early, during the camera's own tracking settle, is the
  *  only way to save time). */
-const SERVO_BURST_UNITS = 60;
 const SERVO_GAP_MS = 250;
 /** A one-push sweep runs ~1-3 s; the servo stays off meanwhile. */
 const SWEEP_RUN_MS = 3000;
-/** Servo only on the final approach to the commanded stop. */
-const SERVO_ZOOM_TOL = 120;
 const ONEPUSH_COOLDOWN_MS = 8000;
 /** Slow: sharp samples spread across a ~300-unit depth-of-field zone at
  *  tele; a fast average walked to its far edge (−4142 at 1437). */
 const LEARN_ALPHA = 0.08;
+
+/**
+ * Lens-dependent thresholds, derived from the camera profile's lens focus
+ * properties (shared/src/camera-profile.ts) — the ratios are the ones that
+ * worked on the first lens (depth of field 300 units, drive ~90 u/s):
+ * - learnMaxJump: samples farther than this from an entry are ignored (a −2630
+ *   "sharp" sample once moved the far-band 1437 point by 190 units).
+ * - nudgeMin: nudge only when the lens is at least this far off.
+ * - onePushAbove: beyond ~3.9 s of drive a one-push sweep (1-3 s with the plane
+ *   centred) beats a nudge.
+ * - stillUnits: the lens counts as still within this.
+ * - servoBurst / servoBigStep (errors over one depth of field): servo bursts.
+ */
+export interface FocusTuning {
+  lutBucket: number;
+  farSeed: [number, number];
+  learnMaxJump: number;
+  nudgeMin: number;
+  onePushAbove: number;
+  wideReferenceMaxZoom: number;
+  stillUnits: number;
+  servoBurst: number;
+  servoBigStep: number;
+  servoBigErr: number;
+  servoZoomTol: number;
+  driveUps: number;
+}
+
+export function focusTuning(lens: CameraProfile["lens"]["focus"]): FocusTuning {
+  const dof = lens.depthOfFieldUnits;
+  return {
+    lutBucket: lens.lutBucketUnits,
+    farSeed: lens.farSeed,
+    learnMaxJump: (dof * 5) / 6,
+    nudgeMin: dof / 10,
+    onePushAbove: 3.9 * lens.driveUnitsPerSec,
+    wideReferenceMaxZoom: lens.wideReferenceMaxZoom,
+    stillUnits: dof / 15,
+    servoBurst: dof / 5,
+    servoBigStep: dof / 2,
+    servoBigErr: dof,
+    servoZoomTol: lens.servoZoomTolUnits,
+    driveUps: lens.driveUnitsPerSec,
+  };
+}
 
 export interface FocusInput {
   now: number;
@@ -136,7 +159,11 @@ export class FocusController {
   private dirty = false;
   private lastSaveAt = 0;
 
-  constructor(private file: string | null = null, seed = true) {
+  private t: FocusTuning;
+
+  constructor(lens: CameraProfile["lens"]["focus"], private file: string | null = null, seed = true) {
+    this.t = focusTuning(lens);
+    const LUT_BUCKET = this.t.lutBucket;
     if (file) {
       try {
         const raw = JSON.parse(fs.readFileSync(file, "utf8")) as { bucket?: number; bands?: number; lut?: Record<string, LutEntry> };
@@ -150,14 +177,15 @@ export class FocusController {
         /* first run */
       }
     }
-    const tb = Math.round(TELE_SEED[0] / LUT_BUCKET) * 10 + 2;
-    if (seed && !this.lut.has(tb)) this.lut.set(tb, { focus: TELE_SEED[1], edgePx: 3, n: 0, at: 0 });
+    const [seedZoom, seedFocus] = this.t.farSeed;
+    const tb = Math.round(seedZoom / LUT_BUCKET) * 10 + 2;
+    if (seed && !this.lut.has(tb)) this.lut.set(tb, { focus: seedFocus, edgePx: 3, n: 0, at: 0 });
   }
 
   /** Learned sharp focus for exactly this zoom (its 4-unit bucket) and
    *  distance band (default: far). */
   learned(zoomUnits: number, band = 2): number | null {
-    const b = Math.round(zoomUnits / LUT_BUCKET) * 10;
+    const b = Math.round(zoomUnits / this.t.lutBucket) * 10;
     const v = this.lut.get(b + band)?.focus ?? this.interpolated(zoomUnits, band);
     if (v == null) return null;
     // Physics: a farther plane never needs a NEARER focus (larger value)
@@ -183,7 +211,7 @@ export class FocusController {
     let hi: { z: number; f: number } | null = null;
     for (const [k, e] of this.lut) {
       if (k % 10 !== band || e.n < 3) continue;
-      const z = Math.floor(k / 10) * LUT_BUCKET;
+      const z = Math.floor(k / 10) * this.t.lutBucket;
       if (z <= zoomUnits && zoomUnits - z <= 60 && (!lo || z > lo.z)) lo = { z, f: e.focus };
       if (z >= zoomUnits && z - zoomUnits <= 60 && (!hi || z < hi.z)) hi = { z, f: e.focus };
     }
@@ -200,7 +228,7 @@ export class FocusController {
    * where the lens's own zoom tracking would have kept it sharp.
    */
   trusted(zoomUnits: number, band: number, minN: number): number | null {
-    const b = Math.round(zoomUnits / LUT_BUCKET) * 10;
+    const b = Math.round(zoomUnits / this.t.lutBucket) * 10;
     const e = this.lut.get(b + band);
     if (!e || e.n < minN) return null;
     return this.learned(zoomUnits, band);
@@ -229,7 +257,7 @@ export class FocusController {
       // infinity (arrivals were randomly 600-1400 off). Reset the distance to
       // the far stop while still wide (cheap, invisible at wide): tracking
       // then lands near the tele far stop, a fixed ~250 units from sharp.
-      if (i.zoomUnits < WIDE_REFERENCE_MAX_ZOOM) out.push({ kind: "farReference" });
+      if (i.zoomUnits < this.t.wideReferenceMaxZoom) out.push({ kind: "farReference" });
       else out.push({ kind: "manual" });
       this.focusHist = [];
     }
@@ -256,7 +284,7 @@ export class FocusController {
     const still =
       recent.length >= 2 &&
       i.now - this.focusHist[0].t >= FOCUS_STILL_MS &&
-      Math.max(...recent.map((h) => h.f)) - Math.min(...recent.map((h) => h.f)) <= FOCUS_STILL_UNITS;
+      Math.max(...recent.map((h) => h.f)) - Math.min(...recent.map((h) => h.f)) <= this.t.stillUnits;
     const settled = i.zoomSettled && still;
 
     // Learn: a sharp plane at a settled zoom with the lens STILL → that focus
@@ -274,7 +302,7 @@ export class FocusController {
     // Continuous servo on the final approach: bursts toward the point learned
     // for the commanded stop, without waiting for the lens to settle.
     const cz = i.commandedZoom ?? i.zoomUnits;
-    const servoTarget = Math.abs(i.zoomUnits - cz) <= SERVO_ZOOM_TOL ? this.learned(cz, band) : null;
+    const servoTarget = Math.abs(i.zoomUnits - cz) <= this.t.servoZoomTol ? this.learned(cz, band) : null;
     this.debug = {
       lens: i.zoomUnits, cz, target: servoTarget, focus: i.focusUnits, settled, still,
       zoomSettled: i.zoomSettled, servoWaitMs: Math.max(0, this.servoUntil - i.now),
@@ -283,10 +311,10 @@ export class FocusController {
     };
     if (servoTarget != null && i.focusUnits != null && i.now >= this.servoUntil) {
       const err = servoTarget - i.focusUnits;
-      const big = Math.abs(err) > ONEPUSH_ABOVE_UNITS;
+      const big = Math.abs(err) > this.t.onePushAbove;
       // A big plane still soft near the learned point: the point is wrong
       // for it (distance) — hand over to a sweep instead of servoing on.
-      const softHere = this.softSince != null && i.now - this.softSince > 1500 && Math.abs(err) < 2 * ONEPUSH_ABOVE_UNITS;
+      const softHere = this.softSince != null && i.now - this.softSince > 1500 && Math.abs(err) < 2 * this.t.onePushAbove;
       // Big error on a plane the AF can see: sweep NOW (~400 u/s) rather
       // than crawl at ~80 u/s — and not "once settled": the servo's own
       // bursts kept the lens from ever settling, so the sweep never fired
@@ -296,7 +324,7 @@ export class FocusController {
       // the WRONG way to −2213 and the plane went from soft to a blur). A
       // sweep only when the plane stays soft right AT the learned point
       // (wrong point for this plane).
-      const sweepNow = softHere && Math.abs(err) < 2 * NUDGE_MIN_UNITS + 40 &&
+      const sweepNow = softHere && Math.abs(err) < 2 * this.t.nudgeMin + this.t.servoBigErr / 7.5 &&
         (i.targetPx ?? Infinity) >= SWEEP_MIN_TARGET_PX &&
         (i.sweepOk ?? i.locked) && i.now - this.lastOnePushAt > ONEPUSH_COOLDOWN_MS;
       void big;
@@ -308,9 +336,10 @@ export class FocusController {
         out.push({ kind: "onePush" });
         return out;
       }
-      if (!sweepNow && !sharpHere && Math.abs(err) > NUDGE_MIN_UNITS) {
-        const step = Math.sign(err) * Math.min(Math.abs(err), Math.abs(err) > 300 ? 150 : SERVO_BURST_UNITS);
-        this.servoUntil = i.now + (Math.abs(step) / 90) * 1000 + SERVO_GAP_MS;
+      if (!sweepNow && !sharpHere && Math.abs(err) > this.t.nudgeMin) {
+        const step = Math.sign(err) *
+          Math.min(Math.abs(err), Math.abs(err) > this.t.servoBigErr ? this.t.servoBigStep : this.t.servoBurst);
+        this.servoUntil = i.now + (Math.abs(step) / this.t.driveUps) * 1000 + SERVO_GAP_MS;
         this.lastActionAt = i.now;
         out.push({ kind: "nudge", deltaUnits: step, target: servoTarget });
         return out;
@@ -336,14 +365,14 @@ export class FocusController {
       return out;
     }
     // Arriving at a zoom we know: go straight to the learned point.
-    if (justSettled && !sharpHere && off != null && Math.abs(off) > 2 * NUDGE_MIN_UNITS) {
+    if (justSettled && !sharpHere && off != null && Math.abs(off) > 2 * this.t.nudgeMin) {
       this.lastActionAt = i.now;
       out.push({ kind: "nudge", deltaUnits: off, target: target! });
       return out;
     }
     // Soft on the plane for a moment: correct.
     if ((i.detected ?? i.locked) && this.softSince != null && i.now - this.softSince >= SOFT_HOLD_MS) {
-      if (off != null && Math.abs(off) > NUDGE_MIN_UNITS) {
+      if (off != null && Math.abs(off) > this.t.nudgeMin) {
         this.lastActionAt = i.now;
         this.softSince = null;
         out.push({ kind: "nudge", deltaUnits: off, target: target! });
@@ -359,10 +388,10 @@ export class FocusController {
   }
 
   private learn(zoom: number, band: number, focus: number, edgePx: number, now: number): void {
-    const b = Math.round(zoom / LUT_BUCKET) * 10 + band;
+    const b = Math.round(zoom / this.t.lutBucket) * 10 + band;
     const e = this.lut.get(b);
     if (!e) this.lut.set(b, { focus, edgePx, n: 1, at: now });
-    else if (Math.abs(focus - e.focus) > LEARN_MAX_JUMP) {
+    else if (Math.abs(focus - e.focus) > this.t.learnMaxJump) {
       return; // one wild "sharp" reading must not drag an entry
     } else {
       // Weight sharper observations more.
@@ -381,7 +410,7 @@ export class FocusController {
     this.dirty = false;
     try {
       fs.mkdirSync(dirname(this.file), { recursive: true });
-      fs.writeFileSync(this.file, JSON.stringify({ bucket: LUT_BUCKET, bands: BAND_EDGES_M.length + 1, lut: this.table() }));
+      fs.writeFileSync(this.file, JSON.stringify({ bucket: this.t.lutBucket, bands: BAND_EDGES_M.length + 1, lut: this.table() }));
     } catch {
       /* best-effort */
     }

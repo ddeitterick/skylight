@@ -96,7 +96,7 @@ function build(samples = synth(), events = EVENTS) {
     build: { version: "0c2cb9f", label: null, node: "v22.0.0" },
     tuning: {
       pursuit: "velocity", maxLeadSec: 3, panLatencySec: 0.6, tiltLatencySec: 0.4, rippleDeg: 0.5,
-      rippleTeleDeg: 0.25, rateFloorDegPerDps: 2.5, rateFloorMaxDeg: 12, lockedSigmaDeg: 0.35,
+      rippleTeleDeg: 0.25, maxSpeedStepFwps: 0.45, speedReachFrac: 0.8, lockedSigmaDeg: 0.35,
       correctionSlewDps: 2.5, kp: 1, ki: 0.6,
     },
     camera: { model: "TONGVEO 20x PTZ", width: 1920, height: 1080, fps: 30 },

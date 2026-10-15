@@ -3,7 +3,7 @@
 // replies are injected through onMessage the way the socket would.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { CameraLimits, ViscaUnitScale } from "@shared/index.js";
+import { TONGVEO_PROFILE, type CameraLimits, type ViscaUnitScale } from "@shared/index.js";
 import { ViscaCamera } from "../src/camera/visca.js";
 
 const UNITS: ViscaUnitScale = {
@@ -26,7 +26,7 @@ interface Internals {
 }
 
 function makeCam() {
-  const cam = new ViscaCamera({ ip: "127.0.0.1", port: 1, units: UNITS, limits: LIMITS });
+  const cam = new ViscaCamera({ ip: "127.0.0.1", port: 1, units: UNITS, limits: LIMITS, profile: () => TONGVEO_PROFILE });
   const sent: string[] = [];
   const c = cam as unknown as Internals;
   c.sendCommand = (p: number[]) => { sent.push(hex(p)); };
@@ -134,6 +134,39 @@ describe("zoom readings", () => {
     // a real zoom move still reads through
     reply7(c, "zoom", 1001);
     expect(c.pose?.zoomUnits).toBe(1001);
+  });
+
+  it("drops zoom readings the lens can't be at (2026-10-14 1085→113→1173)", () => {
+    const { cam, c } = makeCam();
+    reply7(c, "zoom", 1085);
+    cam.setZoom(1173);
+    vi.advanceTimersByTime(200);
+    reply7(c, "zoom", 113); // not where the lens is
+    expect(c.pose?.zoomUnits).toBe(1085);
+    vi.advanceTimersByTime(200);
+    reply7(c, "zoom", 1173);
+    expect(c.pose?.zoomUnits).toBe(1173);
+    // two in a row (1143 → 107 → 115 → …) are still dropped
+    for (const v of [107, 115]) {
+      vi.advanceTimersByTime(200);
+      reply7(c, "zoom", v);
+      expect(c.pose?.zoomUnits).toBe(1173);
+    }
+    // ...also after a long reply stall (1255 → 137 after 1.6 s without a zoom answer)
+    vi.advanceTimersByTime(1600);
+    reply7(c, "zoom", 137);
+    expect(c.pose?.zoomUnits).toBe(1173);
+    // a commanded zoom-out reads through at once
+    cam.setZoom(0);
+    vi.advanceTimersByTime(200);
+    reply7(c, "zoom", 900);
+    expect(c.pose?.zoomUnits).toBe(900);
+    // an uncommanded jump is believed on the third consistent reading
+    for (const [v, want] of [[1400, 900], [1400, 900], [1400, 1400]] as const) {
+      vi.advanceTimersByTime(200);
+      reply7(c, "zoom", v);
+      expect(c.pose?.zoomUnits).toBe(want);
+    }
   });
 
   it("flags a lens that ignores zoom commands (2026-10-12 21:56Z wedge)", () => {

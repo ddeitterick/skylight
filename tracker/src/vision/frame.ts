@@ -72,22 +72,29 @@ export function maskBelowWorld(
   minEl: (azDeg: number) => number,
   cell = 4,
 ): void {
-  for (let y0 = 0; y0 < h; y0 += cell) {
-    for (let x0 = 0; x0 < w; x0 += cell) {
-      const x1 = Math.min(w, x0 + cell);
-      const y1 = Math.min(h, y0 + cell);
+  // Each cell corner is shared by up to four cells: evaluate the corner grid
+  // once (toWorld + the horizon per corner was ~35% of the tracker's CPU
+  // while tracking when done four times per cell, 2026-10-15 profile).
+  const nx = Math.ceil(w / cell);
+  const ny = Math.ceil(h / cell);
+  const cx = (i: number) => Math.min(w, i * cell);
+  const cy = (j: number) => Math.min(h, j * cell);
+  const below = new Uint8Array((nx + 1) * (ny + 1));
+  for (let j = 0; j <= ny; j++) {
+    for (let i = 0; i <= nx; i++) {
+      const p = g.toWorld(cx(i) / w, cy(j) / h);
+      below[j * (nx + 1) + i] = p.elDeg < minEl(p.azDeg) ? 1 : 0;
+    }
+  }
+  for (let j = 0; j < ny; j++) {
+    for (let i = 0; i < nx; i++) {
       // Mask a cell when its LOWEST corner (in world elevation) is below —
       // conservative toward dropping ground clutter.
-      let below = false;
-      for (const [x, y] of [[x0, y1], [x1, y1], [x0, y0], [x1, y0]] as const) {
-        const p = g.toWorld(x / w, y / h);
-        if (p.elDeg < minEl(p.azDeg)) {
-          below = true;
-          break;
-        }
-      }
-      if (!below) continue;
-      for (let y = y0; y < y1; y++) residual.fill(0, y * w + x0, y * w + x1);
+      const k = j * (nx + 1) + i;
+      if (!(below[k] || below[k + 1] || below[k + nx + 1] || below[k + nx + 2])) continue;
+      const x0 = i * cell;
+      const x1 = Math.min(w, x0 + cell);
+      for (let y = j * cell; y < Math.min(h, (j + 1) * cell); y++) residual.fill(0, y * w + x0, y * w + x1);
     }
   }
 }

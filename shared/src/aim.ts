@@ -157,6 +157,44 @@ export function mountFromWorld(azDeg: number, elDeg: number, m: MountModel): Pan
 }
 
 /**
+ * Head axis rates (mechanical pan/tilt, deg/s) for a world direction moving
+ * at (azRate, elRate). On a level mount that is the world rate over the
+ * gains; on the wedge it is not — sending the world azimuth rate as the pan
+ * rate drove UAL875 (2026-10-14, 27° lean) at −82°/s where −24°/s was
+ * needed, and the head swung 46° past the plane. Differentiated through
+ * the lean as a 3-D direction, so it stays valid through the world zenith.
+ */
+export function mountRatesFromWorld(
+  azDeg: number, elDeg: number, azRateDps: number, elRateDps: number, m: MountModel,
+): { panDps: number; tiltDps: number } {
+  if (m.levelTiltDeg === 0) return { panDps: azRateDps / m.panGain, tiltDps: elRateDps / m.tiltGain };
+  const az = azDeg * DEG;
+  const el = elDeg * DEG;
+  const v = azElToVec(azDeg, elDeg);
+  // d(vec)/dt from the az/el rates (rad/s).
+  const dAz = azRateDps * DEG;
+  const dEl = elRateDps * DEG;
+  const dv: Vec3 = [
+    Math.cos(el) * Math.cos(az) * dAz - Math.sin(el) * Math.sin(az) * dEl,
+    -Math.cos(el) * Math.sin(az) * dAz - Math.sin(el) * Math.cos(az) * dEl,
+    Math.cos(el) * dEl,
+  ];
+  const h = 0.02;
+  const k = leanAxis(m.levelDirDeg);
+  const at = (s: number) => {
+    const p: Vec3 = [v[0] + s * dv[0], v[1] + s * dv[1], v[2] + s * dv[2]];
+    const n = Math.hypot(p[0], p[1], p[2]);
+    return vecToAzEl(rotate([p[0] / n, p[1] / n, p[2] / n], k, -m.levelTiltDeg));
+  };
+  const a = at(-h);
+  const b = at(h);
+  return {
+    panDps: norm180(b.azDeg - a.azDeg) / (2 * h) / m.panGain,
+    tiltDps: (b.elDeg - a.elDeg) / (2 * h) / m.tiltGain,
+  };
+}
+
+/**
  * The MOUNT frame: az/el measured in the pan/tilt head's own axes — what
  * the head's pan and tilt actually sweep (pan·gain + offset, tilt·gain +
  * offset), before the base's lean is applied. On a level mount it IS the
@@ -711,6 +749,21 @@ export function requiredHfovDeg(
  * linearly interpolated around the circle. `fallback` when the survey is
  * empty or absent.
  */
+/** The horizon table sorted by azimuth, computed once per table: the vision
+ *  skyline mask asks ~14 000 times a frame, and re-sorting the table on every
+ *  call was a quarter of the tracker's CPU while tracking (2026-10-15 profile). */
+const sortedHorizons = new WeakMap<object, { az: number; el: number }[]>();
+function sortedHorizon(horizon: { azDeg: number; minElDeg: number }[]): { az: number; el: number }[] {
+  let pts = sortedHorizons.get(horizon);
+  if (!pts || pts.length !== horizon.length) {
+    pts = [...horizon]
+      .map((p) => ({ az: norm360(p.azDeg), el: p.minElDeg }))
+      .sort((a, b) => a.az - b.az);
+    sortedHorizons.set(horizon, pts);
+  }
+  return pts;
+}
+
 export function horizonMinEl(
   horizon: { azDeg: number; minElDeg: number }[] | undefined,
   azDeg: number,
@@ -718,9 +771,7 @@ export function horizonMinEl(
 ): number {
   if (!horizon || horizon.length === 0) return fallback;
   if (horizon.length === 1) return horizon[0].minElDeg;
-  const pts = [...horizon]
-    .map((p) => ({ az: norm360(p.azDeg), el: p.minElDeg }))
-    .sort((a, b) => a.az - b.az);
+  const pts = sortedHorizon(horizon);
   const az = norm360(azDeg);
   // Neighbours around the circle.
   let lo = pts[pts.length - 1];

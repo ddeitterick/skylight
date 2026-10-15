@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { TONGVEO_PROFILE } from "@shared/index.js";
 import { FocusController, type FocusInput } from "../src/camera/focus.js";
+
+const LENS = TONGVEO_PROFILE.lens.focus;
 
 /** Feed the same input every 200 ms over [t0, t1]; collect all actions. */
 function run(f: FocusController, i: FocusInput, t0: number, t1: number) {
@@ -12,31 +15,31 @@ const base: FocusInput = { now: 0, zoomedIn: true, zoomUnits: 1200, zoomSettled:
 
 describe("FocusController", () => {
   it("seeds full tele and keys by exact zoom (no neighbour fallback)", () => {
-    const f = new FocusController();
+    const f = new FocusController(LENS);
     expect(f.learned(1437)).toBe(-3870);
     expect(f.learned(1404)).toBeNull();
-    const g = new FocusController(null, false);
+    const g = new FocusController(LENS, null, false);
     run(g, { ...base, zoomUnits: 1404, edgePx: 2.2, focusUnits: -2187 }, 0, 1200);
     expect(g.learned(1404)).toBe(-2187);
     expect(g.learned(1437)).toBeNull();
   });
 
   it("does not learn from implausible measurements", () => {
-    const f = new FocusController(null, false);
+    const f = new FocusController(LENS, null, false);
     f.update({ ...base, edgePx: 0.7 });
     f.update({ ...base, now: 100, edgePx: 2.0, edgeContrast: 10 });
     expect(f.learned(1200)).toBeNull();
   });
 
   it("holds manual focus on zoom-in and AF at wide, without driving the lens", () => {
-    const f = new FocusController();
+    const f = new FocusController(LENS);
     expect(f.update({ ...base, zoomedIn: false })).toEqual([{ kind: "auto" }]);
     expect(f.update({ ...base, now: 100 })).toEqual([{ kind: "manual" }]);
     expect(f.update({ ...base, now: 200, edgePx: 2.5 })).toEqual([]);
   });
 
   it("learns sharp positions and nudges straight there when soft", () => {
-    const f = new FocusController();
+    const f = new FocusController(LENS);
     // a moving lens teaches nothing; a still one does
     f.update({ ...base, now: 0, edgePx: 2.4, focusUnits: -3000 });
     f.update({ ...base, now: 200, edgePx: 2.4, focusUnits: -3500 });
@@ -49,7 +52,7 @@ describe("FocusController", () => {
     expect(acts).toEqual([{ kind: "nudge", deltaUnits: -60, target: -3870 }]);
     // far off with a learned point: servo, never the camera's sweep (it races
     // the wrong way at 20x)
-    const g = new FocusController(null, false);
+    const g = new FocusController(LENS, null, false);
     run(g, { ...base, edgePx: 2.4, focusUnits: -3870 }, 0, 1200);
     const b = run(g, { ...base, edgePx: 8, focusUnits: -2900 }, 9000, 11000);
     expect(b).not.toContainEqual({ kind: "onePush" });
@@ -57,7 +60,7 @@ describe("FocusController", () => {
   });
 
   it("servos toward the commanded stop's learned point during the final approach", () => {
-    const f = new FocusController();
+    const f = new FocusController(LENS);
     // still zooming (lens 200 short of the stop): no servo yet
     expect(f.update({ ...base, targetPx: 30, zoomUnits: 1237, commandedZoom: 1437, focusUnits: -1000 })).not.toContainEqual(
       expect.objectContaining({ kind: "nudge" }));
@@ -71,7 +74,7 @@ describe("FocusController", () => {
   });
 
   it("one-push only when nothing is learned, rate-limited", () => {
-    const f = new FocusController(null, false);
+    const f = new FocusController(LENS, null, false);
     f.update({ ...base, now: 0, edgePx: 7 });
     expect(f.update({ ...base, now: 800, edgePx: 7 })).toEqual([{ kind: "onePush" }]);
     f.update({ ...base, now: 3000, edgePx: 7 });
@@ -81,11 +84,11 @@ describe("FocusController", () => {
 
 describe("FocusController gating", () => {
   it("nudges a detected-but-off-centre soft plane; sweeps an undetectably soft one", () => {
-    const f = new FocusController();
+    const f = new FocusController(LENS);
     const acts = run(f, { ...base, zoomUnits: 1437, locked: false, detected: true, edgePx: 6, focusUnits: -3700 }, 0, 1600);
     expect(acts).toContainEqual({ kind: "nudge", deltaUnits: -60, target: -3870 });
     // nothing learned for this zoom/band and the plane is soft: sweep
-    const g = new FocusController(null, false);
+    const g = new FocusController(LENS, null, false);
     const b = run(g, { ...base, zoomUnits: 1300, locked: false, detected: true, edgePx: 7, sweepOk: true, focusUnits: -600 }, 0, 1600);
     expect(b).toContainEqual({ kind: "onePush" });
   });
@@ -93,14 +96,14 @@ describe("FocusController gating", () => {
 
 describe("FocusController by target size", () => {
   it("never sweeps a small (distant) plane; nudges it to the learned point instead", () => {
-    const f = new FocusController();
+    const f = new FocusController(LENS);
     const acts = run(f, { ...base, zoomUnits: 1437, locked: false, detected: false, sweepOk: true, targetPx: 25, focusUnits: -3200 }, 0, 1600);
     expect(acts).not.toContainEqual({ kind: "onePush" });
     expect(acts).toContainEqual({ kind: "nudge", deltaUnits: -150, target: -3870 });
   });
 
   it("resets the focus distance to the far stop when a pass starts wide", () => {
-    const f = new FocusController();
+    const f = new FocusController(LENS);
     f.update({ ...base, zoomedIn: false });
     expect(f.update({ ...base, now: 200, zoomUnits: 0 })).toEqual([{ kind: "farReference" }]);
   });
@@ -108,7 +111,7 @@ describe("FocusController by target size", () => {
 
 describe("FocusController distance bands", () => {
   it("keeps near and far planes' focus apart, and sweeps a big plane soft at the far point", () => {
-    const f = new FocusController(); // far band seeded at -3870 for 1437
+    const f = new FocusController(LENS); // far band seeded at -3870 for 1437
     expect(f.learned(1437, 2)).toBe(-3870);
     expect(f.learned(1437, 0)).toBeNull();
     // close plane (2 km), big, soft while sitting at -3850: hand over to a sweep
@@ -120,7 +123,7 @@ describe("FocusController distance bands", () => {
 
 describe("FocusController prefers the servo when a point is learned", () => {
   it("drives a big plane far off focus toward the learned point instead of sweeping", () => {
-    const f = new FocusController();
+    const f = new FocusController(LENS);
     const acts = run(f, { ...base, zoomUnits: 1437, commandedZoom: 1437, targetPx: 150, sweepOk: true, detected: true, edgePx: 8, focusUnits: -3100 }, 0, 1200);
     expect(acts).not.toContainEqual({ kind: "onePush" });
     expect(acts).toContainEqual({ kind: "nudge", deltaUnits: -150, target: -3870 });
@@ -129,11 +132,11 @@ describe("FocusController prefers the servo when a point is learned", () => {
 
 describe("FocusController robustness", () => {
   it("ignores a wild sample and keeps far bands no nearer than mid", () => {
-    const f = new FocusController(); // far seed -3870 @1437
+    const f = new FocusController(LENS); // far seed -3870 @1437
     run(f, { ...base, zoomUnits: 1437, edgePx: 2.2, focusUnits: -2600 }, 0, 1400); // bogus
     expect(f.learned(1437, 2)).toBe(-3870);
     // mid band learns -3900 (well supported); a far entry nearer than that is clamped
-    const g = new FocusController(null, false);
+    const g = new FocusController(LENS, null, false);
     run(g, { ...base, zoomUnits: 1437, slantM: 4000, edgePx: 2.0, focusUnits: -3900 }, 0, 3000);
     run(g, { ...base, zoomUnits: 1437, slantM: 7000, edgePx: 2.0, focusUnits: -3700 }, 4000, 5400);
     expect(g.learned(1437, 2)).toBe(-3900);
@@ -142,7 +145,7 @@ describe("FocusController robustness", () => {
 
 describe("FocusController interpolation", () => {
   it("interpolates between learned neighbours for an unlearned zoom", () => {
-    const f = new FocusController(null, false);
+    const f = new FocusController(LENS, null, false);
     run(f, { ...base, zoomUnits: 1332, edgePx: 2, focusUnits: -950 }, 0, 2000);
     run(f, { ...base, zoomUnits: 1384, edgePx: 2, focusUnits: -1920 }, 3000, 5000);
     const v = f.learned(1344)!;
@@ -154,7 +157,7 @@ describe("FocusController interpolation", () => {
 
 describe("FocusController never drives a sharp plane away", () => {
   it("holds a sharp close plane off a weak table point (DAL8926 at zoom 718)", () => {
-    const f = new FocusController(null, false);
+    const f = new FocusController(LENS, null, false);
     // a 4-sample near-band point at 720: −170
     run(f, { ...base, zoomUnits: 720, slantM: 1500, edgePx: 2.2, focusUnits: -170 }, 0, 1000);
     expect(f.learned(720, 0)).toBe(-170);

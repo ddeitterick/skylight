@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { speedTableAt, type SpeedRow } from "../src/camera/visca.js";
+import type { SpeedRow } from "@shared/index.js";
+import { speedTableAt } from "@shared/index.js";
 
 // Speed-by-zoom: the firmware scales drive speed with zoom, so the dither's
 // step→rate table must be looked up at the lens's CURRENT zoom.

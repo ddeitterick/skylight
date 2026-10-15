@@ -48,7 +48,8 @@ export const DEFAULT_MAX_BACKLOG = 200;
 const WARN_EVERY_MS = 10 * 60_000;
 const ID_RE = /^\d{8}T\d{6}Z-[0-9a-z~]+$/;
 
-export const CAMERA: PassCamera = { model: "TONGVEO 20x PTZ", width: 1920, height: 1080, fps: 30 };
+/** Stream format of the recorded clip (the model comes from tracker.camera). */
+export const CAMERA: PassCamera = { model: "", width: 1920, height: 1080, fps: 30 };
 
 export interface PassArchiveOptions {
   /** data/passes */
@@ -396,9 +397,11 @@ export class PassArchive {
       tiltLatencySec: cfg.predict.tiltLatencySec,
       rippleDeg: cfg.predict.rippleDeg,
       rippleTeleDeg: cfg.predict.rippleTeleDeg,
-      rateFloorDegPerDps: cfg.zoom.rateFloorDegPerDps,
-      rateFloorMaxDeg: cfg.zoom.rateFloorMaxDeg,
+      maxSpeedStepFwps: cfg.zoom.maxSpeedStepFwps,
+      speedReachFrac: cfg.zoom.speedReachFrac,
       lockedSigmaDeg: cfg.zoom.lockedSigmaDeg,
+      sigmaGrowthDps: cfg.zoom.sigmaGrowthDps,
+      aimLeadSec: cfg.predict.aimLeadSec,
       correctionSlewDps: cfg.vision.correctionSlewDps,
       kp: PURSUIT_KP,
       ki: PURSUIT_KI,
@@ -415,7 +418,18 @@ export class PassArchive {
       events: s.events,
       build: this.opts.build(),
       tuning,
-      camera: codec ? { ...CAMERA, codec } : CAMERA,
+      camera: { ...CAMERA, model: cfg.camera.model, ...(codec ? { codec } : {}) },
+      setup: {
+        mount: cfg.mount,
+        limits: {
+          panMinDeg: cfg.limits.panMinDeg, panMaxDeg: cfg.limits.panMaxDeg,
+          tiltMinDeg: cfg.limits.tiltMinDeg, tiltMaxDeg: cfg.limits.tiltMaxDeg,
+        },
+        horizon: cfg.limits.horizon ?? [],
+        fovLut: cfg.zoom.fovLut,
+        zoomStopUnits: cfg.zoom.stopUnits ?? [],
+        cameraModel: cfg.camera.model,
+      },
       media: {
         clip: clip?.path ? "clip.mp4" : null,
         poster: clip?.posterPath ? "poster.jpg" : null,

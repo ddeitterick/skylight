@@ -7,5 +7,6 @@ export * from "./messages.js";
 export * from "./geo.js";
 export * from "./route.js";
 export * from "./camera.js";
+export * from "./camera-profile.js";
 export * from "./aim.js";
 export * from "./tracker-messages.js";

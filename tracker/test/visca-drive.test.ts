@@ -5,7 +5,7 @@
 // state the way position replies would.
 
 import { describe, expect, it } from "vitest";
-import type { CameraLimits, ViscaUnitScale } from "@shared/index.js";
+import { TONGVEO_PROFILE, type CameraLimits, type ViscaUnitScale } from "@shared/index.js";
 import { ViscaCamera } from "../src/camera/visca.js";
 
 const UNITS: ViscaUnitScale = {
@@ -26,7 +26,7 @@ const LIMITS: CameraLimits = {
 };
 
 function makeCam(): ViscaCamera {
-  return new ViscaCamera({ ip: "127.0.0.1", port: 1, units: UNITS, limits: LIMITS });
+  return new ViscaCamera({ ip: "127.0.0.1", port: 1, units: UNITS, limits: LIMITS, profile: () => TONGVEO_PROFILE });
 }
 
 /** Inject a "position reply" the way onMessage would. */

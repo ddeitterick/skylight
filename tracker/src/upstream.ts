@@ -14,6 +14,59 @@ import {
   type ServerMessage,
 } from "@shared/index.js";
 
+/**
+ * Fields carried across polls. readsb now and then sends an aircraft with a
+ * field missing for one poll — the position (2026-10-15 00:18Z: a departure
+ * at 125 ft, the surface→airborne switch) or the climb rate (8 of today's
+ * departures right after lift-off). Downstream treated "missing" as "gone"
+ * or "not climbing": the departure lost its priority for one poll and the
+ * camera switched target and back (vision, zoom and the pass recording reset
+ * each time) — 21 of today's 29 quick switch-and-backs. A missing field is
+ * not a changed one: the last value is still the best estimate. Positions
+ * keep their true age (seenPos), so fixAgeSec/posStaleSec decide when they
+ * are too old; the slow kinematic fields are held at most CARRY_FIELDS_MS.
+ */
+const CARRY_FIELDS_MS = 10_000;
+type Kinematics = Pick<Aircraft, "altBaro" | "altGeom" | "gs" | "track" | "baroRate">;
+const KIN_KEYS = ["altBaro", "altGeom", "gs", "track", "baroRate"] as const;
+
+export class PositionCarry {
+  private last = new Map<string, { lat?: number; lon?: number; fixAt?: number; kin: Kinematics; kinAt: Partial<Record<keyof Kinematics, number>> }>();
+
+  /** Fill missing positions/kinematics in this snapshot from earlier polls (in place). */
+  apply(aircraft: Aircraft[], now: number): Aircraft[] {
+    const seen = new Set<string>();
+    for (const ac of aircraft) {
+      seen.add(ac.hex);
+      const ts = ac.ts ?? now;
+      const prev = this.last.get(ac.hex) ?? { kin: {}, kinAt: {} };
+      if (ac.lat != null && ac.lon != null) {
+        prev.lat = ac.lat;
+        prev.lon = ac.lon;
+        prev.fixAt = ts - 1000 * (ac.seenPos ?? ac.seen ?? 0);
+      } else if (prev.lat != null && prev.lon != null && prev.fixAt != null) {
+        ac.lat = prev.lat;
+        ac.lon = prev.lon;
+        ac.seenPos = Math.max(0, (ts - prev.fixAt) / 1000);
+      }
+      if (!ac.onGround) {
+        for (const k of KIN_KEYS) {
+          const v = ac[k];
+          if (v != null) {
+            (prev.kin as Record<string, unknown>)[k] = v;
+            prev.kinAt[k] = ts;
+          } else if (prev.kin[k] != null && ts - (prev.kinAt[k] ?? -Infinity) <= CARRY_FIELDS_MS) {
+            (ac as unknown as Record<string, unknown>)[k] = prev.kin[k];
+          }
+        }
+      }
+      this.last.set(ac.hex, prev);
+    }
+    for (const hex of this.last.keys()) if (!seen.has(hex)) this.last.delete(hex);
+    return aircraft;
+  }
+}
+
 export interface UpstreamEvents {
   onSnapshot?: (now: number, aircraft: Aircraft[]) => void;
   onConfig?: (config: Config) => void;
@@ -37,6 +90,7 @@ export class WsUpstream implements Upstream {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private config: Config = DEFAULT_CONFIG;
   private aircraft = new Map<string, Aircraft>();
+  private carry = new PositionCarry();
 
   constructor(
     private url: string,
@@ -112,10 +166,9 @@ export class WsUpstream implements Upstream {
       this.events.onConfig?.(this.config);
     } else if (msg.type === "aircraft") {
       this.aircraft.clear();
-      for (const ac of msg.aircraft) {
-        if (ac.ts == null) ac.ts = msg.now;
-        this.aircraft.set(ac.hex, ac);
-      }
+      for (const ac of msg.aircraft) if (ac.ts == null) ac.ts = msg.now;
+      this.carry.apply(msg.aircraft, msg.now);
+      for (const ac of msg.aircraft) this.aircraft.set(ac.hex, ac);
       this.events.onSnapshot?.(msg.now, msg.aircraft);
     }
   }
@@ -127,6 +180,7 @@ export class WsUpstream implements Upstream {
  */
 export class ReplayUpstream implements Upstream {
   private aircraft = new Map<string, Aircraft>();
+  private carry = new PositionCarry();
   private config: Config = DEFAULT_CONFIG;
   private timers: ReturnType<typeof setTimeout>[] = [];
   private running = false;
@@ -168,6 +222,7 @@ export class ReplayUpstream implements Upstream {
             ...ac,
             ts: (ac.ts ?? snap.t) + shift,
           }));
+          this.carry.apply(shifted, now);
           for (const ac of shifted) this.aircraft.set(ac.hex, ac);
           this.events.onSnapshot?.(wall0 + delay * this.speed, shifted);
         }, delay),

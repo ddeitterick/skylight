@@ -74,10 +74,19 @@ Sent by the Pi as `POST /ingest/<id>`; stored verbatim in D1 `meta`; returned by
   "build": { "version": "0c2cb9f", "label": "16:52 build — tele ripple 0.25, tilt budget 9/16", "node": "v22.x" },
   "tuning": {                          // snapshot of the live config that matters
     "pursuit": "velocity", "maxLeadSec": 3, "panLatencySec": 0.6, "tiltLatencySec": 0.4,
-    "rippleDeg": 0.5, "rippleTeleDeg": 0.25, "rateFloorDegPerDps": 2.5, "rateFloorMaxDeg": 12,
+    "rippleDeg": 0.5, "rippleTeleDeg": 0.25, "maxSpeedStepFwps": 0.45, "speedReachFrac": 0.8, // (rateFloor* before 2026-10-14)
     "lockedSigmaDeg": 0.35, "correctionSlewDps": 2.5, "kp": 1.0, "ki": 0.6
   },
   "camera": { "model": "TONGVEO 20x PTZ", "width": 1920, "height": 1080, "fps": 30 },
+  "setup": {                           // schema 1.4 (optional): the install's geometry, for viewers (3D replay)
+    "mount": { "panOffsetDeg": 27.8, "tiltOffsetDeg": 1.9, "panGain": 0.978, "tiltGain": 0.985,
+               "levelTiltDeg": 27.35, "levelDirDeg": 218.0 },   // pose → world az/el: shared/src/aim.ts worldFromMount
+    "limits": { "panMinDeg": -175, "panMaxDeg": 175, "tiltMinDeg": -20, "tiltMaxDeg": 85 },
+    "horizon": [ { "azDeg": 0, "minElDeg": 18 }, ... ],      // surveyed skyline (world az → min el)
+    "fovLut": [ { "units": 0, "hfovDeg": 56.48 }, ... ],     // zoom units → horizontal FOV
+    "zoomStopUnits": [1437, 1385, ...],
+    "cameraModel": "TONGVEO 20x PTZ"
+  },                                   // angles only — nothing locates the camera
   "license": "Videos and posters: © Skylight (Cameron Paczek). Free for non-commercial use with credit to skylightceiling.com; NOT covered by the repository's MIT license. Commercial use requires permission — see https://skylightceiling.com/passes#license",
   "media": {
     "clip": "clip.mp4", "poster": "poster.jpg", "series": "series.json",

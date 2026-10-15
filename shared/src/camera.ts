@@ -98,11 +98,17 @@ export interface TargetCriteria {
   /** A challenger must beat the current target's score by this margin. */
   switchMargin: number;
   /**
-   * Skip aircraft within this many degrees of the sun (absent = 15). The
-   * zoomed lens pointed at the sun is a blown-out frame at best and a
-   * sensor burn at worst.
+   * Fallback sun keep-out for selection, deg (absent = 15) — used only when
+   * the caller doesn't pass a frame-based keep-out (the tracker does: see
+   * sunMarginDeg and tracker/src/pointing/sun.ts).
    */
   sunAvoidDeg?: number;
+  /**
+   * The sun is kept this far outside the picture (beyond the frame's
+   * half-diagonal), deg (absent = 5). Near the sun the camera stays zoomed
+   * in; when even full tele can't keep it out, the aim holds at the edge.
+   */
+  sunMarginDeg?: number;
   /** Departures from the home airport heading at the site win selection
    *  from lift-off (default true). */
   departurePriority?: boolean;
@@ -271,7 +277,7 @@ export interface TrackerState {
     hfovDeg: number | null;
     /** Angular size of the aircraft, deg (for framing display). */
     angularSizeDeg: number | null;
-    /** Which rule set the zoom (frameLocked/frameOpen/ladderN/rateFloor/gearFloor/zenith, "+held" = debounce). */
+    /** Which rule set the zoom (frameLocked/frameOpen/ladderN/speedFloor/zenith; before 2026-10-14 rateFloor/gearFloor; "+held" = debounce). */
     zoomWhy?: string;
   };
   candidates: Candidate[];

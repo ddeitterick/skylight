@@ -3,8 +3,11 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  azElFromSite,
   mountFromWorld,
+  mountRatesFromWorld,
   norm180,
+  predictGeo,
   solveMount,
   worldFromMount,
   type CalibrationSample,
@@ -124,5 +127,44 @@ describe("solveMount", () => {
     expect(result).not.toBeNull();
     const worst = result!.residualsDeg.indexOf(Math.max(...result!.residualsDeg));
     expect(worst).toBe(3);
+  });
+});
+
+describe("mountRatesFromWorld", () => {
+  const WEDGE: MountModel = {
+    panOffsetDeg: 27.8, tiltOffsetDeg: 1.9, panGain: 0.978, tiltGain: 0.985,
+    levelTiltDeg: 27.35, levelDirDeg: 218,
+  };
+  const site = { lat: 37.62, lon: -122.38, altM: 0 };
+  // A 777 departure ~380 m overhead at 190 kt (UAL875, 2026-10-14).
+  const kin = { lat: 37.62 - 0.012, lon: -122.38 + 0.0006, altM: 350, gsKt: 190, trackDeg: 340 };
+
+  it("is the world rate over the gains on a level mount", () => {
+    const r = mountRatesFromWorld(120, 40, 10, -3, { ...WEDGE, levelTiltDeg: 0 });
+    expect(r.panDps).toBeCloseTo(10 / 0.978, 6);
+    expect(r.tiltDps).toBeCloseTo(-3 / 0.985, 6);
+  });
+
+  it("matches the head's actual pan/tilt motion along an overhead pass on the wedge", () => {
+    let worst = 0;
+    let worstWorld = 0;
+    for (let t = 0; t <= 40; t += 0.25) {
+      const p0 = azElFromSite(site, predictGeo(kin, t - 0.01));
+      const p1 = azElFromSite(site, predictGeo(kin, t + 0.01));
+      const p = azElFromSite(site, predictGeo(kin, t));
+      if (p.elDeg < 10 || p.elDeg > 88) continue;
+      const azRate = norm180(p1.azDeg - p0.azDeg) / 0.02;
+      const elRate = (p1.elDeg - p0.elDeg) / 0.02;
+      const m0 = mountFromWorld(p0.azDeg, p0.elDeg, WEDGE);
+      const m1 = mountFromWorld(p1.azDeg, p1.elDeg, WEDGE);
+      const truePan = norm180((m1.panDeg - m0.panDeg) * WEDGE.panGain) / WEDGE.panGain / 0.02;
+      const trueTilt = (m1.tiltDeg - m0.tiltDeg) / 0.02;
+      const r = mountRatesFromWorld(p.azDeg, p.elDeg, azRate, elRate, WEDGE);
+      worst = Math.max(worst, Math.abs(r.panDps - truePan), Math.abs(r.tiltDps - trueTilt));
+      // what the loop used to send: world rate / gain
+      worstWorld = Math.max(worstWorld, Math.abs(azRate / WEDGE.panGain - truePan));
+    }
+    expect(worst).toBeLessThan(0.3);
+    expect(worstWorld).toBeGreaterThan(5); // the bug this replaces
   });
 });

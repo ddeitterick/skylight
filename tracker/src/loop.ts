@@ -12,6 +12,7 @@
 // auto-calibration.
 
 import {
+  DEFAULT_CONFIG,
   horizonMinEl,
   AxisTracker,
   azElFromSite,
@@ -19,13 +20,16 @@ import {
   fixTimeMs,
   hfovFromZoomUnits,
   mountFrameFromWorld,
+  worldFromMountFrame,
   mountFromWorld,
+  mountRatesFromWorld,
   norm180,
   SAME_FIX_MS,
   worldFromMount,
   zoomUnitsFromHfov,
   type Aircraft,
   type GeoPoint,
+  type MountModel,
   type CalibrationRef,
   type CameraPose,
   type Config,
@@ -50,10 +54,12 @@ import {
   shiftDeg,
   type LandmarkSet,
 } from "./calibration/landmarks.js";
-import { planPass, zenithHold, ZENITH_MIN_HFOV } from "./pointing/planner.js";
+import { alongTrackSec, LeadLearner } from "./pointing/leadLearn.js";
+import { parkLimits, planPass, zenithHold, ZENITH_MIN_HFOV } from "./pointing/planner.js";
 import { predictAim, TrackHistory, type Prediction } from "./pointing/predict.js";
 import { selectTarget, type CurrentTarget } from "./pointing/target.js";
-import { chooseZoom, snapToStop, zoomStopsHfov } from "./pointing/zoom.js";
+import { chooseZoom, snapToStop, speedFloorHfov, zoomStopsHfov } from "./pointing/zoom.js";
+import { SUN_MARGIN_DEG, maxHfovForSun, pushAimFromSun, sunKeepOutDeg, sunSepDeg } from "./pointing/sun.js";
 import { distanceBand, FocusController } from "./camera/focus.js";
 import { nextPlane, type NextPlane } from "./pointing/nextPass.js";
 import { decodeLuma, VISION_W, VISION_H, type Detection } from "./vision/detect.js";
@@ -72,9 +78,12 @@ import type { Upstream } from "./upstream.js";
 import type { VideoStream } from "./video/stream.js";
 
 const TRACKER_DIR = dirname(fileURLToPath(import.meta.url));
-const AUTOCAL_FILE = resolve(TRACKER_DIR, "../data/autocal.json");
-const LANDMARK_FILE = resolve(TRACKER_DIR, "../data/landmarks.json");
-const FOCUS_LUT_FILE = resolve(TRACKER_DIR, "../data/focus-lut.json");
+/** Learned stores (autocal, landmarks, focus); SKYLIGHT_TRACKER_DATA
+ *  redirects them (simulation runs must not touch the real ones). */
+const DATA_DIR = process.env.SKYLIGHT_TRACKER_DATA ?? resolve(TRACKER_DIR, "../data");
+const AUTOCAL_FILE = resolve(DATA_DIR, "autocal.json");
+const LANDMARK_FILE = resolve(DATA_DIR, "landmarks.json");
+const FOCUS_LUT_FILE = resolve(DATA_DIR, "focus-lut.json");
 /** Landmark check cadence: first one shortly after start (a remount is
  *  usually followed by a restart), then daily; retries after a failed or
  *  aborted check. */
@@ -113,6 +122,9 @@ const SWEEP_FLOOR_ERR_DEG = 1.0;
 const HOLD_RETARGET_DEG = 4;
 /** Per-tick EMA gain for the ripple's slow mean (τ ≈ 1.3 s at 15 Hz). */
 const RIPPLE_LP_K = 0.05;
+/** Longest tick period integrated as elapsed time, s (a stall beyond this
+ *  is not dead-reckoned through in one step). */
+const TICK_DT_MAX_S = 0.5;
 /** Correction glide time constant, s (first-order approach to the bias). */
 const CORR_TAU_S = 0.6;
 /** Commanded-rate jerk limit: deg/s² per degree of HFOV, with a floor. */
@@ -166,9 +178,8 @@ const LADDER_LOST_MS = 6000;
 const ZOOM_ARRIVE_GRACE_MS = 1500;
 /** Learn the vision bias only while the aim moves slower than this, deg/s. */
 const BIAS_MAX_AIM_RATE_DPS = 3;
-/** Zoom-Focus Direct only at/above this zoom (the tele stops)... */
-const ZOOM_FOCUS_MIN_UNITS = 1173;
-/** ...and only for a focus learned from at least this many sharp frames. */
+/** Zoom-Focus Direct only at/above the lens's directMinZoomUnits, and only
+ *  for a focus learned from at least this many sharp frames. */
 const ZOOM_FOCUS_MIN_SAMPLES = 20;
 /** A plane dropped for a challenger can't win the camera back for this long. */
 const TARGET_COOLDOWN_MS = 45_000;
@@ -182,21 +193,23 @@ const TARGET_COOLDOWN_MS = 45_000;
 // time, and the fast pace only for a long, dead-centred lock.
 const LADDER_MS = 1500;
 const LADDER_FAST_MS = 1000;
-/** Catch-up braking horizon, s: a reactive rate above |err|/this would
- *  overshoot once command latency and the motor's stop are counted. */
-const BRAKE_SEC = 0.6; // measured pan command→motion latency ≈0.5-0.8 s
-/** Pan rate cap while handing over from the overhead park, deg/s — and the
- *  looser cap used while the head is still far from the plane. */
-const FOLLOW_PAN_MAX_DPS = 25;
-const FOLLOW_CATCHUP_ERR_DEG = 20;
-const FOLLOW_CATCHUP_MAX_DPS = 45;
-/** Azimuth feedforward weight while in / just after a crossing. */
-const FF_SCALE_CROSSING = 0.4;
-/** Aim lead cap (beyond the fix age) during / just after a crossing, s. */
-const SHORT_LEAD_SEC = 0.4;
 /** Velocity-pursuit PI gains (exported for the pass archive's tuning snapshot). */
 export const PURSUIT_KP = 1.0; // 1/s — 1.3 rang at ~0.5 Hz on slow legs (measured tilt latency ~0.1 s)
 export const PURSUIT_KI = 0.6; // 1/s² — converges in ~2-3 s, anti-windup below
+
+/**
+ * A world-frame aim prediction in HEAD axes: mount-frame az/el (pan·gain +
+ * offset, tilt·gain + offset) and their rates. On a level mount it is the
+ * prediction itself; on a tilted base the two differ everywhere.
+ */
+function headAxes(
+  p: { azEl: { azDeg: number; elDeg: number }; azRateDps: number; elRateDps: number },
+  m: MountModel,
+): { azDeg: number; elDeg: number; azRateDps: number; elRateDps: number } {
+  const f = mountFrameFromWorld(p.azEl.azDeg, p.azEl.elDeg, m);
+  const r = mountRatesFromWorld(p.azEl.azDeg, p.azEl.elDeg, p.azRateDps, p.elRateDps, m);
+  return { azDeg: f.azDeg, elDeg: f.elDeg, azRateDps: r.panDps * m.panGain, elRateDps: r.tiltDps * m.tiltGain };
+}
 
 /**
  * Discrete moments in a pass, mirrored from the recorder sites so observers
@@ -240,10 +253,16 @@ export class ControlLoop {
   /** Idle ready-position state. */
   private lastTargetAt = 0;
   private atHome = false;
+  /** Where the idle park last went (re-parked when the sun guard moves it). */
+  private homeAim: { azDeg: number; elDeg: number } | null = null;
+  /** The aim is held at the sun keep-out boundary this tick (pointing/sun.ts). */
+  private sunHeld = false;
   /** Snapshot of the camera options the live driver was built with. */
   private driverOptsKey: string | null = null;
   /** Last commanded velocity rates (direction-flip hysteresis + accel cap). */
   private lastPanRateCmd = 0;
+  /** When the previous tick ran (real tick period, see tick()). */
+  private lastTickAt = 0;
   private lastTiltRateCmd = 0;
   /** Low-passed pose error for the velocity P term (pose-snap spike damping). */
   private errPanLP = 0;
@@ -282,7 +301,8 @@ export class ControlLoop {
   /** Continuous auto-calibration from locked passes. */
   private autoCal = new AutoCalibrator(AUTOCAL_FILE);
   private landmarks = new LandmarkStore(LANDMARK_FILE);
-  private focus = new FocusController(FOCUS_LUT_FILE);
+  /** Built in the constructor: needs the lens description from the config. */
+  private focus!: FocusController;
   private lmRunning = false;
   private lmAbort = false;
   private lmNextAt = Date.now() + LM_FIRST_DELAY_MS;
@@ -317,13 +337,13 @@ export class ControlLoop {
   private wrapReleasedAt = 0;
   private wrapGoal = 0;
   /** Gear-aware zoom floor currently applied (0 = none); hysteresis state. */
-  private gearFloorHfov = 0;
+  private speedFloorHfov = 0;
   /** Wall time of the most recent fresh detection (survives lastDetection = null). */
   private lastDetSeenAt = 0;
+  /** Last tick with a fresh, motion-consistent lock on this target (0 = none yet). */
+  private lastLockFreshAt = 0;
   /** This pass was classified as a zenith pass inbound (see zenithHold). */
   private zenithLatched = false;
-  /** When the crossing regime was last released (short-lead window). */
-  private zenithExitAt = 0;
   /** Last tick the search clock was held (plane below the skyline, or the
    *  overhead park/hand-over) — acquisition time only counts while the plane
    *  can actually be seen. */
@@ -418,7 +438,9 @@ export class ControlLoop {
       lastUploadedId: null,
       lastError: null,
     }),
-  ) {}
+  ) {
+    this.focus = new FocusController(this.cfg().camera.lens.focus, FOCUS_LUT_FILE);
+  }
 
   /** Subscribe to pass events (target changes, zenith/wrap regimes, focus). */
   onEvent(cb: (e: LoopEvent) => void): () => void {
@@ -597,8 +619,8 @@ export class ControlLoop {
           v: nextPlane(
             this.upstream.getAircraft(), cfg.site, now, cfg.target, cfg.limits.horizon,
             this.current,
-            cfg.target.departurePriority === false ? null : (this.upstream.getConfig().airport ?? SFO_ARP),
-            this.sunAt(cfg.site, now),
+            cfg.target.departurePriority === false ? null : (this.upstream.getConfig().airport ?? DEFAULT_CONFIG.airport),
+            this.sunForSelection(cfg, now),
             cfg.targetMode,
             this.targetCooldown,
           ),
@@ -622,7 +644,7 @@ export class ControlLoop {
     // Elsewhere tracking preserves the current focus DISTANCE, which is right
     // for the plane already in focus; forcing a table value there defocused a
     // close plane instantly (see FocusController.trusted).
-    const f = d.setZoomFocus && zoomUnits >= ZOOM_FOCUS_MIN_UNITS
+    const f = d.setZoomFocus && zoomUnits >= this.cfg().camera.lens.focus.directMinZoomUnits
       ? this.focus.trusted(zoomUnits, distanceBand(slantM), ZOOM_FOCUS_MIN_SAMPLES)
       : null;
     if (f != null) d.setZoomFocus!(zoomUnits, f);
@@ -630,6 +652,36 @@ export class ControlLoop {
   }
 
   /** Sun direction, refreshed every 30 s (it moves ~0.25°/min). */
+  /** The idle park direction, kept out of the sun's way for the wide lens
+   *  it parks at (a morning sun sits right over the airport bearing). */
+  private homeAimNow(cfg: TrackerConfig, now: number): { azDeg: number; elDeg: number } {
+    const azDeg =
+      cfg.home.mode === "sfo" // "face the configured airport" (named for the first site)
+        ? azElFromSite(cfg.site, { ...(this.upstream.getConfig().airport ?? DEFAULT_CONFIG.airport), altM: cfg.site.altM }).azDeg
+        : cfg.home.azDeg;
+    const sun = this.sunAt(cfg.site, now);
+    if (!sun) return { azDeg, elDeg: cfg.home.elDeg };
+    const wide = hfovFromZoomUnits(cfg.units.zoomWideUnits, cfg.zoom.fovLut);
+    const g = pushAimFromSun({ azDeg, elDeg: cfg.home.elDeg }, sun, sunKeepOutDeg(wide, cfg.target.sunMarginDeg ?? SUN_MARGIN_DEG));
+    return { azDeg: g.azDeg, elDeg: g.elDeg };
+  }
+
+  /** The sun has moved the guarded park direction by more than a degree. */
+  private homeMoved(cfg: TrackerConfig, now: number): boolean {
+    if (!this.homeAim) return false;
+    const h = this.homeAimNow(cfg, now);
+    return sunSepDeg(h, { azDeg: this.homeAim.azDeg, elDeg: this.homeAim.elDeg }) > 1;
+  }
+
+  /** The sun with the separation inside which no zoom keeps it out of the
+   *  picture — planes closer than that can't be filmed (pointing/sun.ts). */
+  private sunForSelection(cfg: TrackerConfig, now: number): { azDeg: number; elDeg: number; keepOutDeg: number } | null {
+    const sun = this.sunAt(cfg.site, now);
+    if (!sun) return null;
+    const tele = Math.min(...cfg.zoom.fovLut.map((p) => p.hfovDeg));
+    return { ...sun, keepOutDeg: sunKeepOutDeg(tele, cfg.target.sunMarginDeg ?? SUN_MARGIN_DEG) };
+  }
+
   private sunAt(site: GeoPoint, now: number): { azDeg: number; elDeg: number } | null {
     if (!this.sunCache || now - this.sunCache.t > 30_000) {
       const sun = visibleBodies(site, now, -5).find((b) => b.name === "Sun");
@@ -795,6 +847,7 @@ export class ControlLoop {
 
   /** Bias corrections sampled while locked this pass, head frame (mount az, el deg). */
   private passBias: { az: number; el: number }[] = [];
+  private leadLearn = new LeadLearner();
   private biasSampleAt = 0;
   /** Recent passes' median corrections, newest last. */
   private biasHistory: { az: number; el: number; t: number }[] = [];
@@ -808,6 +861,19 @@ export class ControlLoop {
    * the median into the offsets (off_new = off − corr), shift auto-cal's
    * samples by the same delta, and have the landmark references re-shot.
    */
+  /** End of a pass: fold the agreed along-track timing error into the aim
+   *  lead (pointing/leadLearn.ts) — replaces a hand-set aimLeadSec. */
+  private foldLead(now: number): void {
+    const cfg = this.cfg();
+    const lead = cfg.predict.aimLeadSec ?? 0;
+    const r = this.leadLearn.endPass(now, lead);
+    if (!r || !cfg.predict.learnAimLead) return;
+    const leadSec = Math.round(r.leadSec * 100) / 100;
+    this.upstream.patchConfig({ tracker: { predict: { aimLeadSec: leadSec } } } as Partial<Config>);
+    this.recorder.write("leadFold", { from: lead, to: leadSec, medianSec: r.medianSec });
+    console.log(`[tracker] aim lead ${lead.toFixed(2)} → ${leadSec.toFixed(2)} s (plane ${r.medianSec >= 0 ? "ahead" : "behind"} by ${Math.abs(r.medianSec).toFixed(2)} s over the last passes)`);
+  }
+
   private foldPassBias(now: number): void {
     const b = this.passBias;
     this.passBias = [];
@@ -863,13 +929,13 @@ export class ControlLoop {
     this.wasHold = false;
     this.wrapHolding = false;
     this.zenithLatched = false;
-    this.zenithExitAt = 0;
     this.biasOutliers = 0;
     this.detHops = 0;
     this.lockMotionOk = false;
     this.lastResidFrac = 1;
     this.lockHits = 0;
     this.lagDegLP = 0;
+    this.lastLockFreshAt = 0;
     this.ripplePanLP = 0;
     this.rippleTiltLP = 0;
     this.cmdHist.length = 0;
@@ -890,6 +956,16 @@ export class ControlLoop {
   private tick(): void {
     const now = Date.now();
     const cfg = this.cfg();
+    // Real time since the previous tick. The loop is scheduled at commandHz
+    // but runs at ~7-8 Hz while tracking (vision load, 2026-10-14: median
+    // 140 ms between ticks): integrating with the nominal 1/commandHz moved
+    // the setpoint, the integrator and the correction glide at half speed —
+    // at tele the setpoint trailed the plane by a median 1.2° at 1-2°/s and
+    // 4.3° at 2-3°/s (EIN961 walked off the corner of a 4° frame).
+    const tickDt = this.lastTickAt > 0
+      ? clamp((now - this.lastTickAt) / 1000, 0.001, TICK_DT_MAX_S)
+      : 1 / (cfg.predict.commandHz || 15);
+    this.lastTickAt = now;
     const d = this.driver();
     const pose = d.getPose();
     // Dead-reckoned current pose: position replies stall around drives, so
@@ -919,8 +995,8 @@ export class ControlLoop {
       undefined,
       undefined,
       cfg.limits.horizon,
-      this.sunAt(cfg.site, now),
-      cfg.target.departurePriority === false ? null : (this.upstream.getConfig?.()?.airport ?? SFO_ARP),
+      this.sunForSelection(cfg, now),
+      cfg.target.departurePriority === false ? null : (this.upstream.getConfig?.()?.airport ?? DEFAULT_CONFIG.airport),
       this.targetCooldown,
     );
 
@@ -937,6 +1013,7 @@ export class ControlLoop {
         }
         for (const [h, until] of this.targetCooldown) if (until <= now) this.targetCooldown.delete(h);
         this.foldPassBias(now);
+        this.foldLead(now);
         this.current = hex ? { hex, sinceMs: now } : null;
         this.resetSetpoint();
         this.recorder.write("target", { hex });
@@ -948,23 +1025,20 @@ export class ControlLoop {
     }
 
     if (tracking && targetAc) {
-      // Near and just after an overhead crossing the azimuth rate is large
-      // and collapsing fast: a ~1 s lead then puts the goal 20-30° of pan
-      // ahead, and as the rate collapses the goal RETREATS onto a head that
-      // is still swinging toward it (observed: 29° overshoot, 7 s to
-      // re-lock). Keep the lead short there; vision centres the rest.
-      const shortLead = this.zenithLatched || now - this.zenithExitAt < 3000;
+      // (A short-lead/no-lead rule around overhead crossings, FF_SCALE_CROSSING
+      // and the follow-phase pan caps were removed 2026-10-14: patches over
+      // the world-frame feedforward bug; no effect in the loop twin since.)
       const curPT = poseEst ? { panDeg: poseEst.panDeg, tiltDeg: poseEst.tiltDeg } : null;
       // Setpoint lead per axis = actuator latency + the aim-only lead (the
       // latter is NOT in the cmdAt() error reference below, so it shifts
       // where the head ends up instead of cancelling out).
-      const aimLead = shortLead ? 0 : cfg.predict.aimLeadSec ?? 0;
+      const aimLead = cfg.predict.aimLeadSec ?? 0;
       const tiltLat = (cfg.predict.tiltLatencySec ?? 0.4) + aimLead;
       const panLat = (cfg.predict.panLatencySec ?? 0.6) + aimLead;
       const baseP = { ...cfg.predict, motorLatencySec: tiltLat };
       prediction = predictAim(
         targetAc, cfg.site, now, this.history,
-        shortLead ? { ...baseP, maxLeadSec: SHORT_LEAD_SEC } : baseP,
+        baseP,
         cfg.mount, cfg.limits, curPT,
       );
       // The pan axis answers ~0.6 s after a command (tilt ~0.15 s): its
@@ -974,7 +1048,7 @@ export class ControlLoop {
       // ago, so the loop sees only true deviations.)
       const predAzLead = predictAim(
         targetAc, cfg.site, now, this.history,
-        shortLead ? { ...cfg.predict, motorLatencySec: panLat, maxLeadSec: SHORT_LEAD_SEC } : { ...cfg.predict, motorLatencySec: panLat },
+        { ...cfg.predict, motorLatencySec: panLat },
         cfg.mount, cfg.limits, curPT,
       );
       if (prediction && predAzLead) azLeadPred = predAzLead;
@@ -987,13 +1061,12 @@ export class ControlLoop {
         mount: cfg.mount,
         panMinDeg: cfg.limits.panMinDeg,
         panMaxDeg: cfg.limits.panMaxDeg,
-      });
+      }, parkLimits(cfg.camera, cfg.zoom.speedReachFrac));
       const headEl = mountFrameFromWorld(prediction.azEl.azDeg, prediction.azEl.elDeg, cfg.mount).elDeg;
       const hold = zenithHold(plan, headEl, this.zenithLatched);
       if (hold?.phase === "park") this.zenithLatched = true;
       else if (!hold && this.zenithLatched) {
         this.zenithLatched = false; // released: cone left
-        this.zenithExitAt = now;
         this.emit({ kind: "zenith", t: now, phase: "release" });
       }
 
@@ -1025,8 +1098,9 @@ export class ControlLoop {
         // Park on the exit azimuth, tilt just under vertical, fly-through.
         az = hold!.azDeg;
         el = hold!.elDeg;
-        this.azTracker.reset(az);
-        this.elTracker.reset(el);
+        const hm = mountFrameFromWorld(az, el, cfg.mount);
+        this.azTracker.reset(hm.azDeg);
+        this.elTracker.reset(hm.elDeg);
         this.lastObservedTs = 0; // re-seed the filters on regime exit
         // The crossing reverses the needed pan rate — an inbound-learned
         // rate deficit is wrong-signed outbound.
@@ -1045,16 +1119,26 @@ export class ControlLoop {
           // the frame; the vision correction holds the plane meanwhile.
           const hPrev = this.lastState?.target.hfovDeg ?? 56;
           const stepMax = hPrev < 10 ? 0.06 * hPrev : Infinity;
-          this.azTracker.observe(pa.azEl.azDeg, dtFix, pa.azRateDps, stepMax);
-          this.elTracker.observe(prediction.azEl.elDeg, dtFix, prediction.elRateDps, stepMax);
+          const hp = headAxes(pa, cfg.mount);
+          const ht = headAxes(prediction, cfg.mount);
+          this.azTracker.observe(hp.azDeg, dtFix, hp.azRateDps, stepMax);
+          this.elTracker.observe(ht.elDeg, dtFix, ht.elRateDps, stepMax);
           this.lastObservedTs = fixTs;
         }
         // Follow the predictor's current rates between fixes (see steer()).
-        this.azTracker.steer((azLeadPred ?? prediction).azRateDps);
-        this.elTracker.steer(prediction.elRateDps);
-        const dt = 1 / (cfg.predict.commandHz || 15);
-        az = this.azTracker.propagate(dt, cfg.limits.panSpeedMaxDps);
-        el = this.elTracker.propagate(dt, cfg.limits.tiltSpeedMaxDps);
+        // The trackers run in HEAD axes (mount-frame az/el): their slew
+        // clamps are the head's real speed limits, and their rates are the
+        // pan/tilt feedforward. In world az/el the clamp cut the setpoint
+        // short near the world zenith, where the azimuth rate is huge but the
+        // tilted head's pan rate is not (UAL875: 82°/s world, 24°/s pan).
+        this.azTracker.steer(headAxes(azLeadPred ?? prediction, cfg.mount).azRateDps);
+        this.elTracker.steer(headAxes(prediction, cfg.mount).elRateDps);
+        const dt = tickDt;
+        const azM = this.azTracker.propagate(dt, cfg.limits.panSpeedMaxDps * Math.abs(cfg.mount.panGain));
+        const elM = this.elTracker.propagate(dt, cfg.limits.tiltSpeedMaxDps * Math.abs(cfg.mount.tiltGain));
+        const w = worldFromMountFrame(azM, elM, cfg.mount);
+        az = w.azDeg;
+        el = w.elDeg;
         // Vision steering: the bias estimator's output, applied through a
         // rate limiter — the correction GLIDES onto the aim instead of
         // stepping per detection (4 Hz steps read as jank at tele).
@@ -1104,6 +1188,22 @@ export class ControlLoop {
         // the detector — CES590 (777, in frame from ~12 s) first locked at 18 s.
         const rising = (prediction?.elRateDps ?? 0) > 0.2;
         if (el < skyline || (rising && el < waitEl)) el = Math.max(el, waitEl);
+      }
+      // Sun keep-out (pointing/sun.ts): the aim comes no closer to the sun
+      // than keeps it out of the picture the lens is ACTUALLY giving — it may
+      // still be zooming in; the zoom cap below pulls the lens in first.
+      const planeAim = { azDeg: az, elDeg: el };
+      const sunNow = this.sunAt(cfg.site, now);
+      const sunMargin = cfg.target.sunMarginDeg ?? SUN_MARGIN_DEG;
+      this.sunHeld = false;
+      if (sunNow) {
+        const lensHfov = hfovFromZoomUnits(d.getPose()?.zoomUnits ?? cfg.units.zoomWideUnits, cfg.zoom.fovLut);
+        const g = pushAimFromSun(planeAim, sunNow, sunKeepOutDeg(Math.max(lensHfov, this.zoomCmdHfov ?? 0), sunMargin));
+        if (g.pushed) {
+          az = g.azDeg;
+          el = g.elDeg;
+          this.sunHeld = true;
+        }
       }
       const pt = mountFromWorld(az, el, cfg.mount);
       // Pan dead-zone anticipation (see WRAP_SLEW_DPS).
@@ -1158,9 +1258,10 @@ export class ControlLoop {
           }
         }
       }
-      // Target's angular rate across the sky (for the zoom-out floor).
+      // Target's angular rate across the sky (for the zoom-out floor) —
+      // frame-independent, from the head-axis setpoint rates.
       const rateDps = Math.hypot(
-        this.azTracker.rate * Math.cos((el * Math.PI) / 180),
+        this.azTracker.rate * Math.cos((this.elTracker.pos * Math.PI) / 180),
         this.elTracker.rate,
       );
       // How far the camera is trailing its command right now, deg.
@@ -1207,10 +1308,14 @@ export class ControlLoop {
       // Which rule set the zoom this tick (logged per pass row as `zw`, to
       // find what drives in→out pumping).
       this.zoomWhy = lockFresh ? "frameLocked" : "frameOpen";
-      const zoom = chooseZoom(
-        targetAc, prediction.azEl, cfg, rateDps, this.lagDegLP,
-        lockFresh ? cfg.zoom.lockedSigmaDeg : undefined,
-      );
+      if (lockFresh) this.lastLockFreshAt = now;
+      // Since the last lock, the pointing uncertainty grows gradually
+      // (zoom.sigmaGrowthDps) — chooseZoom caps it at the open-loop sigma.
+      const sinceLock = this.lastLockFreshAt > 0 ? (now - this.lastLockFreshAt) / 1000 : Infinity;
+      const sigmaNow = lockFresh
+        ? cfg.zoom.lockedSigmaDeg
+        : Number.isFinite(sinceLock) ? cfg.zoom.lockedSigmaDeg + (cfg.zoom.sigmaGrowthDps ?? 0.1) * sinceLock : undefined;
+      const zoom = chooseZoom(targetAc, prediction.azEl, cfg, rateDps, this.lagDegLP, sigmaNow);
       if (park && zoom.hfovDeg < ZENITH_MIN_HFOV) {
         // Wide through the crossing so the fly-through stays framed.
         zoom.hfovDeg = ZENITH_MIN_HFOV;
@@ -1272,7 +1377,14 @@ export class ControlLoop {
             // aim 0.5° off it, because "lost" used to mean wide for good.
             const t0 = Math.max(since, this.acqHoldAt, seen ? this.lastDetSeenAt + LADDER_LOST_MS : 0);
             const tAcq = (now - t0) % ACQ_CYCLE_MS;
-            const settled = now - t0 > 1500 && lagDeg < 2;
+            // A departure still below the roofline and climbing toward it:
+            // pre-zoom to the search framing while waiting at the roofline,
+            // so the climb-out is filmed at that size and found sooner. (The
+            // held search clock kept these at full wide until first lock —
+            // 2026-10-14 SFO departures locked 11-26 s after lift-off, at 16-24°
+            // elevation, waiting at 33-54° HFOV.)
+            const climbingToSkyline = !visible && (prediction.elRateDps ?? 0) > 0.2;
+            const settled = (climbingToSkyline || now - t0 > 1500) && lagDeg < 2;
             const ang = zoom.angularSizeDeg ?? 1;
             const acqHfov = clamp(24 * ang, 6, wideHfov);
             const sizedRung = Math.max(0, Math.floor(Math.log(acqHfov / wideHfov) / Math.log(RUNG)));
@@ -1343,36 +1455,24 @@ export class ControlLoop {
           this.ladderIdx = clamped;
         }
       }
-      // Motor-smoothness floor: the dither's velocity steps are fixed in
-      // deg/s, so their visibility scales with 1/HFOV × the step size the
-      // wanted rate sits between. A fast-moving (close) plane at full tele
-      // dithers across the 3→5→7°/s gears and the picture lurches; hold the
-      // zoom proportionally wider while the rate is high (the plane is
-      // close and big then anyway).
+      // Speed-step floor, from the camera profile (zoom.maxSpeedStepFwps):
+      // never zoom tighter than the camera can hold this plane's head rates
+      // smoothly — within reach of its speeds at that zoom, and with the jump
+      // between the two speeds it must alternate across small against the
+      // field of view. Replaces the hand-tuned rate floor (2.5°/(°/s)) and the
+      // TONGVEO gear thresholds (6/3°/s → 13.5/8.3°). Hysteresis: the floor
+      // relaxes only once the rates are ~15% below what set it.
       {
-        let floorHfov = clamp(
-          (cfg.zoom.rateFloorDegPerDps ?? 2.5) * rateDps, 0, cfg.zoom.rateFloorMaxDeg ?? 12,
-        );
-        // Gear-aware floor on the PAN AXIS rate (not the sky rate): at full
-        // tele the firmware's speed table jumps from ~3°/s (byte 12) to
-        // ~22°/s (byte 18) with nothing between, and short pulses of the fast
-        // gear deliver a fraction of their nominal speed. A near-zenith leg
-        // needing 6-10°/s of pan at 5° HFOV lagged the command by 7° for two
-        // seconds, then caught up at 18°/s and overshot (SCX395). Hold the
-        // view wider while the pan axis is that fast; hysteresis so the zoom
-        // doesn't flap around the thresholds.
-        const panAxisRate = Math.abs(this.azTracker.rate);
-        const g = this.gearFloorHfov;
-        const next =
-          panAxisRate > 6 || (g >= 13.5 && panAxisRate > 5) ? 13.5
-          : panAxisRate > 3 || (g >= 8.3 && panAxisRate > 2.5) ? 8.3
-          : 0;
-        this.gearFloorHfov = next;
-        floorHfov = Math.max(floorHfov, next);
+        const panDps = this.azTracker.rate;
+        const tiltDps = this.elTracker.rate;
+        const now0 = speedFloorHfov(panDps, tiltDps, cfg);
+        const relaxed = speedFloorHfov(panDps * 1.15, tiltDps * 1.15, cfg);
+        const floorHfov = Math.max(now0, Math.min(this.speedFloorHfov, relaxed));
+        this.speedFloorHfov = floorHfov;
         if (zoom.hfovDeg < floorHfov) {
           zoom.hfovDeg = floorHfov;
           zoom.zoomUnits = zoomUnitsFromHfov(floorHfov, cfg.zoom.fovLut);
-          this.zoomWhy = next > 0 && floorHfov === next ? "gearFloor" : "rateFloor";
+          this.zoomWhy = "speedFloor";
         }
       }
       // Zoom DEBOUNCE: a zoom command is a motor move and a vision reset, so
@@ -1422,6 +1522,20 @@ export class ControlLoop {
           zoom.zoomUnits = zoomUnitsFromHfov(stop, cfg.zoom.fovLut);
         }
       }
+      // Sun keep-out: never wider than keeps the sun out of the picture
+      // around the PLANE (the aim follows once the lens is in) — overrides
+      // every floor, the debounce and the stop snap (largest stop that fits).
+      if (sunNow) {
+        const stops = zoomStopsHfov(cfg.zoom); // ascending: tele first
+        const cap = Math.max(stops[0], maxHfovForSun(sunSepDeg(planeAim, sunNow), sunMargin));
+        if (zoom.hfovDeg > cap) {
+          const fit = [...stops].reverse().find((h) => h <= cap) ?? stops[0];
+          zoom.hfovDeg = fit;
+          zoom.zoomUnits = zoomUnitsFromHfov(fit, cfg.zoom.fovLut);
+          this.zoomCmdHfov = fit;
+          this.zoomWhy += "+sun";
+        }
+      }
       hfovDeg = zoom.hfovDeg;
       angular = zoom.angularSizeDeg;
       commandedPanTilt = pt;
@@ -1469,7 +1583,7 @@ export class ControlLoop {
         else if (a.kind === "nudge") {
           // Jump straight there only onto a trusted tele point; anything else
           // stays a timed drive the sharpness feedback can catch mid-way.
-          const trusted = lensZoom >= ZOOM_FOCUS_MIN_UNITS
+          const trusted = lensZoom >= cfg.camera.lens.focus.directMinZoomUnits
             ? this.focus.trusted(lensZoom, distanceBand(prediction?.azEl.slantM ?? null), ZOOM_FOCUS_MIN_SAMPLES)
             : null;
           const direct = d.setFocusDirect && trusted != null && Math.abs(trusted - a.target) < 5 && d.setFocusDirect(a.target);
@@ -1579,7 +1693,7 @@ export class ControlLoop {
         // the (smooth) feedforward rate + vision for centering; P only trims.
         const KP = PURSUIT_KP;
         const KI = PURSUIT_KI;
-        const dtTick = 1 / (cfg.predict.commandHz || 15);
+        const dtTick = tickDt;
         // Low-pass the pose error before the P term: the dead-reckoned pose
         // SNAPS when an inquiry reply lands after a stall, and raw P turns
         // each snap into a velocity step (wobble). The filter rides through
@@ -1600,36 +1714,30 @@ export class ControlLoop {
         else this.panRateI *= 0.98;
         if (Math.abs(errTilt) < iGate) this.tiltRateI = clamp(this.tiltRateI + KI * errTilt * dtTick, -I_MAX, I_MAX);
         else this.tiltRateI *= 0.98;
-        // Around an overhead crossing the azimuth rate is large and collapsing
-        // within a second or two; full feedforward on it plus the ~0.6 s
-        // actuator lag overshoots 20-35° at hand-over (UAL626, ANA108). Lean
-        // on the position terms there — they are stable with the lag at
-        // KP 1 — and only partially on the feedforward.
-        const ffScale = this.zenithLatched || now - this.zenithExitAt < 3000 ? FF_SCALE_CROSSING : 1;
-        const ffPan = (ffScale * this.azTracker.rate + corrAzRateDps) / cfg.mount.panGain;
-        const ffTilt = (this.elTracker.rate + corrElRateDps) / cfg.mount.tiltGain;
+        // The setpoint's motion in HEAD axes: on the wedge the world az/el
+        // rates are not the pan/tilt rates (UAL875 2026-10-14: −82°/s sent
+        // where the head needed −24°/s; it swung 46° past the plane).
+        // The vision correction's glide is in world az/el: map it through
+        // the lean too (the trackers are already in head axes).
+        const corrFf = mountRatesFromWorld(az, el, corrAzRateDps, corrElRateDps, cfg.mount);
+        // Held at the sun keep-out edge: the plane's own motion must not carry
+        // the head inside it — position control only until the plane is clear.
+        const ffPan = this.sunHeld ? 0 : this.azTracker.rate / cfg.mount.panGain + corrFf.panDps;
+        const ffTilt = this.sunHeld ? 0 : this.elTracker.rate / cfg.mount.tiltGain + corrFf.tiltDps;
         let panRate = ffPan + KP * this.errPanLP + this.panRateI;
         let tiltRate = ffTilt + KP * this.errTiltLP + this.tiltRateI;
         // Latency-aware braking on the CATCH-UP part of the command: a head
-        // closing a 10° gap at 60°/s still has ~0.3 s of command latency and
+        // closing a 10° gap at 60°/s still has its command latency to go and
         // no soft stop, so it sails 4-13° past the setpoint (observed on
         // every acquisition and zenith-hold exit). Bound the reactive rate
-        // by what can still be absorbed before arrival; the feedforward
-        // (the plane's own motion) is never limited.
-        const brakePan = Math.abs(ffPan) + Math.max(1.5, Math.abs(errPan) / BRAKE_SEC);
-        const brakeTilt = Math.abs(ffTilt) + Math.max(1.5, Math.abs(errTilt) / BRAKE_SEC);
+        // by what can still be absorbed within that axis's latency; the
+        // feedforward (the plane's own motion) is never limited.
+        const brakePanSec = Math.max(0.2, cfg.predict.panLatencySec ?? 0.6);
+        const brakeTiltSec = Math.max(0.2, cfg.predict.tiltLatencySec ?? 0.4);
+        const brakePan = Math.abs(ffPan) + Math.max(1.5, Math.abs(errPan) / brakePanSec);
+        const brakeTilt = Math.abs(ffTilt) + Math.max(1.5, Math.abs(errTilt) / brakeTiltSec);
         panRate = clamp(panRate, -brakePan, brakePan);
         tiltRate = clamp(tiltRate, -brakeTilt, brakeTilt);
-        // Coming out of an overhead crossing the azimuth rate is still high
-        // and collapsing: sweep, don't whip.
-        if (hold?.phase === "follow") {
-          // ...unless the head is still far from the plane (the park never
-          // finished before the crossing): then it is a catch-up, not a
-          // sweep, and the brake alone governs (DAL2159: a 100° catch-up
-          // crawled at 20°/s for 6 s under the sweep cap).
-          const cap = Math.abs(errPan) > FOLLOW_CATCHUP_ERR_DEG ? FOLLOW_CATCHUP_MAX_DPS : FOLLOW_PAN_MAX_DPS;
-          panRate = clamp(panRate, -cap, cap);
-        }
         // Deadband so the camera rests when locked on (frame-relative: what
         // counts as "centered" is a fraction of the field of view, not a
         // fixed angle). The driver dithers against stop below the table
@@ -1772,19 +1880,17 @@ export class ControlLoop {
     } else if (
       this.mode === "auto" &&
       cfg.home.enabled &&
-      !this.atHome &&
-      now - this.lastTargetAt > cfg.home.afterSec * 1000
+      now - this.lastTargetAt > cfg.home.afterSec * 1000 &&
+      (!this.atHome || this.homeMoved(cfg, now))
     ) {
-      const azDeg =
-        cfg.home.mode === "sfo"
-          ? azElFromSite(cfg.site, { ...SFO_ARP, altM: cfg.site.altM }).azDeg
-          : cfg.home.azDeg;
-      const pt = mountFromWorld(azDeg, cfg.home.elDeg, cfg.mount);
+      const { azDeg, elDeg } = this.homeAimNow(cfg, now);
+      const pt = mountFromWorld(azDeg, elDeg, cfg.mount);
+      this.homeAim = { azDeg, elDeg };
       this.atHome = true;
       this.lastAbsolute = null;
       this.driver().gotoAbsolute({ ...pt, zoomUnits: cfg.units.zoomWideUnits });
       this.driver().setFocusInfinity(false); // wide + idle -> autofocus
-      this.recorder.write("home", { azDeg, elDeg: cfg.home.elDeg });
+      this.recorder.write("home", { azDeg, elDeg });
     }
 
     // No target: hand focus back to AF (on the scenery, wide) so the next
@@ -1820,8 +1926,9 @@ export class ControlLoop {
         predEl: prediction.azEl.elDeg,
         truthAz: prediction.nowAzEl.azDeg,
         truthEl: prediction.nowAzEl.elDeg,
-        rateAzDps: this.azTracker.rate,
-        rateElDps: this.elTracker.rate,
+        // World rates — vision compares them with world-frame track velocities.
+        rateAzDps: (azLeadPred ?? prediction).azRateDps,
+        rateElDps: prediction.elRateDps,
         panDeg: poseEst.panDeg,
         tiltDeg: poseEst.tiltDeg,
         hfov: hfovFromZoomUnits(poseEst.zoomUnits, cfg.zoom.fovLut),
@@ -2037,8 +2144,23 @@ export class ControlLoop {
     const atPre = this.aimAt(frameT);
     const geomNow = frameGeom(pose, cfg.mount, hfov);
     if (lockedBefore && atPre) {
-      const p = lockedBefore.positionAt(frameT);
+      const p = this.tracks.lockedPositionAt(frameT)!;
       const e = frameGeom(atPre, cfg.mount, atPre.hfov).toFrame(p.azDeg, p.elDeg);
+      exX = clamp01(e.cx);
+      exY = clamp01(e.cy);
+    } else if (atPre) {
+      // Where the plane IS in this frame: its ADS-B direction at frame time,
+      // advanced by the learned aim lead (the feed's delay, see leadLearn),
+      // plus the current vision correction — through the pose the camera had
+      // when the frame was taken. (This used to be the AIM-AHEAD prediction,
+      // ~1-1.2 s in the future, through the current pose: 0.3 of a 5° frame
+      // ahead of the plane at 2°/s, outside the silhouette search radius —
+      // most "nothing near the expected spot" misses at tele, 2026-10-14.)
+      const lead = cfg.predict.aimLeadSec ?? 0;
+      const e = frameGeom(atPre, cfg.mount, atPre.hfov).toFrame(
+        atPre.truthAz + atPre.rateAzDps * lead + this.corrAzApp,
+        atPre.truthEl + atPre.rateElDps * lead + this.corrElApp,
+      );
       exX = clamp01(e.cx);
       exY = clamp01(e.cy);
     } else if (predicted) {
@@ -2058,6 +2180,8 @@ export class ControlLoop {
       // tracker (below) still arbitrates which residual is the plane.
       const cur = await decodeLuma(frame);
       let cands: Detection[] = [];
+      let silTried = false;
+      let silFound = false;
       const prev = this.prevLuma;
       const prevAim = this.prevAim;
       if (prev && prevAim && prev.length === cur.length) {
@@ -2125,7 +2249,9 @@ export class ControlLoop {
           const near = cands.some((c) => Math.hypot((c.cx - exX) * VISION_W, (c.cy - exY) * VISION_H) < 30);
           if (!near) {
             const sil = silhouetteCentroid(cur, VISION_W, VISION_H, exX, exY, Math.max(8, thetaPx));
+            silTried = true;
             if (sil && sil.areaPx >= 4) {
+              silFound = true;
               cands.push({
                 cx: sil.cx, cy: sil.cy, areaPx: sil.areaPx, contrastSigma: 6,
                 box: sil.box, score: 6,
@@ -2195,10 +2321,13 @@ export class ControlLoop {
         Math.max(0.4, hfovF * 0.07) +
         (Number.isFinite(aimRateDps) ? 0.18 * Math.min(20, aimRateDps) : 1.5);
       this.tracks.update(obs, frameT, gateDeg);
+      // The ADS-B plane at FRAME time (+ the learned feed delay), not the
+      // aim-ahead point ~1 s further along (see the expected spot above).
+      const leadSel = cfg.predict.aimLeadSec ?? 0;
       const sel = this.tracks.select(
         {
-          azDeg: atFrame.predAz,
-          elDeg: atFrame.predEl,
+          azDeg: atFrame.truthAz + atFrame.rateAzDps * leadSel,
+          elDeg: atFrame.truthEl + atFrame.rateElDps * leadSel,
           azRateDps: atFrame.rateAzDps,
           elRateDps: atFrame.rateElDps,
         },
@@ -2224,6 +2353,21 @@ export class ControlLoop {
       const lt = sel?.track ?? null;
       const freshLock = lt != null && lt.lastSeen === frameT; // updated THIS frame
       this.lockMotionOk = sel?.motionOk ?? false;
+      if (!freshLock && this.current) {
+        // Why a frame had no lock (session recordings only): the plane can sit
+        // centred and plainly visible for seconds without one (EJM450
+        // 2026-10-14 35-42 s, 82σ against the sky).
+        const near = cands.reduce(
+          (m, c) => Math.min(m, Math.hypot((c.cx - exX) * VISION_W, (c.cy - exY) * VISION_H)), Infinity);
+        this.recorder.write("visionMiss", {
+          hfov: hfovF, exX, exY, nCands: cands.length, nearPx: Number.isFinite(near) ? near : null,
+          silTried, silFound, aimRateDps,
+          sel: sel ? {
+            hits: sel.track.hits, ageMs: frameT - sel.track.lastSeen, eligible: sel.eligible,
+            velErrDps: sel.velErrDps, posErrDeg: sel.posErrDeg, motionOk: sel.motionOk,
+          } : null,
+        });
+      }
 
       if (lt && freshLock) {
         const o = lt.latest();
@@ -2299,6 +2443,16 @@ export class ControlLoop {
         // The lock IS the temporal confirmation now: a track only becomes
         // the lock after several coherent, motion-consistent frames.
         const confirmed = lt.hits >= 4;
+        // Timing evidence for the aim-lead fold (pointing/leadLearn.ts): the
+        // plane's offset from where the ADS-B aim alone would point (the
+        // applied vision correction is that aim's learned offset), along its
+        // motion, in seconds.
+        if (confirmed && elF >= 15 && elF <= 75) {
+          const sec = alongTrackSec(
+            offAz + this.corrAzApp, offElDeg + this.corrElApp, elF, atFrame.rateAzDps, atFrame.rateElDps,
+          );
+          if (sec !== null) this.leadLearn.push(sec);
+        }
 
         if (confirmed && cfg.vision.applyCorrection) {
           // Where the blob (the plane, then) is NOW, world frame:
@@ -2481,5 +2635,3 @@ export function mergeBlobs<T extends { cx: number; cy: number; areaPx: number; p
   return out;
 }
 
-/** SFO airport reference point (the project's anchor airport). */
-const SFO_ARP = { lat: 37.6213, lon: -122.379 };

@@ -21,11 +21,13 @@ import {
   planPass,
   zenithHold,
   ZENITH_MIN_HFOV,
-  ZENITH_PRE_SEC,
   ZENITH_REGIME_EL,
 } from "../src/pointing/planner.js";
 import { predictAim, TrackHistory } from "../src/pointing/predict.js";
 import { chooseZoom } from "../src/pointing/zoom.js";
+
+/** Park limits as inputs (these tests are about the planner's geometry). */
+const PARK = { aboveDps: 25, tiltDeg: 84, leadSec: 3.5 };
 
 const SITE: GeoPoint = { lat: 37.6213, lon: -122.379, altM: 0 };
 const CFG = {
@@ -57,7 +59,7 @@ function overheadFix(tSec: number): Aircraft {
 
 describe("planPass", () => {
   it("classifies a direct overhead pass as a zenith pass", () => {
-    const plan = planPass(overheadFix(60), SITE, 60_000);
+    const plan = planPass(overheadFix(60), SITE, 60_000, undefined, undefined, undefined, PARK);
     expect(plan).not.toBeNull();
     expect(plan!.zenithPass).toBe(true);
     expect(plan!.elMaxDeg).toBeGreaterThan(85);
@@ -75,12 +77,41 @@ describe("planPass", () => {
       { ...ac, altGeom: 400 / FT_TO_M, gs: 200, lon: ac.lon! + 200 / (111320 * Math.cos((SITE.lat * Math.PI) / 180)) },
       SITE,
       60_000,
+      undefined,
+      undefined,
+      undefined,
+      PARK,
     );
     expect(plan).not.toBeNull();
     expect(plan!.elMaxDeg).toBeLessThan(70);
     expect(plan!.zenithPass).toBe(true);
     expect(plan!.holdAzEl.elDeg).toBeCloseTo(plan!.elMaxDeg, 1);
     expect(Math.abs(norm180(plan!.holdAzEl.azDeg - plan!.caAzDeg))).toBeLessThan(1);
+  });
+
+  it("holds a steady park point while the pass is re-planned every tick", () => {
+    // EJM450 2026-10-14 (397 m slant, ~27°/s): the closest-approach azimuth
+    // came off the 0.5 s grid, so it hopped ±6° between 100 ms re-plans;
+    // every hop over HOLD_RETARGET_DEG re-issued the absolute move, the head
+    // sat still for 1.2 s, then whipped 70° after the plane had gone by.
+    const cosLat = Math.cos((SITE.lat * Math.PI) / 180);
+    const start = { lat: SITE.lat - 0.02, lon: SITE.lon + 200 / (111320 * cosLat), altM: 400 };
+    const fix = (tSec: number): Aircraft => {
+      const p = predictGeo({ ...start, gsKt: 200, trackDeg: 0 }, tSec);
+      return {
+        hex: "low", typeCode: "GLF4", lat: p.lat, lon: p.lon, altGeom: p.altM / FT_TO_M,
+        gs: 200, track: 0, baroRate: 0, ts: tSec * 1000, seen: 0,
+      };
+    };
+    const holds: { azDeg: number; elDeg: number }[] = [];
+    for (let t = 18; t < 23; t += 0.1) {
+      const plan = planPass(fix(t), SITE, t * 1000, undefined, undefined, undefined, PARK);
+      if (plan && plan.tCaSec > 0 && plan.tCaSec <= PARK.leadSec) holds.push(plan.holdAzEl);
+    }
+    expect(holds.length).toBeGreaterThan(20);
+    const azs = holds.map((h) => h.azDeg);
+    const spread = Math.max(...azs.map((a) => Math.abs(norm180(a - azs[0]))));
+    expect(spread).toBeLessThan(1);
   });
 
   it("does NOT flag a moderate pass", () => {
@@ -90,6 +121,10 @@ describe("planPass", () => {
       { ...ac, lon: ac.lon! + 3000 / (111320 * Math.cos((SITE.lat * Math.PI) / 180)) },
       SITE,
       60_000,
+      undefined,
+      undefined,
+      undefined,
+      PARK,
     );
     expect(plan).not.toBeNull();
     expect(plan!.zenithPass).toBe(false);
@@ -121,7 +156,7 @@ describe("zenith crossing, end to end with a rate-limited camera", () => {
       const fixSec = Math.floor(tSec);
       const ac = overheadFix(fixSec);
 
-      const plan = planPass(ac, SITE, tMs);
+      const plan = planPass(ac, SITE, tMs, undefined, undefined, undefined, PARK);
       const truthNow = azElFromSite(SITE, {
         lat: overheadFix(tSec).lat!,
         lon: overheadFix(tSec).lon!,
@@ -183,15 +218,15 @@ describe("zenith crossing, end to end with a rate-limited camera", () => {
 
   it("parks on time inbound, follows inside the cone outbound", () => {
     // Far out: no hold yet, whatever the elevation says.
-    const far = planPass(overheadFix(60), SITE, 60_000);
-    expect(far?.tCaSec).toBeGreaterThan(ZENITH_PRE_SEC);
+    const far = planPass(overheadFix(60), SITE, 60_000, undefined, undefined, undefined, PARK);
+    expect(far?.tCaSec).toBeGreaterThan(PARK.leadSec);
     expect(zenithHold(far, ZENITH_REGIME_EL + 1)).toBeNull();
     // Just before closest approach: park.
     const tCa = far!.tCaSec;
-    const near = planPass(overheadFix(60 + Math.floor(tCa) - 2), SITE, (60 + Math.floor(tCa) - 2) * 1000);
+    const near = planPass(overheadFix(60 + Math.floor(tCa) - 2), SITE, (60 + Math.floor(tCa) - 2) * 1000, undefined, undefined, undefined, PARK);
     expect(zenithHold(near, 50)?.phase).toBe("park");
     // Past closest approach: follow while above the regime line, then release.
-    const past = planPass(overheadFix(60 + Math.ceil(tCa) + 3), SITE, (60 + Math.ceil(tCa) + 3) * 1000);
+    const past = planPass(overheadFix(60 + Math.ceil(tCa) + 3), SITE, (60 + Math.ceil(tCa) + 3) * 1000, undefined, undefined, undefined, PARK);
     expect(past?.tCaSec).toBeLessThanOrEqual(0);
     // (the forward-looking plan no longer sees the peak — the latch carries it)
     expect(zenithHold(past, ZENITH_REGIME_EL + 1, true)?.phase).toBe("follow");
@@ -212,7 +247,7 @@ describe("planPass pan dead-zone crossing", () => {
     };
   }
   it("reports entry/exit times and the far-side pan for a crossing", () => {
-    const plan = planPass(southFix(), SITE, 0, 240, 0.5, WRAP)!;
+    const plan = planPass(southFix(), SITE, 0, 240, 0.5, WRAP, PARK)!;
     expect(plan.wrapInSec).not.toBeNull();
     expect(plan.wrapOutSec).not.toBeNull();
     expect(plan.wrapOutSec!).toBeGreaterThan(plan.wrapInSec!);
@@ -231,7 +266,7 @@ describe("planPass pan dead-zone crossing", () => {
     expect(Math.abs(at)).toBeGreaterThan(175);
   });
   it("is null for a pass that never reaches the gap", () => {
-    const plan = planPass(overheadFix(0), SITE, 0, 120, 0.5, WRAP)!; // northbound through az 0/180? overhead: az 180→0 via zenith
+    const plan = planPass(overheadFix(0), SITE, 0, 120, 0.5, WRAP, PARK)!; // northbound through az 0/180? overhead: az 180→0 via zenith
     // Overhead northbound: az jumps 180→0 through the zenith at el≈90, where
     // pan is ±180 for an instant — but the plane is in range again at once on
     // the SAME side only if it came back; here it does cross. Use a plane
@@ -241,13 +276,13 @@ describe("planPass pan dead-zone crossing", () => {
       hex: "east", typeCode: "A320", lat: eastGeo.lat, lon: eastGeo.lon,
       altGeom: eastGeo.altM / FT_TO_M, gs: 250, track: 0, baroRate: 0, ts: 0, seen: 0,
     };
-    const p2 = planPass(ac, SITE, 0, 240, 0.5, WRAP)!;
+    const p2 = planPass(ac, SITE, 0, 240, 0.5, WRAP, PARK)!;
     expect(p2.wrapOutSec).toBeNull();
     expect(p2.wrapExitPanDeg).toBeNull();
     expect(plan).toBeTruthy();
   });
   it("leaves the wrap fields null without wrap options", () => {
-    const plan = planPass(southFix(), SITE, 0)!;
+    const plan = planPass(southFix(), SITE, 0, undefined, undefined, undefined, PARK)!;
     expect(plan.wrapInSec).toBeNull();
     expect(plan.wrapOutSec).toBeNull();
   });

@@ -127,6 +127,10 @@ describe("PassArchive", () => {
     expect(pass.build).toEqual({ version: "abc1234", label: "test", node: process.version });
     expect(pass.tuning).toMatchObject({ pursuit: "velocity", kp: 1, ki: 0.6, lockedSigmaDeg: 0.35 });
     expect(pass.camera).toEqual({ model: "TONGVEO 20x PTZ", width: 1920, height: 1080, fps: 30 });
+    // schema 1.4: the install's geometry travels with the pass (no site coordinates)
+    expect(pass.setup?.mount).toEqual(expect.objectContaining({ levelTiltDeg: expect.any(Number), panOffsetDeg: expect.any(Number) }));
+    expect(pass.setup?.fovLut.length).toBeGreaterThan(1);
+    expect(JSON.stringify(pass.setup)).not.toMatch(/"lat"|"lon"/);
     expect(pass.media).toEqual({ clip: null, poster: null, series: "series.json", clipBytes: null, clipDurationSec: null, clipOffsetSec: null });
     expect(pass.events.map((e) => [e.kind, e.t])).toEqual([
       ["target", 0], ["lock", 3.1], ["zoom", 6.1], ["lost", 9.1], ["focus", 11], ["release", 12],

@@ -12,6 +12,7 @@ import type {
   ViscaUnitScale,
 } from "./camera.js";
 import type { FovPoint } from "./aim.js";
+import { TONGVEO_PROFILE, type CameraProfile } from "./camera-profile.js";
 import { SFO_AIRPORT, type Airport } from "./airport.js";
 import { CONSTELLATIONS } from "./stars.js";
 
@@ -85,6 +86,8 @@ export interface TrackerConfig {
   site: GeoPoint;
   limits: CameraLimits;
   units: ViscaUnitScale;
+  /** How the camera moves — measured data (docs/camera-profile.md). */
+  camera: CameraProfile;
   mount: MountModel;
   targetMode: TargetMode;
   target: TargetCriteria;
@@ -154,6 +157,12 @@ export interface TrackerConfig {
      * ADS-B was right (along-track ≈ 0) — the head trails its own estimate.
      */
     aimLeadSec: number;
+    /**
+     * Learn aimLeadSec from vision: per pass, the plane's along-track
+     * offset from the ADS-B aim (s); when 5 passes agree, 30% of it is
+     * folded in (tracker/src/pointing/leadLearn.ts). Any camera / feed.
+     */
+    learnAimLead: boolean;
   };
   zoom: {
     auto: boolean;
@@ -165,6 +174,15 @@ export interface TrackerConfig {
      * what lets the camera zoom past ~5× to the framing target once locked.
      */
     lockedSigmaDeg: number;
+    /**
+     * After the lock drops, the pointing sigma grows from lockedSigmaDeg at
+     * this rate (deg/s) up to the open-loop estimate instead of jumping to
+     * it: the applied vision correction keeps the aim good for a while
+     * (2026-10-14: re-lock offsets 0.4-1.0° for 1-8 s gaps), and the jump
+     * zoomed out a stop on every brief dropout — the lens refocused, the
+     * plane went soft, the lock dropped again.
+     */
+    sigmaGrowthDps: number;
     /** Fraction of frame height the plane should fill. */
     fillFrac: number;
     /**
@@ -187,13 +205,16 @@ export interface TrackerConfig {
     /** Measured zoom-units -> HFOV samples (endpoints from the datasheet). */
     fovLut: FovPoint[];
     /**
-     * Motor-smoothness zoom floor: HFOV ≥ rateFloorDegPerDps × the target's
-     * angular rate (deg/s), capped at rateFloorMaxDeg. The dither's velocity
-     * steps are fixed in deg/s, so a fast (close) plane at full tele lurches;
-     * holding the zoom proportionally wider keeps the picture steady.
+     * Speed-step zoom floor (any camera — from tracker.camera.speedSurface):
+     * holding a rate between two of the camera's discrete speeds means
+     * alternating between them, and the picture lurches by that speed jump
+     * ÷ the field of view. Never zoom tighter than keeps that jump at or
+     * below maxSpeedStepFwps frame-widths per second on either axis, nor
+     * where the rate needed exceeds speedReachFrac of the camera's top speed
+     * at that zoom (no headroom to catch up). Lower = smoother, wider.
      */
-    rateFloorDegPerDps: number;
-    rateFloorMaxDeg: number;
+    maxSpeedStepFwps: number;
+    speedReachFrac: number;
     /**
      * Zoom STOPS, lens units: every zoom command snaps to one of these (never
      * tighter than wanted). The lens re-focuses (zoom tracking, then the
@@ -571,6 +592,7 @@ export const DEFAULT_CONFIG: Config = {
       zoomWideUnits: 0,
       zoomTeleUnits: 16384,
     },
+    camera: TONGVEO_PROFILE,
     mount: {
       panOffsetDeg: 0,
       tiltOffsetDeg: 0,
@@ -601,11 +623,13 @@ export const DEFAULT_CONFIG: Config = {
       panLatencySec: 0.6,
       tiltLatencySec: 0.4,
       aimLeadSec: 0,
+      learnAimLead: true,
     },
     zoom: {
       auto: true,
       sigmaDeg: 0.6,
       lockedSigmaDeg: 0.35,
+      sigmaGrowthDps: 0.1,
       fillFrac: 0.28,
       minHfovDeg: 0,
       minHfovAboveRateDps: 0,
@@ -615,8 +639,9 @@ export const DEFAULT_CONFIG: Config = {
         { units: 0, hfovDeg: 62.3 },
         { units: 16384, hfovDeg: 3.46 },
       ],
-      rateFloorDegPerDps: 2.5,
-      rateFloorMaxDeg: 12,
+      // ≈ the old hand-tuned rate/gear floors on the first camera (2026-10-14)
+      maxSpeedStepFwps: 0.45,
+      speedReachFrac: 0.8,
       stopUnits: [],
       stopRatio: 1.3,
     },
@@ -693,6 +718,7 @@ export function mergeConfig(base: Config, patch: Partial<Config>): Config {
 const RETIRED_TRACKER_KEYS = {
   predict: ["carrotHorizonSec", "carrotMs", "deadbandDeg", "alpha", "beta", "motorLatencySec"],
   vision: ["net"],
+  zoom: ["rateFloorDegPerDps", "rateFloorMaxDeg"],
 } as const;
 
 function withoutKeys<T extends object>(obj: T, keys: readonly string[]): T {
@@ -724,13 +750,24 @@ export function mergeTrackerConfig(
     site: { ...base.site, ...(patch.site ?? {}) },
     limits: { ...base.limits, ...(patch.limits ?? {}) },
     units: { ...base.units, ...(patch.units ?? {}) },
+    camera: {
+      ...base.camera,
+      ...(patch.camera ?? {}),
+      absolute: { ...base.camera.absolute, ...(patch.camera?.absolute ?? {}) },
+      lens: {
+        ...base.camera.lens,
+        ...(patch.camera?.lens ?? {}),
+        focus: { ...base.camera.lens.focus, ...(patch.camera?.lens?.focus ?? {}) },
+      },
+      mechanical: { ...base.camera.mechanical, ...(patch.camera?.mechanical ?? {}) },
+    },
     mount: { ...base.mount, ...(patch.mount ?? {}) },
     target: { ...base.target, ...(patch.target ?? {}) },
     predict: {
       ...withoutKeys({ ...base.predict, ...(patch.predict ?? {}) }, RETIRED_TRACKER_KEYS.predict),
       pursuit: "velocity", // the only mode; an old persisted "carrot" must not survive
     },
-    zoom: { ...base.zoom, ...(patch.zoom ?? {}) },
+    zoom: withoutKeys({ ...base.zoom, ...(patch.zoom ?? {}) }, RETIRED_TRACKER_KEYS.zoom),
     vision: withoutKeys({ ...base.vision, ...(patch.vision ?? {}) }, RETIRED_TRACKER_KEYS.vision),
     leveling: { ...base.leveling, ...(patch.leveling ?? {}) },
     liveStab: mergeLiveStab(base.liveStab, patch.liveStab),

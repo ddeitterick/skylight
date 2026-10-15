@@ -127,6 +127,66 @@ describe("TrackTable", () => {
     expect(sel).not.toBeNull(); // reacquired the same track after
   });
 
+  it("a lock unseen for longer than 1.5 s keeps coasting with the plane and re-joins on the next detection (SKW4655)", () => {
+    // Live gate at tele: 0.4° + 0.18 × rate. The extrapolation used to freeze
+    // at 1.5 s, so after a 2.5 s dropout the lock predicted a point 2° behind
+    // the plane, the re-detection started a NEW track, and the old lock
+    // blocked it until the grace expired.
+    const gate = 0.4 + 0.18 * Math.hypot(PLANE_RATE.az, PLANE_RATE.el);
+    const table = new TrackTable();
+    let lockedId: number | null = null;
+    for (let i = 0; i < 34; i++) {
+      const t = T0 + i * TICK;
+      const p = planeAt(t);
+      const dropout = i >= 14 && i < 24; // 2.5 s unseen
+      table.update(dropout ? [] : [obs(t, p.az, p.el, 5, 0.04)], t, gate);
+      const sel = table.select(predAt(t), t);
+      if (i === 13) lockedId = sel!.track.id;
+      if (dropout) {
+        const lt = table.lockedTrack()!;
+        const q = lt.positionAt(t);
+        expect(Math.hypot((q.azDeg - p.az) * Math.cos((p.el * Math.PI) / 180), q.elDeg - p.el)).toBeLessThan(0.3);
+      }
+      if (i === 24) {
+        expect(sel?.track.id).toBe(lockedId); // the same lock, fed at once
+        expect(sel?.track.latest().t).toBe(t);
+      }
+    }
+  });
+
+  it("an unseen lock coasts at the PREDICTED rate, not its own fit (SKW4655: fit 0.75°/s, plane 1.0°/s)", () => {
+    const rate = 1.0;
+    const pred = (t: number): PredictedMotion => ({ azDeg: 20 + ((t - T0) / 1000) * rate, elDeg: 25, azRateDps: rate, elRateDps: 0 });
+    const gate = 0.4 + 0.18 * rate;
+    const table = new TrackTable();
+    let lockedId: number | null = null;
+    let lastSeenAz = 0;
+    for (let i = 0; i < 40; i++) {
+      const t = T0 + i * TICK;
+      const truthAz = 20 + ((t - T0) / 1000) * rate;
+      // Before the dropout the blob centroids crept (fit 0.75°/s, ending on
+      // the plane); after it, the plane is where it really is.
+      const seenAz = i < 16 ? truthAz + 0.25 * ((T0 + 15 * TICK - t) / 1000) : truthAz;
+      const dropout = i >= 16 && i < 30; // 3.5 s unseen
+      if (i === 15) lastSeenAz = seenAz;
+      table.update(dropout ? [] : [obs(t, seenAz, 25, 5)], t, gate);
+      const sel = table.select(pred(t), t);
+      if (i === 15) {
+        lockedId = sel!.track.id;
+        expect(sel!.track.velocity().azRateDps).toBeLessThan(0.8);
+      }
+      if (dropout) {
+        const q = table.lockedPositionAt(t)!;
+        const want = lastSeenAz + ((t - (T0 + 15 * TICK)) / 1000) * rate;
+        expect(Math.abs(q.azDeg - want)).toBeLessThan(0.01);
+      }
+      if (i === 30) {
+        expect(sel?.track.id).toBe(lockedId); // re-joined at once
+        expect(sel?.track.latest().t).toBe(t);
+      }
+    }
+  });
+
   it("does not flip the lock for a one-frame bright flash", () => {
     const table = new TrackTable();
     let lockedId: number | null = null;

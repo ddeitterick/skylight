@@ -23,7 +23,9 @@ import type {
   CameraLimits,
   CameraPose,
   ViscaUnitScale,
+  CameraProfile,
 } from "@shared/index.js";
+import { speedTableAt } from "@shared/index.js";
 import type { CameraDriver, TrackRateOptions } from "./driver.js";
 import {
   clampPose,
@@ -47,155 +49,19 @@ export interface ViscaOptions {
   inquiryHz?: number;
   /** Max absolute-position command rate, Hz (latest wins between sends). */
   commandHz?: number;
+  /** How this camera moves (tracker.camera) — read live, so config edits apply. */
+  profile: () => CameraProfile;
 }
 
-// Drive-speed step -> SUSTAINED deg/s, as a SURFACE over zoom.
-//
-// This firmware scales pan/tilt drive speed with zoom ("speed by zoom",
-// measured 2026-10-10 with scripts/probe-mech.ts + probe-speed-zoom.ts): pan
-// byte 1 is ~7°/s at full wide but ~1.4°/s from zoom ≈900 up, and every byte
-// compresses toward the ~1.47°/s floor as the lens goes tele. The June tables
-// were measured wide only, so zoomed in — exactly where smoothness matters —
-// the dither's model ran ~5× hot and the loop's integrator saturated. The
-// driver therefore interpolates a per-zoom table from the rows below (linear
-// in zoom units between measured rows, linear in step within a row).
-//
-// Row 0 (wide) keeps the full June tables (two-timed-sweep; low steps
-// re-measured by video frame-shift 2026-06-10). Speed byte 0x00 is a REAL
-// slow gear (~1.47°/s), not a no-op — "stopped" is STOP_STEP (-1).
-const PAN_SPEEDS_WIDE: [number, number][] = [
-  [0, 1.47], [1, 7.9], [2, 17.6], [3, 21.2], [4, 26.55], [5, 29.32], [6, 31.05],
-  [7, 35.57], [9, 41.5], [11, 44.59], [12, 47.26], [13, 50.06], [16, 54.15],
-  [17, 56.01], [18, 57.85], [19, 64.76], [20, 67.56], [21, 71.53],
-  [22, 74.23], [24, 75.16],
-];
-const TILT_SPEEDS_WIDE: [number, number][] = [
-  [0, 1.47], [1, 3.0], [2, 4.5], [3, 6.2], [4, 7.67], [5, 9.29], [6, 11.86],
-  [7, 13.36], [8, 13.8], [9, 16.82], [10, 17.68], [11, 20.31], [13, 23.52],
-  [15, 24.78], [16, 26.14], [17, 30.45], [19, 33.5],
-];
-
-/** One measured zoom position of the drive-rate surface. */
-export interface SpeedRow {
-  /** Zoom units (0 = wide). */
-  zoom: number;
-  pan: [number, number][];
-  tilt: [number, number][];
-}
-
-/**
- * Measured rows, wide → tele. Rows beyond the wide one list the steps that
- * were measured at that zoom; unmeasured steps interpolate within the row.
- * (Filled from probe-speed-zoom.ts RESULTS_JSON — see speedSurface below.)
- */
-export const SPEED_SURFACE: SpeedRow[] = [
-  { zoom: 0, pan: PAN_SPEEDS_WIDE, tilt: TILT_SPEEDS_WIDE },
-  // Measured 2026-10-10 (probe-speed-zoom.ts, pose two-timed sweep, zoom read
-  // back from the lens). Byte 0 is the 1.47°/s floor gear at every zoom
-  // (probe-mech.ts: 1.53 @900, 1.46 @1437). Up to ~zoom 300 nothing changes;
-  // from ~600 the firmware remaps bytes onto progressively slower native
-  // speeds, until at 1200+ bytes 1-2 sit on the floor and 3-4 on ~2.9°/s.
-  {
-    zoom: 300,
-    pan: [[0, 1.47], [1, 7.43], [2, 14.77], [3, 20.92], [4, 28.55], [6, 32.71], [8, 38.7], [12, 41.95], [18, 61.08]],
-    tilt: [[0, 1.47], [1, 3.4], [2, 4.91], [3, 5.46], [5, 9.84], [8, 12.28]],
-  },
-  {
-    zoom: 600,
-    pan: [[0, 1.47], [1, 2.78], [2, 7.48], [3, 7.79], [4, 15.63], [6, 20.83], [8, 28.24], [12, 33.6], [18, 44.41]],
-    tilt: [[0, 1.47], [1, 1.7], [2, 3.25], [3, 4.12], [5, 7.76], [8, 11.63]],
-  },
-  {
-    zoom: 900,
-    pan: [[0, 1.47], [1, 1.49], [2, 3.12], [3, 6.6], [4, 7.82], [6, 13.98], [8, 22.11], [12, 23.67], [18, 35.73]],
-    tilt: [[0, 1.47], [1, 1.7], [2, 3.26], [3, 5.13], [5, 6.51], [8, 10.12]],
-  },
-  {
-    zoom: 1200,
-    // Bytes 12-18 / tilt 10 re-measured 2026-10-10 17:55 (probe-speed-zoom.ts).
-    pan: [[0, 1.47], [1, 1.32], [2, 1.39], [3, 2.8], [4, 2.97], [6, 7.0], [8, 7.0], [12, 14.84], [16, 21.11], [18, 23.19]],
-    tilt: [[0, 1.47], [1, 1.36], [2, 1.61], [3, 2.93], [5, 3.08], [8, 4.32], [10, 6.15]],
-  },
-  // Full tele (measured 2026-10-10 15:17, probe-speed-zoom.ts): bytes 0-4
-  // are ALL the ~1.5°/s floor gear on both axes (pan 1.56/1.48/1.47/1.32/
-  // 1.41, tilt 1.61/1.55/1.44/1.71/1.43). Bytes ≥5 still carried over from
-  // the 1200 row until measured. (The earlier guess of 2.9°/s at bytes 3-4
-  // made the dither "deliver" a rate the motor never produced — the loop's
-  // integrator wound up and hunted at tele.)
-  // Second probe 15:25: bytes 5-6 are still the floor; byte 8 = 2.63 (pan) /
-  // 2.93 (tilt); byte 12 = 2.97 (pan). Byte 18 unmeasured (kept from 1200).
-  {
-    zoom: 1437,
-    // Third probe 2026-10-10 17:52 (bytes 12-18 pan, 8-20 tilt): the fast
-    // pan gear at full tele is ~7.4°/s (bytes 16-18), NOT the 22°/s carried
-    // over from the 1200 row — bytes 12-15 are all ~3°/s. Tilt tops out at
-    // ~4.6°/s (byte 20). So at tele the only gears are ~1.5 / ~3 / ~7.4°/s.
-    pan: [[0, 1.47], [6, 1.5], [8, 2.63], [12, 2.97], [14, 3.14], [16, 7.06], [18, 7.39]],
-    tilt: [[0, 1.5], [6, 1.6], [8, 2.93], [12, 3.06], [14, 3.25], [16, 4.09], [20, 4.62]],
-  },
-];
-
-/** Rate at `step` within one row: linear between neighbouring measured steps. */
-function rateInRow(row: [number, number][], step: number): number {
-  if (step <= row[0][0]) return row[0][1];
-  for (let i = 1; i < row.length; i++) {
-    if (step <= row[i][0]) {
-      const [s0, r0] = row[i - 1];
-      const [s1, r1] = row[i];
-      return r0 + ((step - s0) / (s1 - s0)) * (r1 - r0);
-    }
-  }
-  return row[row.length - 1][1];
-}
-
-/**
- * The speed table that applies at `zoomUnits`: every step of the wide table,
- * each rate interpolated between the bracketing measured rows. Entries that
- * fail to rise ≥0.05°/s over the previous one are dropped so the dither's
- * bracket never divides by a zero-width gap (at tele most bytes collapse onto
- * the floor and only the rising ones remain).
- */
-export function speedTableAt(
-  axis: "pan" | "tilt",
-  zoomUnits: number,
-  rows: SpeedRow[] = SPEED_SURFACE,
-): [number, number][] {
-  const wide = rows[0][axis];
-  if (rows.length === 1) return wide;
-  const z = Math.max(rows[0].zoom, Math.min(rows[rows.length - 1].zoom, zoomUnits));
-  let lo = rows[0];
-  let hi = rows[rows.length - 1];
-  for (let i = 1; i < rows.length; i++) {
-    if (z <= rows[i].zoom) {
-      lo = rows[i - 1];
-      hi = rows[i];
-      break;
-    }
-  }
-  const f = hi.zoom === lo.zoom ? 0 : (z - lo.zoom) / (hi.zoom - lo.zoom);
-  const out: [number, number][] = [];
-  let last = -Infinity;
-  for (const [step] of wide) {
-    const r = rateInRow(lo[axis], step) * (1 - f) + rateInRow(hi[axis], step) * f;
-    if (r >= last + 0.05) {
-      out.push([step, r]);
-      last = r;
-    }
-  }
-  return out;
-}
+// Drive-speed step -> SUSTAINED deg/s comes from the camera profile
+// (tracker.camera.speedSurface, shared/src/camera-profile.ts): a per-zoom
+// table the driver interpolates (linear in zoom between measured rows,
+// linear in step within a row). Speed step 0 may be a real gear; "stopped"
+// is STOP_STEP (-1).
 
 /** Sentinel for "axis not driven" — distinct from speed byte 0, a real gear. */
 const STOP_STEP = -1;
-/** Absolute moves run flat out (pan 0x18 / tilt 0x14, the maxima)... */
-const ABS_PAN_SPEED = 0x18;
-const ABS_TILT_SPEED = 0x14;
-/** ...except LONG pan slews (dead-zone wraps, big re-targets): the pan
- *  pointing jumped ~+2° across a wrap pass (SWA2306, 2026-10-11; landmark
- *  checks saw −2.0/+1.0° jumps that afternoon) — the motor missing steps
- *  while flinging the head through ~300°. */
-const ABS_PAN_SPEED_LONG = 0x12;
-const LONG_PAN_MOVE_DEG = 120;
+
 
 /** Sustained deg/s of a discrete speed step (nearest table entry). */
 function stepRate(table: [number, number][], step: number): number {
@@ -437,21 +303,11 @@ export class ViscaCamera implements CameraDriver {
     return st.onHi ? hiStep : loStep;
   }
 
-  /** Tilt rests only on detents ~0.33° apart (probed at full tele: a
-   *  pulse moves 0 or 22-24 encoder units, never less). Below the slowest
-   *  gear the dither's bursts slid one or two detents and the loop then
-   *  pulsed back — a 0.3-0.8° up-down limit cycle, 15-35% of the frame
-   *  height at 4° HFOV. The stepper below takes exactly one detent per
-   *  pulse, only in the direction the plane needs. */
-  static readonly TILT_DETENT_DEG = 0.33;
-  /** 120 ms at speed 2 moved exactly one detent in every probe trial; 40-80 ms
-   *  sometimes moved nothing (and the stall let a climbing plane out of frame). */
-  private static readonly TILT_PULSE_MS = 120;
-  /** Above this the stepper's ~3 pulses/s cadence can't keep up (ASA1403
-   *  climbing at 0.9°/s: tilt froze 0.8 s, lag 1.2°, plane left the frame). */
-  private static readonly STEPPER_MAX_DPS = 0.45;
-  /** Zoom from which the stepper replaces dithering (detent vs frame). */
-  private static readonly STEPPER_MIN_ZOOM = 900;
+  /** Tilt detent stepping (profile.tiltStepper): below the slowest gear the
+   *  dither's bursts slid one or two detents and the loop then pulsed back
+   *  — a 0.3-0.8° up-down limit cycle, 15-35% of the frame height at 4°
+   *  HFOV. The stepper takes exactly one detent per pulse, only in the
+   *  direction the plane needs. */
   private tiltStepper = { acc: 0, until: 0, dir: 0, lastAt: 0, active: false };
 
   /**
@@ -471,9 +327,11 @@ export class ViscaCamera implements CameraDriver {
     const dt = st.lastAt ? Math.min(0.2, (now - st.lastAt) / 1000) : 0;
     st.lastAt = now;
     const slowest = table[0][1];
+    const P = this.o.profile().tiltStepper;
     const engaged =
-      zoom >= ViscaCamera.STEPPER_MIN_ZOOM &&
-      Math.abs(want) < Math.min(0.8 * slowest, ViscaCamera.STEPPER_MAX_DPS);
+      P != null &&
+      zoom >= P.minZoomUnits &&
+      Math.abs(want) < Math.min(0.8 * slowest, P.maxDps);
     if (!engaged) {
       st.active = false;
       st.acc = 0;
@@ -481,14 +339,14 @@ export class ViscaCamera implements CameraDriver {
       return null;
     }
     st.active = true;
-    if (now < st.until) return { step: 2, dir: st.dir };
-    const D = ViscaCamera.TILT_DETENT_DEG;
+    if (now < st.until) return { step: P.pulseSetting, dir: st.dir };
+    const D = P.detentDeg;
     st.acc = Math.max(-1.5 * D, Math.min(1.5 * D, st.acc + want * dt));
     if (Math.abs(st.acc) >= 0.6 * D) {
       st.dir = Math.sign(st.acc);
       st.acc -= st.dir * D;
-      st.until = now + ViscaCamera.TILT_PULSE_MS;
-      return { step: 2, dir: st.dir };
+      st.until = now + P.pulseMs;
+      return { step: P.pulseSetting, dir: st.dir };
     }
     return { step: STOP_STEP, dir: 0 };
   }
@@ -546,8 +404,8 @@ export class ViscaCamera implements CameraDriver {
     const z = this.currentZoom();
     const R = opts?.rippleDeg ?? ViscaCamera.DITHER_RIPPLE_DEG;
     const RT = opts?.rippleTiltDeg ?? R;
-    const panStep = this.pickDithered(this.panDither, speedTableAt("pan", z), pd, now, R);
-    const tiltTable = speedTableAt("tilt", z);
+    const panStep = this.pickDithered(this.panDither, speedTableAt("pan", z, this.o.profile().speedSurface), pd, now, R);
+    const tiltTable = speedTableAt("tilt", z, this.o.profile().speedSurface);
     let tiltStep: number;
     const stepper = this.tiltDetentStep(tiltTable, td, z, now);
     if (stepper !== null) {
@@ -584,7 +442,12 @@ export class ViscaCamera implements CameraDriver {
     this.lastSentZoom = z;
     this.noteZoomCommand(z);
     this.lastSentFocus = null; // zoom tracking moves the focus
+    // A timed focus drive is for the zoom the lens is leaving; and zoom
+    // commands sent during one were dropped 5× as often (5.7% vs 1.1%,
+    // 2026-10-14) — end it first, as setZoomFocus does.
+    this.stopFocusDrive();
     this.sendCommand([0x81, 0x01, 0x04, 0x47, ...nibbles(z, 4), 0xff]);
+    this.zoomSent(z);
   }
 
   private lastSentFocus: number | null = null;
@@ -634,6 +497,7 @@ export class ViscaCamera implements CameraDriver {
     this.sweptSinceFocus = false;
     // Focus is signed 16-bit on this lens; nibbles() masks to 0xffff.
     this.sendCommand([0x81, 0x01, 0x04, 0x47, ...nibbles(z, 4), ...nibbles(f, 4), 0xff]);
+    this.zoomSent(z);
   }
 
   /** Re-send an unchanged direct focus after this long (it lands in ~2-3 s). */
@@ -750,9 +614,9 @@ export class ViscaCamera implements CameraDriver {
     // Dead-reckon jog motion too (the limit guard rides on these).
     const z = this.currentZoom();
     this.cmdPanDps =
-      Math.abs(pan) > 0.05 ? Math.sign(pan) * stepRate(speedTableAt("pan", z), panSpeed) : 0;
+      Math.abs(pan) > 0.05 ? Math.sign(pan) * stepRate(speedTableAt("pan", z, this.o.profile().speedSurface), panSpeed) : 0;
     this.cmdTiltDps =
-      Math.abs(tilt) > 0.05 ? Math.sign(tilt) * stepRate(speedTableAt("tilt", z), tiltSpeed) : 0;
+      Math.abs(tilt) > 0.05 ? Math.sign(tilt) * stepRate(speedTableAt("tilt", z, this.o.profile().speedSurface), tiltSpeed) : 0;
     this.sendCommand([
       0x81, 0x01, 0x06, 0x01,
       panSpeed, tiltSpeed,
@@ -764,6 +628,7 @@ export class ViscaCamera implements CameraDriver {
     const zs = Math.min(7, Math.round(Math.abs(zoom) * 7));
     const zoomByte = zoom > 0.05 ? 0x20 | zs : zoom < -0.05 ? 0x30 | zs : 0x00;
     this.sendCommand([0x81, 0x01, 0x04, 0x07, zoomByte, 0xff]);
+    this.zoomGoalVoid();
   }
 
   stopMotion(): void {
@@ -775,6 +640,7 @@ export class ViscaCamera implements CameraDriver {
     this.cmdTiltDps = 0;
     this.sendCommand([0x81, 0x01, 0x06, 0x01, 0x01, 0x01, 0x03, 0x03, 0xff]);
     this.sendCommand([0x81, 0x01, 0x04, 0x07, 0x00, 0xff]);
+    this.zoomGoalVoid();
   }
 
   getPose(): CameraPose | null {
@@ -881,10 +747,11 @@ export class ViscaCamera implements CameraDriver {
     if (moved) {
       const p = nibbles(panDegToUnits(w.panDeg, this.o.units), 4);
       const t = nibbles(tiltDegToUnits(w.tiltDeg, this.o.units), 4);
-      const longMove = this.pose != null && Math.abs(w.panDeg - this.pose.panDeg) > LONG_PAN_MOVE_DEG;
+      const abs = this.o.profile().absolute;
+      const longMove = this.pose != null && Math.abs(w.panDeg - this.pose.panDeg) > abs.longPanMoveDeg;
       this.sendCommand([
         0x81, 0x01, 0x06, 0x02,
-        longMove ? ABS_PAN_SPEED_LONG : ABS_PAN_SPEED, ABS_TILT_SPEED,
+        longMove ? abs.longPanSetting : abs.panSetting, abs.tiltSetting,
         ...p, ...t, 0xff,
       ]);
       this.lastSent = { panDeg: w.panDeg, tiltDeg: w.tiltDeg };
@@ -900,11 +767,13 @@ export class ViscaCamera implements CameraDriver {
       this.lastSentDurMs = travelSec * 1000 + 400;
     }
     if (zoomMoved) {
+      this.stopFocusDrive(); // see setZoom
       const z = nibbles(Math.round(w.zoomUnits), 4);
       this.sendCommand([0x81, 0x01, 0x04, 0x47, ...z, 0xff]);
       this.lastSentZoom = w.zoomUnits;
       this.lastSentFocus = null; // zoom tracking moves the focus
       this.noteZoomCommand(w.zoomUnits);
+      this.zoomSent(w.zoomUnits);
     }
   }
 
@@ -951,12 +820,111 @@ export class ViscaCamera implements CameraDriver {
     return Math.abs(v - f.units) <= 2 && Math.abs(v - cur) > 100;
   }
 
+  /**
+   * The lens only travels toward the zoom it was sent (profile lens travel
+   * rate), so a
+   * reading outside [last reading … commanded] plus the travel possible since
+   * is not where the lens is. 2026-10-14: 11 such readings in 20 passes
+   * (1085 → 113 → 1173; values 32-300, mostly 104-120, at lens 850-1330 —
+   * not the focus position, so isFocusEcho misses them; sometimes two in a
+   * row). Each one told vision the frame was ~52° wide instead of ~8° for a
+   * few frames (×6 corrections, a dropped lock) and restarted the
+   * lens-settle clock. Accepted only after 3 consistent readings in a row.
+   */
+  private zoomOddReads: number[] = [];
+  private zoomOddAt = 0;
+  private lastZoomReadAt = 0;
+  private isZoomJump(v: number): boolean {
+    const cur = this.pose?.zoomUnits;
+    const now = Date.now();
+    const dt = now - this.lastZoomReadAt;
+    const cmd = this.lastSentZoom ?? cur;
+    // Travel slack capped: after a reply stall (seen: 1.5 s+) the lens is
+    // still somewhere between where it was and where it was sent.
+    const travelPerMs = this.o.profile().lens.travelUnitsPerSec / 1000;
+    const slack = 100 + 1.2 * travelPerMs * Math.min(dt, 500);
+    const ok =
+      cur == null || cmd == null ||
+      (v >= Math.min(cur, cmd) - slack && v <= Math.max(cur, cmd) + slack);
+    // A streak is consecutive answers (~200-400 ms apart); stray bad values
+    // seconds apart cluster at 104-137 and must not add up to one.
+    if (now - this.zoomOddAt > 800) this.zoomOddReads = [];
+    if (!ok) this.zoomOddAt = now;
+    const odd = this.zoomOddReads;
+    if (!ok && (odd.length === 0 || Math.abs(v - odd[odd.length - 1]) <= 120) && odd.length < 2) {
+      odd.push(v);
+      return true;
+    }
+    if (!ok && odd.length > 0 && Math.abs(v - odd[odd.length - 1]) > 120) {
+      this.zoomOddReads = [v];
+      return true;
+    }
+    this.zoomOddReads = [];
+    this.lastZoomReadAt = now;
+    return false;
+  }
+
   /** Lens stuck: zoom commands keep asking for another zoom, the camera keeps
    *  answering the same one (2026-10-12 21:56Z: zoom 976 / focus 184 from
    *  then on, through a tracker restart — pan/tilt fine; only a camera
    *  reboot / power-cycle clears it). */
   private static readonly LENS_STUCK_MS = 10_000;
   private static readonly LENS_STUCK_UNITS = 40;
+
+  /**
+   * Zoom delivery is closed-loop. The camera now and then drops a Zoom
+   * Direct without a trace (2026-10-14: 1% of zoom commands, 6% of those
+   * sent during a timed focus drive), and every send path dedupes on the
+   * last zoom SENT — so a dropped command was never repeated: the lens sat
+   * at the old zoom until the loop happened to want a different one (UAL817:
+   * 4.6 s at tele after a target change, no lock; one mid-pass zoom was
+   * ignored 27 s). The commanded zoom is the goal until a lens reading
+   * arrives at it; while readings show no progress toward it for
+   * ZOOM_RESEND_MS (doubling per unanswered resend), it is sent again.
+   */
+  private zoomDelivery: { goal: number; best: number; progressAt: number; resends: number } | null = null;
+  /** Lens reading this close to the goal = arrived (zoom units). */
+  private static readonly ZOOM_ARRIVE_UNITS = 15;
+  /** No progress toward the goal for this long after a send → resend, ms. */
+  private static readonly ZOOM_RESEND_MS = 1500;
+
+  /** A zoom position went out (any command that carries one). */
+  private zoomSent(z: number): void {
+    const d = this.zoomDelivery;
+    const resends = d && Math.abs(d.goal - z) <= 8 ? d.resends : 0;
+    this.zoomDelivery = { goal: z, best: Infinity, progressAt: Date.now(), resends };
+  }
+
+  /** A zoom drive or stop (jog, stopMotion) leaves the lens wherever it
+   *  halts: there is no goal to deliver, and the next zoom position must
+   *  go out even if it equals the last one sent. */
+  private zoomGoalVoid(): void {
+    this.zoomDelivery = null;
+    this.lastSentZoom = null;
+  }
+
+  private checkZoomDelivery(zoom: number): void {
+    const d = this.zoomDelivery;
+    if (!d) return;
+    const now = Date.now();
+    const dist = Math.abs(zoom - d.goal);
+    if (dist <= ViscaCamera.ZOOM_ARRIVE_UNITS) {
+      this.zoomDelivery = null;
+      return;
+    }
+    if (dist < d.best - 2) {
+      d.best = dist;
+      d.progressAt = now;
+      return;
+    }
+    if (now - d.progressAt < ViscaCamera.ZOOM_RESEND_MS * 2 ** Math.min(3, d.resends)) return;
+    d.resends++;
+    d.best = Infinity;
+    d.progressAt = now;
+    this.lastSentFocus = null; // zoom tracking moves the focus
+    console.log(`[visca] zoom ${d.goal} not taken up (lens at ${zoom}) — resent (#${d.resends})`);
+    this.sendCommand([0x81, 0x01, 0x04, 0x47, ...nibbles(d.goal, 4), 0xff]);
+  }
 
   private noteZoomCommand(z: number): void {
     const st = this.zoomReadStill;
@@ -1073,8 +1041,10 @@ export class ViscaCamera implements CameraDriver {
         const zoomMax = Math.max(this.o.units.zoomWideUnits, this.o.units.zoomTeleUnits);
         if (v < 0 || v > zoomMax + 64) return; // not a zoom reading
         if (this.isFocusEcho(v)) return;
+        if (this.isZoomJump(v)) return;
         const zoom = v;
         this.noteZoomReading(zoom);
+        this.checkZoomDelivery(zoom);
         this.lastInquiryReply = Date.now();
         this.pose = {
           panDeg: this.pose?.panDeg ?? 0,

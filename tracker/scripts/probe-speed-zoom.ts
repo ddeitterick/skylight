@@ -1,7 +1,8 @@
 // Speed-vs-zoom SURFACE: sustained drive rate for each pan/tilt speed byte at
 // several zoom positions, by pose-encoder two-timed sweep (positions read
 // only while stationary). This firmware scales drive speed with zoom, and the
-// result is camera/visca.ts SPEED_SURFACE (paste the RESULTS_JSON rows).
+// result is the camera profile's speedSurface (tracker.camera, see
+// shared/src/camera-profile.ts; paste the RESULTS_JSON rows).
 //
 // When: after a firmware update or a camera swap, or when tele tracking
 // shows the integrator winding up (the dither's model no longer matches).
@@ -13,9 +14,13 @@
 
 import dgram from "node:dgram";
 
-const IP = process.env.CAMERA_IP ?? "192.168.5.206";
+import { cameraTarget } from "./lib/camera-config.js";
+
+// Address and encoder units from the tracker config (any VISCA camera).
+const CAM = cameraTarget();
+const IP = process.env.CAMERA_IP ?? CAM.ip;
 const PORT = 52381;
-const PAN_UPD = 71.714, PAN_ZERO = 12550, TILT_UPD = 69.333, TILT_ZERO = 6240;
+const PAN_UPD = CAM.panUpd, PAN_ZERO = CAM.panZero, TILT_UPD = CAM.tiltUpd, TILT_ZERO = CAM.tiltZero;
 const T1_MS = 700, T2_MS = 1600;
 const PT_COMMAND = 0x0100, PT_INQUIRY = 0x0110, PT_CONTROL = 0x0200;
 

@@ -118,7 +118,14 @@ def stabilize(clip: str, series: dict | None, clip_offset: float, out_dir: str, 
                 missing += 1
                 continue
             ax[i], ay[i] = ox[j], oy[j]
-        after = metrics(ax, ay, on)
+        # Judge before and after on the SAME frames — where the plane was found
+        # in both. The output tracker finds the plane in more frames (0.72 →
+        # 0.90 on 20261014T195349Z-ac4279), and those extra, noisier finds
+        # inflated "after" shake 5× while the shift path itself lowered it.
+        both = on & np.isfinite(an.px) & np.isfinite(ax)
+        before = metrics(an.px, an.py, both)
+        summary.update(wobbleBefore=before["wobble"], shakeBefore=before["shake"], hopBefore=before["hop"])
+        after = metrics(ax, ay, both)
         predicted = metrics(an.px + plan.dx, an.py + plan.dy, on)
         extra.update(renderSec=round(t_render, 1), measureSec=round(t_measure, 1), outFrames=len(opts),
                      ptsMissing=missing, shifted=rr["shifted"], flatFielded=rr["flatFielded"],

@@ -53,6 +53,7 @@ async function main(): Promise<void> {
             port: t.viscaPort,
             units: t.units,
             limits: t.limits,
+            profile: () => upstream.getConfig().tracker.camera,
           })
         : new SimCamera(t.limits, t.units);
     d.start();

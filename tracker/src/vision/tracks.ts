@@ -208,11 +208,34 @@ export class CandidateTrack {
     };
   }
 
-  /** Track position extrapolated to time t (capped — don't coast forever). */
-  positionAt(t: number): { azDeg: number; elDeg: number } {
+  /**
+   * Track position extrapolated to time t, for as long as a track can live
+   * unseen (EXPIRE_LOCKED_MS). The cap used to be 1.5 s while the locked
+   * track lives 3.8 s: for the last 2.3 s of its grace the lock predicted a
+   * FROZEN point in the sky, the camera kept following the plane, and the
+   * frozen point slid across the frame at the plane's rate — the vision
+   * searched the frame edge while the plane sat near centre, and a fresh
+   * detection was too far from the frozen point to re-join the lock
+   * (SKW4655 2026-10-14: 6 s gap at tele, plane visible throughout; 34% of
+   * tele vision misses were in that frozen window).
+   *
+   * `coast`: world rates to carry the track forward past its last sighting
+   * instead of its own velocity fit — for the lock, the predicted plane
+   * motion. A lock may match the prediction to only ±50% (lockVelTolerance);
+   * SKW4655's fit said 0.75°/s where the plane flew 1.0°/s, 0.9° off after
+   * 3.8 s at a 0.6° gate.
+   */
+  positionAt(
+    t: number,
+    coast?: { azRateDps: number; elRateDps: number },
+  ): { azDeg: number; elDeg: number } {
     const last = this.latest();
+    const capSec = EXPIRE_LOCKED_MS / 1000;
+    const dt = Math.max(-capSec, Math.min(capSec, (t - last.t) / 1000));
+    if (coast && dt > 0) {
+      return { azDeg: last.azDeg + coast.azRateDps * dt, elDeg: last.elDeg + coast.elRateDps * dt };
+    }
     const v = this.velocity();
-    const dt = Math.max(-1.5, Math.min(1.5, (t - last.t) / 1000));
     if (v.n < 2) return { azDeg: last.azDeg, elDeg: last.elDeg };
     return {
       azDeg: last.azDeg + v.azRateDps * dt,
@@ -238,6 +261,9 @@ export class TrackTable {
   private lockedId: number | null = null;
   private challengerId: number | null = null;
   private challengerCount = 0;
+  /** Predicted plane rates from the last select(): how the lock coasts
+   *  while unseen (see CandidateTrack.positionAt). */
+  private coast: { azRateDps: number; elRateDps: number } | null = null;
 
   all(): CandidateTrack[] {
     return this.tracks;
@@ -247,12 +273,18 @@ export class TrackTable {
     return this.tracks.find((t) => t.id === this.lockedId) ?? null;
   }
 
+  /** Where the lock is at time t — coasting with the plane while unseen. */
+  lockedPositionAt(t: number): { azDeg: number; elDeg: number } | null {
+    return this.lockedTrack()?.positionAt(t, this.coast ?? undefined) ?? null;
+  }
+
   /** Drop the lock and all tracks (target switch — nothing carries over). */
   reset(): void {
     this.tracks = [];
     this.lockedId = null;
     this.challengerId = null;
     this.challengerCount = 0;
+    this.coast = null;
   }
 
   /**
@@ -267,7 +299,7 @@ export class TrackTable {
       const tr = this.tracks[ti];
       for (let oi = 0; oi < observations.length; oi++) {
         const o = observations[oi];
-        const p = tr.positionAt(o.t);
+        const p = tr.positionAt(o.t, tr.id === this.lockedId ? this.coast ?? undefined : undefined);
         const cosE = Math.max(0.2, Math.cos((o.elDeg * DEG)));
         const d = Math.hypot(
           norm180(o.azDeg - p.azDeg) * cosE,
@@ -320,6 +352,7 @@ export class TrackTable {
    * information — its weight scales down rather than letting noise decide.
    */
   select(pred: PredictedMotion, now: number, opts: SelectOptions = {}): ScoredTrack | null {
+    this.coast = { azRateDps: pred.azRateDps, elRateDps: pred.elRateDps };
     const posScale = opts.posScaleDeg ?? 1.6;
     const velScale = VEL_SCALE_DPS;
     const velTol = (r: number) => opts.velTolDps ?? lockVelTolerance(r);

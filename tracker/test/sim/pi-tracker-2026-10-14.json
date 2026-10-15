@@ -1,0 +1,128 @@
+{
+ "site": {
+  "lat": 37.63,
+  "lon": -122.41,
+  "altM": 0
+ },
+ "limits": {
+  "panMinDeg": -175,
+  "panMaxDeg": 175,
+  "tiltMinDeg": -20,
+  "tiltMaxDeg": 85,
+  "panSpeedMaxDps": 65,
+  "tiltSpeedMaxDps": 55
+ },
+ "units": {
+  "panUnitsPerDeg": 71.714,
+  "tiltUnitsPerDeg": 69.333,
+  "panZeroUnits": 12550,
+  "tiltZeroUnits": 6240,
+  "zoomWideUnits": 0,
+  "zoomTeleUnits": 1437
+ },
+ "mount": {
+  "panOffsetDeg": 27.391140678620616,
+  "tiltOffsetDeg": 2.1445565136805693,
+  "panGain": 0.9785923841713607,
+  "tiltGain": 0.9965184992532676,
+  "levelTiltDeg": 27.460152498549814,
+  "levelDirDeg": 217.01038033722216
+ },
+ "predict": {
+  "adsbLatencySec": 0,
+  "maxLeadSec": 3,
+  "commandHz": 15,
+  "pursuit": "velocity",
+  "posSmoothing": 0.7,
+  "errSmoothing": 0.5,
+  "maxAccelDps2": 80,
+  "minSweepDps": 0.6,
+  "rippleDeg": 0.5,
+  "rippleTeleDeg": 0.25,
+  "panLatencySec": 0.6,
+  "tiltLatencySec": 0.4,
+  "aimLeadSec": -0.2
+ },
+ "zoom": {
+  "auto": true,
+  "sigmaDeg": 0.6,
+  "lockedSigmaDeg": 0.35,
+  "fillFrac": 0.42,
+  "minHfovDeg": 4.1,
+  "minHfovAboveRateDps": 0.5,
+  "manualHfovDeg": 20,
+  "fovLut": [
+   {
+    "units": 0,
+    "hfovDeg": 56.48
+   },
+   {
+    "units": 180,
+    "hfovDeg": 49.08
+   },
+   {
+    "units": 360,
+    "hfovDeg": 39.04
+   },
+   {
+    "units": 540,
+    "hfovDeg": 29.8
+   },
+   {
+    "units": 720,
+    "hfovDeg": 22.1
+   },
+   {
+    "units": 900,
+    "hfovDeg": 16.3
+   },
+   {
+    "units": 1080,
+    "hfovDeg": 10.65
+   },
+   {
+    "units": 1260,
+    "hfovDeg": 6.6
+   },
+   {
+    "units": 1437,
+    "hfovDeg": 3.4
+   }
+  ],
+  "rateFloorDegPerDps": 2.5,
+  "rateFloorMaxDeg": 12,
+  "stopUnits": [
+   1437,
+   1385,
+   1332,
+   1260,
+   1173,
+   1080,
+   976,
+   850,
+   720,
+   540,
+   360,
+   0
+  ],
+  "stopRatio": 1.3
+ },
+ "vision": {
+  "enabled": true,
+  "applyCorrection": true,
+  "lockWide": true,
+  "autofocusOnZoom": true,
+  "intervalMs": 100,
+  "encodeLagMs": 700,
+  "correctionSlewDps": 2.5,
+  "autoCalibrate": true,
+  "frameLagMs": 700
+ },
+ "target": {
+  "minElevationDeg": 11,
+  "maxRangeMi": 6,
+  "minAltFt": 500,
+  "hysteresisSec": 4,
+  "switchMargin": 0.3
+ }
+}

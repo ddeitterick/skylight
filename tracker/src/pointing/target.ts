@@ -73,8 +73,10 @@ export function selectTarget(
   staleSec = 15,
   posStaleSec = 30,
   horizon?: { azDeg: number; minElDeg: number }[],
-  /** Sun direction (null/absent = below the horizon or unknown). */
-  sun?: { azDeg: number; elDeg: number } | null,
+  /** Sun direction (null/absent = below the horizon or unknown), and the
+   *  separation below which a plane can't be filmed with the sun out of the
+   *  picture even at full tele (absent: criteria.sunAvoidDeg). */
+  sun?: { azDeg: number; elDeg: number; keepOutDeg?: number } | null,
   /** Home airport: departures climbing out toward the site get priority. */
   airport?: { lat: number; lon: number } | null,
   /**
@@ -85,7 +87,7 @@ export function selectTarget(
    */
   cooldown?: ReadonlyMap<string, number>,
 ): Selection {
-  const sunAvoid = c.sunAvoidDeg ?? 15;
+  const sunAvoid = sun?.keepOutDeg ?? c.sunAvoidDeg ?? 15;
   const candidates: Candidate[] = [];
 
   for (const ac of aircraft) {
