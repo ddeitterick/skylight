@@ -22,6 +22,7 @@ interface RawAircraft {
   gs?: number;
   track?: number;
   baro_rate?: number;
+  geom_rate?: number;
   squawk?: string;
   category?: string;
   r?: string;
@@ -49,7 +50,11 @@ export function normalize(raw: RawAircraft, ts: number, jsonAgeSec = 0): Aircraf
     altGeom: raw.alt_geom ?? null,
     gs: raw.gs,
     track: raw.track,
-    baroRate: raw.baro_rate ?? null,
+    // Vertical rate: barometric, else geometric (GNSS). Some transponders
+    // send only geom_rate (2 of 28 aircraft on 2026-10-15) — a departure
+    // whose baro_rate stopped mid-climb read as level and lost its
+    // departure priority (UAL44: 11 s into the climb, camera handed back).
+    baroRate: raw.baro_rate ?? raw.geom_rate ?? null,
     squawk: raw.squawk,
     category: raw.category,
     onGround,

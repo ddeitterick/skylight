@@ -264,6 +264,12 @@ export interface TrackerConfig {
      * when the refit clearly beats the current model.
      */
     autoCalibrate: boolean;
+    /**
+     * Let auto-calibration refit the pan/tilt GAINS too (encoder scale, a
+     * camera property). Off by default: plane samples barely constrain them
+     * and the offsets trade against them. Turn on once for a new camera.
+     */
+    autoCalGains?: boolean;
   };
 
   /**

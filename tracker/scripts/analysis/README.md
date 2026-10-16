@@ -23,3 +23,8 @@ holds install data: the site and mount come from the environment.
 - Loop twin (no camera needed): `tracker/test/sim/` + `tracker/test/loop-sim.test.ts`
   — the real ControlLoop + VISCA driver against a profile-driven fake head. No
   vision in the twin: vision changes need live A/B.
+- `telegaps.py` (run on the Pi over session logs): tele lock gaps split into pan wrap / slew
+  vs vision misses, each frame classified from `visionMiss` (spot outside frame, no
+  candidates, candidates elsewhere, motion check).
+- `blindspot.py`: how many archived passes cross the pan dead zone (and pass near the mount
+  pole) for each base rotation — tells the owner which way to turn the camera.

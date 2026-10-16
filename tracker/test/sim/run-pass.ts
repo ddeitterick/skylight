@@ -17,8 +17,10 @@ import {
   type CameraProfile,
   type Config,
   type TrackerConfig,
+  type TrackerState,
 } from "@shared/index.js";
 import { FakeViscaHead, type HeadOptions } from "./fake-visca-head.js";
+import { OracleCamera, type OracleOptions } from "./oracle-vision.js";
 import PI from "./pi-tracker-2026-10-14.json" with { type: "json" };
 
 export interface Flight {
@@ -54,6 +56,18 @@ export interface PassMetrics {
    *  last one, s (see HeadOptions.dropZoom). */
   zoomCommands: number;
   zoomIdleOffMaxSec: number;
+  /** With `vision`: first time the lens was at HFOV ≤ 8° with the plane
+   *  in the middle half of the frame, s from the start (null = never). */
+  firstTeleSec: number | null;
+  /** With the plane in the middle half of the frame at HFOV ≤ 8°, s (the
+   *  quality score's "centred at tele"). */
+  centredTeleSec: number;
+  /** Lens zoom-direction reversals (in→out or out→in) of more than one stop. */
+  zoomReversals: number;
+  /** …of those, the ones with the plane inside the picture (visible pumping). */
+  zoomReversalsVisible: number;
+  /** Zoom-rule tags seen (loop zoomWhy), in order of first appearance. */
+  zoomWhy: string[];
 }
 
 export function baseTracker(over: Partial<TrackerConfig> = {}): TrackerConfig {
@@ -63,7 +77,7 @@ export function baseTracker(over: Partial<TrackerConfig> = {}): TrackerConfig {
     ...(PI as unknown as Partial<TrackerConfig>),
     driver: "visca",
     // no video in the sim: framing from ADS-B only
-    vision: { ...t.vision, ...(PI.vision as object), lockWide: false, applyCorrection: false },
+    vision: { ...t.vision, ...(PI.vision as Partial<TrackerConfig["vision"]>), lockWide: false, applyCorrection: false },
     home: { ...t.home, enabled: false },
     ...over,
   } as TrackerConfig;
@@ -92,7 +106,15 @@ export interface RunOptions {
   at?: Date;
   /** Called every simulation step with the camera axis, the true plane
    *  direction and the lens field of view. */
-  onSample?: (s: { tSec: number; axis: { azDeg: number; elDeg: number }; truth: { azDeg: number; elDeg: number }; hfov: number }) => void;
+  onSample?: (s: { tSec: number; axis: { azDeg: number; elDeg: number }; truth: { azDeg: number; elDeg: number }; hfov: number; state: TrackerState | null }) => void;
+  /** Run the REAL vision pipeline on synthetic frames (oracle-vision.ts):
+   *  the zoom ladder, lock and correction then behave as live. Vision config
+   *  comes from the Pi snapshot (lockWide + applyCorrection on). */
+  vision?: Partial<OracleOptions>;
+  /** Every session-log record the loop writes (visionMiss, snapshot, …). */
+  onRecord?: (kind: string, data: unknown) => void;
+  /** Head state at the start (e.g. still zoomed in on the previous target). */
+  start?: { panDeg?: number; tiltDeg?: number; zoomUnits?: number };
 }
 
 /** Default start instant: 03:00 PDT, sun well below the horizon. */
@@ -107,9 +129,32 @@ export async function runPass(
 ): Promise<PassMetrics> {
   vi.setSystemTime(opts.at ?? NIGHT);
   vi.stubEnv("SKYLIGHT_TRACKER_DATA", mkdtempSync(join(tmpdir(), "skylight-sim-")));
+  if (opts.vision) {
+    // Synthetic frames are already VISION_W×VISION_H luma: skip the JPEG decode.
+    vi.resetModules();
+    vi.doMock("../../src/vision/detect.js", async (orig) => ({
+      ...(await orig<typeof import("../../src/vision/detect.js")>()),
+      decodeLuma: async (b: Buffer) => new Uint8Array(b.buffer, b.byteOffset, b.length),
+    }));
+  }
   const { ControlLoop } = await import("../../src/loop.js");
-  const cfg: Config = { ...DEFAULT_CONFIG, tracker: { ...tracker, camera: profile ?? tracker.camera } };
+  if (opts.vision) vi.doUnmock("../../src/vision/detect.js");
+  const trackerCfg: TrackerConfig = opts.vision
+    ? { ...tracker, vision: { ...tracker.vision, ...(PI.vision as Partial<TrackerConfig["vision"]>), autoCalibrate: false } }
+    : tracker;
+  const cfg: Config = { ...DEFAULT_CONFIG, tracker: { ...trackerCfg, camera: profile ?? tracker.camera } };
   const sim = new FakeViscaHead(cfg.tracker.camera, cfg.tracker.units, cfg.tracker.limits, head);
+  if (opts.start) {
+    sim.place(opts.start);
+  }
+  const oracle = opts.vision
+    ? new OracleCamera(cfg.tracker.mount, {
+        lagMs: cfg.tracker.vision.encodeLagMs,
+        fps: 15,
+        spanM: 60.9, // B772, as in the fix
+        ...opts.vision,
+      })
+    : null;
 
   const site = cfg.tracker.site;
   const cosLat = Math.cos((site.lat * Math.PI) / 180);
@@ -137,8 +182,8 @@ export async function runPass(
     find: (hex: string) => (fix && fix.hex === hex ? fix : undefined),
     patchConfig() {},
   };
-  const recorder = { write() {}, recording: false, start() {}, stop() {} };
-  const video = { latestFrame: () => null, latestFrameAt: () => 0, status: () => ({ running: false }) };
+  const recorder = { write: (kind: string, data: unknown) => opts.onRecord?.(kind, data), recording: !!opts.onRecord, start() {}, stop() {} };
+  const video = oracle?.video ?? { latestFrame: () => null, latestFrameAt: () => 0, status: () => ({ running: false }) };
   const loop = new ControlLoop(
     upstream as never, () => sim.driver, recorder as never, video as never, () => {},
   );
@@ -162,6 +207,13 @@ export async function runPass(
   const along: number[] = [];
   const frac: number[] = [];
   let inFrame = 0;
+  let firstTeleSec: number | null = null;
+  let centredTele = 0;
+  let zoomReversals = 0;
+  let zoomReversalsVisible = 0;
+  let zoomDir = 0;
+  let zoomPivot = sim.zoom;
+  const zoomWhy: string[] = [];
   const DT = 50;
   for (let ms = 0; ms < flight.durationSec * 1000; ms += DT) {
     await vi.advanceTimersByTimeAsync(DT);
@@ -172,7 +224,35 @@ export async function runPass(
     }
     const truth = azElFromSite(site, predictGeo(kin, (Date.now() - t0) / 1000));
     const axis = worldFromMount({ panDeg: sim.panDeg, tiltDeg: sim.tiltDeg }, cfg.tracker.mount);
-    opts.onSample?.({ tSec: ms / 1000, axis, truth, hfov: hfovAt(cfg.tracker, sim.zoom) });
+    const hfovNow = hfovAt(cfg.tracker, sim.zoom);
+    const state = opts.onSample || oracle ? loop.getState() : null;
+    opts.onSample?.({ tSec: ms / 1000, axis, truth, hfov: hfovNow, state });
+    if (oracle) {
+      oracle.record({
+        t: Date.now(), panDeg: sim.panDeg, tiltDeg: sim.tiltDeg, hfovDeg: hfovNow,
+        truthAz: truth.azDeg, truthEl: truth.elDeg, slantM: truth.slantM,
+      });
+      const off = angularSepDeg(axis.azDeg, axis.elDeg, truth.azDeg, truth.elDeg);
+      if (hfovNow <= 8 && off < hfovNow * (9 / 16) * 0.25) {
+        centredTele += DT / 1000;
+        if (firstTeleSec == null) firstTeleSec = ms / 1000;
+      }
+      const why = (state?.target.zoomWhy ?? "").replace(/\+held$/, "");
+      if (why && !zoomWhy.includes(why)) zoomWhy.push(why);
+    }
+    // Reversals: the lens turns around after travelling more than ~one stop.
+    {
+      const dz = sim.zoom - zoomPivot;
+      const dir = Math.abs(dz) > 60 ? Math.sign(dz) : 0;
+      if (dir !== 0) {
+        if (zoomDir !== 0 && dir !== zoomDir) {
+          zoomReversals++;
+          if (angularSepDeg(axis.azDeg, axis.elDeg, truth.azDeg, truth.elDeg) < hfovNow * (9 / 16) / 2) zoomReversalsVisible++;
+        }
+        zoomDir = dir;
+        zoomPivot = sim.zoom;
+      } else if (zoomDir !== 0 && Math.sign(sim.zoom - zoomPivot) === zoomDir) zoomPivot = sim.zoom;
+    }
     if (truth.elDeg < 20 || ms < 8000) continue; // settle + clear sky only
     {
       const t1 = azElFromSite(site, predictGeo(kin, (Date.now() - t0) / 1000 + 0.2));
@@ -185,10 +265,9 @@ export async function runPass(
       if (v2 > 0.25) along.push((ox * vx + oy * vy) / v2);
     }
     const err = angularSepDeg(axis.azDeg, axis.elDeg, truth.azDeg, truth.elDeg);
-    const hfov = hfovAt(cfg.tracker, sim.zoom);
     errs.push(err);
-    frac.push(err / hfov);
-    if (err < hfov / 2 * 0.9) inFrame++;
+    frac.push(err / hfovNow);
+    if (err < hfovNow / 2 * 0.9) inFrame++;
   }
   loop.stop();
   const zoomCmds = sim.zoomCmds;
@@ -209,6 +288,11 @@ export async function runPass(
     alongSec: q(along, 0.5),
     zoomCommands: zoomCmds,
     zoomIdleOffMaxSec: sim.zoomIdleOffMaxSec,
+    firstTeleSec,
+    centredTeleSec: Math.round(centredTele * 10) / 10,
+    zoomReversals,
+    zoomReversalsVisible,
+    zoomWhy,
   };
 }
 

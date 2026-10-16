@@ -150,6 +150,16 @@ export class ViscaCamera implements CameraDriver {
   private lastSentZoom: number | null = null;
   /** Last velocity-drive command key (dedupe). */
   private lastDrive: string | null = null;
+  /** The zoom each axis's running drive speed was set at (see speedLatched). */
+  private latchZoom: { pan: number; tilt: number } | null = null;
+  /** When the last drive / zoom position command went out (re-latch pacing). */
+  private lastDriveSentAt = 0;
+  private lastZoomSentAt = 0;
+  /** Re-latch at most this often, and not this soon after a zoom command:
+   *  re-sending the drive on every tick while the lens travelled tripled the
+   *  camera's dropped Zoom Directs (build q, 2026-10-15: 7 resends in 21 min
+   *  vs 4-6 an hour) — a busy camera drops commands. */
+  private static readonly RELATCH_MIN_MS = 400;
 
   constructor(private o: ViscaOptions) {}
 
@@ -189,6 +199,7 @@ export class ViscaCamera implements CameraDriver {
       // driving on the last command until it grinds the ±175° hard stop.
       this.wanted = null;
       this.lastDrive = null;
+      this.latchZoom = null;
       this.sendCommand([0x81, 0x01, 0x06, 0x01, 0x01, 0x01, 0x03, 0x03, 0xff]);
       this.sendCommand([0x81, 0x01, 0x04, 0x07, 0x00, 0xff]);
       this.socket = null;
@@ -229,6 +240,7 @@ export class ViscaCamera implements CameraDriver {
 
   gotoAbsolute(pose: CameraPose): void {
     this.lastDrive = null; // absolute move supersedes velocity pursuit
+    this.latchZoom = null;
     this.cmdPanDps = 0; // dead reckoning only models velocity drives
     this.cmdTiltDps = 0;
     this.wanted = clampPose(pose, this.o.limits, this.o.units);
@@ -400,14 +412,22 @@ export class ViscaCamera implements CameraDriver {
     this.cmdTiltDps = td;
 
     const now = Date.now();
-    // Speed-by-zoom: the step→rate map depends on where the lens IS.
-    const z = this.currentZoom();
+    // Speed-by-zoom: the step→rate map depends on where the lens IS when
+    // the command lands. Zoom readings trail a travelling lens by a few
+    // hundred ms (hundreds of units), so the reading is advanced toward the
+    // commanded zoom; of the reading and that estimate, the table that
+    // makes the head FASTER is used — a mis-guess then undershoots instead
+    // of overshooting. (Target switches zoom out while slewing: a step
+    // picked at the stale tele reading ran several times faster at the
+    // wider zoom it landed at — 9° past the setpoint in the loop twin.)
+    const surface = this.o.profile().speedSurface;
+    const { zoom: zPan, table: panTable } = this.fasterTable("pan", now);
+    const { zoom: zTilt, table: tiltTable } = this.fasterTable("tilt", now);
     const R = opts?.rippleDeg ?? ViscaCamera.DITHER_RIPPLE_DEG;
     const RT = opts?.rippleTiltDeg ?? R;
-    const panStep = this.pickDithered(this.panDither, speedTableAt("pan", z, this.o.profile().speedSurface), pd, now, R);
-    const tiltTable = speedTableAt("tilt", z, this.o.profile().speedSurface);
+    const panStep = this.pickDithered(this.panDither, panTable, pd, now, R);
     let tiltStep: number;
-    const stepper = this.tiltDetentStep(tiltTable, td, z, now);
+    const stepper = this.tiltDetentStep(tiltTable, td, zTilt, now);
     if (stepper !== null) {
       tiltStep = stepper.step;
       td = stepper.dir; // direction of the pulse in flight (0 = stopped)
@@ -420,10 +440,25 @@ export class ViscaCamera implements CameraDriver {
     const panDir = panStep === STOP_STEP ? 0x03 : pd > 0 ? 0x02 : 0x01;
     const tiltDir = tiltStep === STOP_STEP ? 0x03 : td > 0 ? 0x01 : 0x02;
 
-    // Only transmit when the discrete command actually changes.
+    // Only transmit when the discrete command actually changes — or when
+    // the lens has moved far enough that a re-sent step would run at a
+    // clearly different speed than the one the camera latched.
     const key = `${panStep}:${panDir}:${tiltStep}:${tiltDir}`;
-    if (key === this.lastDrive) return;
+    const latched = this.o.profile().speedLatched !== false;
+    const stale = (axis: "pan" | "tilt", step: number, table: [number, number][]) => {
+      if (!latched || step === STOP_STEP || !this.latchZoom) return false;
+      const rateWas = stepRate(speedTableAt(axis, this.latchZoom[axis], surface), step);
+      const rateNow = stepRate(table, step);
+      return Math.abs(rateNow - rateWas) > 0.1 * Math.max(rateWas, rateNow);
+    };
+    const relatch =
+      now - this.lastDriveSentAt >= ViscaCamera.RELATCH_MIN_MS &&
+      now - this.lastZoomSentAt >= ViscaCamera.RELATCH_MIN_MS &&
+      (stale("pan", panStep, panTable) || stale("tilt", tiltStep, tiltTable));
+    if (key === this.lastDrive && !relatch) return;
     this.lastDrive = key;
+    this.latchZoom = { pan: zPan, tilt: zTilt };
+    this.lastDriveSentAt = now;
     // A stopped axis (dir 0x03) ignores its speed byte — send the canonical 1.
     // Byte 0x00 must pass through unclamped: it's the slow gear.
     this.sendCommand([
@@ -594,6 +629,7 @@ export class ViscaCamera implements CameraDriver {
   jog(pan: number, tilt: number, zoom: number): void {
     this.wanted = null; // jog overrides any pending absolute move
     this.lastDrive = null;
+    this.latchZoom = null;
     this.lastSent = null; // jog moves make the last absolute goal moot
     this.lastSentAt = 0;
     // Same soft-margin limit guard as trackRate — a held-down jog button is
@@ -634,6 +670,7 @@ export class ViscaCamera implements CameraDriver {
   stopMotion(): void {
     this.wanted = null;
     this.lastDrive = null;
+    this.latchZoom = null;
     this.lastSent = null; // stopped: any prior travel window is void
     this.lastSentAt = 0;
     this.cmdPanDps = 0;
@@ -654,6 +691,34 @@ export class ViscaCamera implements CameraDriver {
       panDeg: Math.sign(this.cmdPanDps) * this.panDither.acc,
       tiltDeg: Math.sign(this.cmdTiltDps) * this.tiltDither.acc,
     };
+  }
+
+  /**
+   * Where the lens is now: the last zoom reading advanced toward the
+   * commanded zoom at the lens's fastest travel (readings arrive a few
+   * hundred ms apart). A stuck lens stays at its reading.
+   */
+  private lensZoomNow(now: number): number {
+    const read = this.pose?.zoomUnits;
+    if (read == null) return this.currentZoom();
+    const goal = this.lastSentZoom;
+    if (goal == null || this.lensStuckSec(now) != null) return read;
+    const age = Math.max(0, (now - this.lastZoomReadAt) / 1000);
+    const reach = this.o.profile().lens.travelUnitsPerSec * age;
+    return read + Math.max(-reach, Math.min(reach, goal - read));
+  }
+
+  /** Of the zoom reading and the estimate, the one whose speed table is
+   *  faster on this axis (its top rate), with that table. */
+  private fasterTable(axis: "pan" | "tilt", now: number): { zoom: number; table: [number, number][] } {
+    const surface = this.o.profile().speedSurface;
+    const read = this.currentZoom();
+    const est = this.lensZoomNow(now);
+    const readTable = speedTableAt(axis, read, surface);
+    if (est === read) return { zoom: read, table: readTable };
+    const estTable = speedTableAt(axis, est, surface);
+    const top = (t: [number, number][]) => t[t.length - 1][1];
+    return top(estTable) > top(readTable) ? { zoom: est, table: estTable } : { zoom: read, table: readTable };
   }
 
   /** Zoom the lens is at (inquiry), else the last commanded, else wide. */
@@ -890,6 +955,7 @@ export class ViscaCamera implements CameraDriver {
 
   /** A zoom position went out (any command that carries one). */
   private zoomSent(z: number): void {
+    this.lastZoomSentAt = Date.now();
     const d = this.zoomDelivery;
     const resends = d && Math.abs(d.goal - z) <= 8 ? d.resends : 0;
     this.zoomDelivery = { goal: z, best: Infinity, progressAt: Date.now(), resends };

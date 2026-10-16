@@ -45,6 +45,15 @@ export interface CameraLimits {
    * below it. Empty/absent = flat (minElevationDeg / tiltMinDeg only).
    */
   horizon?: HorizonPoint[];
+  /**
+   * The head's tilt zero can SLIP against its encoder (backdrivable heads; the
+   * TONGVEO on its wedge slipped ~14° in 7 h on 2026-10-15). Then every change
+   * the automatic calibration makes to mount.tiltOffsetDeg is that slip, and
+   * the tilt range and park tilt — physical properties of the head — must move
+   * with it in encoder terms. On: they do. Off (default): limits stay put
+   * (offset changes are model refinements, not slip).
+   */
+  followTiltOffset?: boolean;
 }
 
 export interface HorizonPoint {

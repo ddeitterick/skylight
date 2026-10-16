@@ -187,7 +187,7 @@ export class AutoCalibrator {
    * model: they were measured against the old orientation (or are mis-locks)
    * and would steer every later solve.
    */
-  trySolve(current: MountModel, now: number): SolveOutcome | null {
+  trySolve(current: MountModel, now: number, opts: { fitGains?: boolean } = {}): SolveOutcome | null {
     this.prune(now);
     this.dirty = false;
     if (this.samples.length < MIN_SAMPLES) return null;
@@ -195,11 +195,17 @@ export class AutoCalibrator {
 
     const aSpan = azSpan(this.samples);
     const eSpan = elSpan(this.samples);
-    const solveGains =
+    const skyCovered =
       this.samples.length >= GAINS_MIN_SAMPLES &&
       aSpan >= GAINS_MIN_AZ_SPAN &&
       eSpan >= GAINS_MIN_EL_SPAN;
-    const solveLevel = solveGains && this.samples.length >= LEVEL_MIN_SAMPLES;
+    // Gains are the camera's encoder scale — a re-mount can't change them —
+    // and plane samples barely constrain them: on 146 samples (2026-10-15)
+    // tiltGain 0.966…0.990 all fit within 0.04° rms, so each refit moved the
+    // gain and the offsets traded against it (tiltGain .966→.987 in an hour).
+    // Solved only when asked (a new camera's first calibration).
+    const solveGains = skyCovered && opts.fitGains === true;
+    const solveLevel = skyCovered && this.samples.length >= LEVEL_MIN_SAMPLES;
 
     const rmsBefore = rmsUnder(this.samples, current);
     const fit = this.robustFit(this.samples, current, { solveGains, solveLevel }, MIN_SAMPLES);

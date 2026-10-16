@@ -78,6 +78,13 @@ export class FakeViscaHead {
     d.sendInquiry = (p) => this.inquiry(p);
   }
 
+  /** Put the head somewhere before a run (e.g. still zoomed in on the previous target). */
+  place(p: { panDeg?: number; tiltDeg?: number; zoomUnits?: number }): void {
+    this.panDeg = p.panDeg ?? this.panDeg;
+    this.tiltDeg = p.tiltDeg ?? this.tiltDeg;
+    if (p.zoomUnits != null) this.zoom = this.zoomGoal = p.zoomUnits;
+  }
+
   private rate(axis: "pan" | "tilt", setting: number): number {
     const table = speedTableAt(axis, this.zoom, this.profile.speedSurface);
     let best = table[0];

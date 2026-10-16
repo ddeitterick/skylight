@@ -104,9 +104,15 @@ const LM_AZIMUTHS = [15, 60, 105, 150, 195, 240, 285, 330];
 const WRAP_REARM_MS = 4000;
 /** Drift fold-in from per-pass vision bias (foldPassBias). */
 const BIAS_FOLD_PASSES = 3;
-const BIAS_FOLD_MIN_DEG = 0.6;
+const BIAS_FOLD_MIN_DEG = 0.3;
 const BIAS_FOLD_MAX_SPREAD = 0.8;
 const BIAS_FOLD_GAIN = 0.5;
+/** A fold in the same direction as the previous one (within this window)
+ *  is a ramp — the head's tilt zero slipping +8.5° in 3 h on 2026-10-15 —
+ *  not an over-reaction: fold all of it. Half gain plus a 0.6° dead zone
+ *  left a standing 0.6-1° error behind the slip (corrEl −0.5…−1° on every
+ *  pass), most of the half-frame height at tele. */
+const BIAS_FOLD_RAMP_MS = 30 * 60_000;
 /** Vision bias-correction clamp, deg. The estimator measures an exogenous
  *  ADS-B-vs-mount offset directly (no plant feedback), so it cannot wind up;
  *  the clamp only bounds the damage of a wrong lock. It was 12° so a stale
@@ -235,6 +241,27 @@ export type LoopEvent =
       zoom: number;
       hfov: number | null;
     };
+
+/**
+ * Config patch for an automatic mount update. With limits.followTiltOffset
+ * the tilt range and the park tilt move by the same tilt-offset change (in
+ * encoder degrees), so the head's PHYSICAL range stays what it was: a tilt
+ * zero slip otherwise pins low planes at the old floor and puts the park past
+ * vertical, into the auto-flip zone (2026-10-15).
+ */
+export function mountPatch(cfg: TrackerConfig, next: MountModel): Partial<Config> {
+  const tracker: { mount: MountModel; limits?: TrackerConfig["limits"]; camera?: TrackerConfig["camera"] } = { mount: next };
+  const d = (next.tiltOffsetDeg - cfg.mount.tiltOffsetDeg) / (next.tiltGain || 1);
+  if (cfg.limits.followTiltOffset && Number.isFinite(d) && Math.abs(d) > 1e-6) {
+    tracker.limits = { ...cfg.limits, tiltMinDeg: cfg.limits.tiltMinDeg - d, tiltMaxDeg: cfg.limits.tiltMaxDeg - d };
+    tracker.camera = {
+      ...cfg.camera,
+      mechanical: { ...cfg.camera.mechanical, parkTiltMaxDeg: cfg.camera.mechanical.parkTiltMaxDeg - d },
+    };
+    console.log(`[tracker] tilt range follows the offset: ${(-d).toFixed(2)}° → ${tracker.limits.tiltMinDeg.toFixed(1)}…${tracker.limits.tiltMaxDeg.toFixed(1)}°`);
+  }
+  return { tracker } as Partial<Config>;
+}
 
 export class ControlLoop {
   private listeners = new Set<(e: LoopEvent) => void>();
@@ -813,7 +840,7 @@ export class ControlLoop {
           verdict.model.tiltOffsetDeg - cfg.mount.tiltOffsetDeg,
           cfg.mount.panGain, cfg.mount.tiltGain, now,
         );
-        this.upstream.patchConfig({ tracker: { mount: verdict.model } } as Partial<Config>);
+        this.upstream.patchConfig(mountPatch(this.cfg(), verdict.model));
         // Re-shoot the references at once (same frames, new model) so the
         // next check measures only drift from here.
         this.landmarks.save(capture(verdict.model));
@@ -849,6 +876,9 @@ export class ControlLoop {
   private passBias: { az: number; el: number }[] = [];
   private leadLearn = new LeadLearner();
   private biasSampleAt = 0;
+  /** Direction and time of the last fold per axis (ramp detection). */
+  private lastFoldAz: { sign: number; t: number } | null = null;
+  private lastFoldEl: { sign: number; t: number } | null = null;
   /** Recent passes' median corrections, newest last. */
   private biasHistory: { az: number; el: number; t: number }[] = [];
 
@@ -895,14 +925,22 @@ export class ControlLoop {
     };
     // Damped: the bias responded ~2x to each fold on 2026-10-11 (−1.64° moved
     // it −3.3°, +1.52° moved it +2.5°), so full folds oscillated. Half a
-    // fold converges whether the true gain is 1 or 2.
-    const dAz = BIAS_FOLD_GAIN * fold(last.map((h) => h.az));
-    const dEl = BIAS_FOLD_GAIN * fold(last.map((h) => h.el));
+    // fold converges whether the true gain is 1 or 2 — except on a ramp (a
+    // fold in the same direction as the last one): full gain, see
+    // BIAS_FOLD_RAMP_MS.
+    const gain = (v: number, prev: { sign: number; t: number } | null) =>
+      v !== 0 && prev && prev.sign === Math.sign(v) && now - prev.t < BIAS_FOLD_RAMP_MS ? 1 : BIAS_FOLD_GAIN;
+    const fAz = fold(last.map((h) => h.az));
+    const fEl = fold(last.map((h) => h.el));
+    const dAz = gain(fAz, this.lastFoldAz) * fAz;
+    const dEl = gain(fEl, this.lastFoldEl) * fEl;
+    if (fAz !== 0) this.lastFoldAz = { sign: Math.sign(fAz), t: now };
+    if (fEl !== 0) this.lastFoldEl = { sign: Math.sign(fEl), t: now };
     if (dAz === 0 && dEl === 0) return;
     const m = cfg.mount;
     const next = { ...m, panOffsetDeg: m.panOffsetDeg - dAz, tiltOffsetDeg: m.tiltOffsetDeg - dEl };
     this.autoCal.shiftSamples(-dAz, -dEl, m.panGain, m.tiltGain, now);
-    this.upstream.patchConfig({ tracker: { mount: next } } as Partial<Config>);
+    this.upstream.patchConfig(mountPatch(this.cfg(), next));
     this.landmarks.clear(); // re-shoot the references under the new model (disk too)
     this.biasHistory = [];
     this.recorder.write("biasFold", { dAz, dEl, mount: next });
@@ -1005,10 +1043,11 @@ export class ControlLoop {
       // (null vs undefined: with no target at all this must NOT fire every
       // tick — it resets the setpoint/vision state and spams the recorder.)
       if ((hex ?? null) !== (this.current?.hex ?? null)) {
-        // Dropped while still trackable (a challenger won) → cooldown, so the
-        // two can't ping-pong. A target that simply left isn't penalised.
+        // Any plane that loses the camera to another → cooldown, so the two
+        // can't ping-pong — also one that only dropped out for a poll (on a
+        // filter threshold) and would otherwise re-take it on return.
         const prev = this.current?.hex;
-        if (prev && hex && selection.candidates.some((c) => c.hex === prev)) {
+        if (prev && hex) {
           this.targetCooldown.set(prev, now + TARGET_COOLDOWN_MS);
         }
         for (const [h, until] of this.targetCooldown) if (until <= now) this.targetCooldown.delete(h);
@@ -1948,14 +1987,21 @@ export class ControlLoop {
       now - this.lastAutoCalAt > 30_000
     ) {
       this.lastAutoCalAt = now;
-      const out = this.autoCal.trySolve(cfg.mount, now);
+      const out = this.autoCal.trySolve(cfg.mount, now, { fitGains: cfg.vision.autoCalGains === true });
       if (out) {
-        this.upstream.patchConfig({ tracker: { mount: out.model } } as Partial<Config>);
+        this.upstream.patchConfig(mountPatch(this.cfg(), out.model));
         this.corrAz = 0;
         this.corrAzX = 0;
         this.corrEl = 0;
         this.corrAzApp = 0;
         this.corrElApp = 0;
+        // Evidence gathered under the OLD model no longer describes this one:
+        // folding those pass biases into the new model double-corrected it
+        // (2026-10-15 after the re-mount: folds −1.15°, +0.37°, −1.53° on
+        // tilt between auto-cal applies). Same for the landmark references.
+        this.biasHistory = [];
+        this.passBias = [];
+        this.landmarks.clear();
         this.recorder.write("autoCal", { ...out });
         console.log(
           `[tracker] auto-calibration applied: rms ${out.rmsBeforeDeg.toFixed(2)}° -> ` +

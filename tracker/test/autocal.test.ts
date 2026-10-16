@@ -67,6 +67,19 @@ describe("AutoCalibrator", () => {
     expect(out!.rmsAfterDeg).toBeLessThan(out!.rmsBeforeDeg);
   });
 
+  it("leaves the gains alone by default (camera property; fitGains opts in)", () => {
+    const cal = new AutoCalibrator(file);
+    const t0 = 1_000_000_000;
+    feed(cal, 80, t0);
+    // Plenty of coverage (gains WOULD be solved), base rotated: offsets move, gains don't.
+    const fixed = cal.trySolve(CONFIGURED, t0 + 400_000);
+    expect(fixed).not.toBeNull();
+    expect(fixed!.solvedGains).toBe(false);
+    expect(fixed!.model.panGain).toBe(CONFIGURED.panGain);
+    expect(fixed!.model.tiltGain).toBe(CONFIGURED.tiltGain);
+    expect(norm180(fixed!.model.panOffsetDeg - TRUE_MOUNT.panOffsetDeg)).toBeCloseTo(0, 1);
+  });
+
   it("refuses to apply when the current model is already good", () => {
     const cal = new AutoCalibrator(file);
     const t0 = 1_000_000_000;

@@ -52,7 +52,13 @@ async function main(): Promise<void> {
             ip: t.cameraIp,
             port: t.viscaPort,
             units: t.units,
-            limits: t.limits,
+            // Live: a POSTed limit (e.g. tiltMinDeg moved after a tilt-zero
+            // slip) must reach the driver's guards without a restart — the
+            // captured object kept enforcing the old −20° after the loop
+            // already planned to −34° (2026-10-15).
+            get limits() {
+              return upstream.getConfig().tracker.limits;
+            },
             profile: () => upstream.getConfig().tracker.camera,
           })
         : new SimCamera(t.limits, t.units);

@@ -1,6 +1,7 @@
 // Minimal VISCA-over-IP client for the stand-alone probe/survey scripts
 // (one process at a time; the tracker must be stopped). Address and encoder
 // units come from the tracker config (camera-config.ts).
+import { execFileSync } from "node:child_process";
 import dgram from "node:dgram";
 import { cameraTarget } from "./camera-config.js";
 
@@ -120,4 +121,8 @@ export async function readZoom(): Promise<number> {
   return NaN;
 }
 
-
+/** One frame from the camera's main RTSP stream to a JPEG file. */
+export function grabFrame(file: string): void {
+  execFileSync("ffmpeg", ["-loglevel", "error", "-rtsp_transport", "tcp", "-y", "-i", CAM.rtspMain,
+    "-frames:v", "1", "-q:v", "3", file], { timeout: 20000 });
+}

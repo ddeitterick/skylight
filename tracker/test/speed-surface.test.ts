@@ -23,13 +23,12 @@ describe("speedTableAt", () => {
     const byte4 = t.find(([s]) => s === 4)![1];
     expect(byte4).toBeCloseTo((26 + 12) / 2, 6);
   });
-  it("fills unmeasured steps of a zoomed row by interpolating within the row", () => {
-    const t = speedTableAt("pan", 600, SURFACE); // step 0 not measured at 600: clamps to step-1 rate
-    const byte0 = t.find(([s]) => s === 0);
-    const byte1 = t.find(([s]) => s === 1);
-    // step 0 (3.0) and step 1 (3.0) collide → the flat duplicate is dropped
-    expect(byte0?.[1]).toBeCloseTo(3, 6);
-    expect(byte1).toBeUndefined();
+  it("never invents steps a row did not measure (bytes map onto native speeds)", () => {
+    const t = speedTableAt("pan", 600, SURFACE); // exactly on the 600 row: its steps only
+    expect(t.map(([st]) => st)).toEqual([1, 2, 4]);
+    const mid = speedTableAt("pan", 900, SURFACE); // between 600 and 1200: steps both measured
+    expect(mid.map(([st]) => st)).toEqual([1, 2, 4]);
+    expect(mid.find(([st]) => st === 3)).toBeUndefined();
   });
   it("drops steps that have collapsed onto the floor so the dither never sees a zero gap", () => {
     const t = speedTableAt("tilt", 1200, SURFACE);

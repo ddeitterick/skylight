@@ -11,6 +11,7 @@ import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   hfovFromZoomUnits,
+  horizonMinEl,
   type Aircraft,
   type PassArchiveStatus,
   type TrackerConfig,
@@ -371,10 +372,18 @@ export class PassArchive {
   private async finalize(s: PassSession, endedAt: number, reason: string): Promise<void> {
     const dir = join(this.opts.dir, s.id);
     const durationSec = (endedAt - s.startedAt) / 1000;
-    if (durationSec < this.minPassSec) {
+    // Nor is a plane that never rose above the skyline: a departure picked at
+    // lift-off that turned away while still below the roofline left a clip
+    // of rooftops (2026-10-15: 4 of 65 passes, max el 2-6°).
+    const cfg = this.opts.config();
+    const hz = cfg.limits.horizon;
+    const everInView = s.samples.some(
+      (r) => r.pAz != null && r.pEl != null && r.pEl >= horizonMinEl(hz, r.pAz, 0),
+    );
+    if (durationSec < this.minPassSec || !everInView) {
       await s.clip?.stop({ discard: true });
       await rm(dir, { recursive: true, force: true });
-      console.log(`[passes] discard ${s.id}: ${durationSec.toFixed(1)}s (${reason})`);
+      console.log(`[passes] discard ${s.id}: ${durationSec.toFixed(1)}s${everInView ? "" : ", never above the skyline"} (${reason})`);
       return;
     }
     let clipOffsetSec: number | null = null;
@@ -387,9 +396,15 @@ export class PassArchive {
         })
       : null;
     if (clip?.error) this.fail(`clip ${s.id}: ${clip.error}`);
+    // A pass is footage: with a video source but nothing captured (camera
+    // unplugged / off the roof, stream down) there is nothing to archive.
+    if (s.clip && !clip?.path) {
+      await rm(dir, { recursive: true, force: true });
+      console.log(`[passes] discard ${s.id}: ${durationSec.toFixed(1)}s, no video (${reason})`);
+      return;
+    }
     if (clip?.startWallMs != null) clipOffsetSec = (clip.startWallMs - s.startedAt) / 1000;
 
-    const cfg = this.opts.config();
     const tuning: PassTuning = {
       pursuit: cfg.predict.pursuit,
       maxLeadSec: cfg.predict.maxLeadSec,

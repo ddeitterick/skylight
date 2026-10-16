@@ -24,6 +24,13 @@ export interface CameraProfile {
    * protocol's speed values (VISCA bytes); the first row is the widest zoom.
    */
   speedSurface: SpeedRow[];
+  /**
+   * A running drive keeps the speed it was commanded at while the lens
+   * moves (the speed is LATCHED when the command arrives); false = the
+   * camera re-scales a running drive as the zoom changes. Default true.
+   * Measure with tracker/scripts/probe-speed-zoomchange.ts.
+   */
+  speedLatched?: boolean;
   /** Absolute moves: speed settings used, and a slower pan setting for long
    *  slews (some heads miss steps when flung far at full speed). */
   absolute: {
@@ -97,11 +104,15 @@ function rateInRow(row: [number, number][], step: number): number {
 }
 
 /**
- * The speed table that applies at `zoomUnits`: every step of the wide table,
- * each rate interpolated between the bracketing measured rows. Entries that
- * fail to rise ≥0.05°/s over the previous one are dropped so the dither's
- * bracket never divides by a zero-width gap (at tele most bytes collapse onto
- * the floor and only the rising ones remain).
+ * The speed table that applies at `zoomUnits`: the steps MEASURED at that
+ * zoom — in both bracketing rows when between rows, each rate interpolated
+ * in zoom. Steps a row didn't measure are not invented by interpolating
+ * along the row: this firmware maps the bytes onto a few native speeds (at
+ * zoom 1385 bytes 0-4 ≈ 1.5°/s, 8 ≈ 3°/s, 12 ≈ 7°/s), so an "in-between"
+ * byte runs at one of its neighbours' speeds, not between them — the dither
+ * mixed bytes it believed were 1.9-2.6°/s and the head lurched at 4-5°/s
+ * (THY73G 2026-10-15). Entries that fail to rise ≥0.05°/s over the previous
+ * one are dropped so the dither's bracket never divides by a zero-width gap.
  */
 export function speedTableAt(
   axis: "pan" | "tilt",
@@ -121,9 +132,17 @@ export function speedTableAt(
     }
   }
   const f = hi.zoom === lo.zoom ? 0 : (z - lo.zoom) / (hi.zoom - lo.zoom);
+  const loSteps = new Set(lo[axis].map(([st]) => st));
+  const hiSteps = new Set(hi[axis].map(([st]) => st));
+  let steps =
+    f <= 0 ? [...loSteps] : f >= 1 ? [...hiSteps] : [...loSteps].filter((st) => hiSteps.has(st));
+  // Rows that share fewer than two measured steps can't bracket a rate: fall
+  // back to the nearer row's own steps (still only measured bytes).
+  if (steps.length < 2) steps = (f < 0.5 ? lo : hi)[axis].map(([st]) => st);
+  steps.sort((a, b) => a - b);
   const out: [number, number][] = [];
   let last = -Infinity;
-  for (const [step] of wide) {
+  for (const step of steps) {
     const r = rateInRow(lo[axis], step) * (1 - f) + rateInRow(hi[axis], step) * f;
     if (r >= last + 0.05) {
       out.push([step, r]);
@@ -132,7 +151,6 @@ export function speedTableAt(
   }
   return out;
 }
-
 
 /**
  * Holding `rateDps` with discrete speeds means alternating between the two
@@ -218,6 +236,12 @@ const TONGVEO_SPEED_SURFACE: SpeedRow[] = [
     pan: [[0, 1.32], [4, 2.79], [8, 6.6], [12, 15.7], [16, 15.63], [18, 22.19]],
     tilt: [[0, 1.51], [4, 2.93], [8, 4.59], [16, 8.04]],
   },
+  // 2026-10-15 every byte 0-10 measured at 1385 and 1437 (characterize-camera,
+  // job notes): three native speeds per axis — pan ≈1.45 / ≈3.0 / 7.2°/s,
+  // tilt ≈1.55 / ≈3.1 / 4.4-4.9°/s; per-byte noise ±0.1°/s. The rows below
+  // already hold one byte of each gear, so they were kept as they are. NB the
+  // speed floor's limit at full tele (maxSpeedStepFwps × 3.4° = 1.53°/s) sits
+  // inside the noise of the slowest tilt gear (1.46-1.70 measured).
   {
     zoom: 1385,
     pan: [[0, 1.42], [4, 1.55], [8, 2.97], [12, 7.06], [16, 7.39], [18, 7.06]],
@@ -246,6 +270,10 @@ export const TONGVEO_PROFILE: CameraProfile = {
   model: "TONGVEO 20x PTZ",
   characterized: "VISCA speed surface 2026-06-10 / 2026-10-10 / 2026-10-14 (stops 1260, 1385)",
   speedSurface: TONGVEO_SPEED_SURFACE,
+  // probe-speed-zoomchange.ts 2026-10-15, pan byte 2 for 3 s: wide 45.67°,
+  // tele 4.46°, started tele + zoomed to wide 4.50°, started wide + zoomed
+  // to tele 45.90° — the speed stays what it was at the command.
+  speedLatched: true,
   absolute: {
     // Absolute moves flat out (pan 0x18 / tilt 0x14, the maxima) except long
     // pan slews: the pan pointing jumped ~+2° across a ~300° wrap

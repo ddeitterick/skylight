@@ -18,7 +18,8 @@ export interface Aircraft {
   gs?: number;
   /** Track / heading over ground, degrees. */
   track?: number;
-  /** Vertical rate, ft/min (positive = climbing). */
+  /** Vertical rate, ft/min (positive = climbing): barometric, else geometric
+   *  (GNSS) — some transponders send only geom_rate. */
   baroRate?: number | null;
   squawk?: string;
   category?: string;

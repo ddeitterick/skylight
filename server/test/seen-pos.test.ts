@@ -13,3 +13,11 @@ describe("normalize: position age", () => {
     expect(ac?.seen).toBeCloseTo(0.1, 6);
   });
 });
+
+describe("normalize: vertical rate", () => {
+  it("uses the barometric rate, else the geometric one", () => {
+    expect(normalize({ hex: "a", baro_rate: 640, geom_rate: 700 }, 0)?.baroRate).toBe(640);
+    expect(normalize({ hex: "a", geom_rate: 1216 }, 0)?.baroRate).toBe(1216);
+    expect(normalize({ hex: "a" }, 0)?.baroRate).toBeNull();
+  });
+});
