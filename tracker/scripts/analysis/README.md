@@ -28,3 +28,18 @@ holds install data: the site and mount come from the environment.
   candidates, candidates elsewhere, motion check).
 - `blindspot.py`: how many archived passes cross the pan dead zone (and pass near the mount
   pole) for each base rotation — tells the owner which way to turn the camera.
+
+Added 2026-10-16 (archive API: https://passes.skylightceiling.com, read-only):
+
+- `buildstats.py <from>` — per-build pass stats (quality, lock, centring, lost-lock).
+- `abstats.py <from> [experiment]` — interleaved A/B readout per arm (pass.json `experiment`), also per
+  distance class. Use this instead of hour-vs-hour builds: the traffic mix swamps small effects.
+- `clipping.py <from> <to>` — share of the plane clipped to white in each poster (exposure).
+- `clipgaps.py <from> <to>` — timestamp gaps in clips (Wi-Fi dropouts). See its header for the case it misses.
+- `gapframes2.py <outdir> <from> <to> <session.jsonl>…` — clip frames at no-candidate tele gaps.
+- `silframes.py` / `candframes.py <session> <outdir> <from>` — clip frames at silhouette-sourced locks /
+  at "candidates elsewhere" misses with the logged candidates drawn (needs visionMiss.cands, build 16e+).
+- `slipline.py <session> <initial tiltOffset|first>` — implied tilt offset per minute (model offset −
+  live corrEl, continuous across folds) next to head-motion features: the tilt-slip timeline.
+- `telesum.py <session>` — tele vision frames by outcome (lock / edge / no candidates / far / other).
+- `ringcmp.py <ringA> <ringB>` — two survey rings at the same encoder poses → image shift = head slip.

@@ -19,6 +19,10 @@ BASE = os.environ.get("PASS_ARCHIVE_URL", "https://passes.skylightceiling.com").
 UA = "skylight-stabilizer/1 (+https://skylightceiling.com/passes)"
 _HERE = os.path.dirname(os.path.abspath(__file__))
 KEY_FILE = os.environ.get("PASS_ARCHIVE_KEY_FILE", os.path.join(_HERE, "..", "..", "passes", ".ingest-key"))
+# Cloudflare rejects request bodies over 100 MB (413): bigger files go up as R2 multipart in
+# equal parts (R2: all but the last the same size, >= 5 MiB). Same numbers as the Pi uploader.
+SINGLE_PUT_MAX = 90 << 20
+PART_BYTES = 50 << 20
 
 
 def _key() -> str:
@@ -72,12 +76,47 @@ def download(pid: str, name: str, dest: str) -> int:
     return os.path.getsize(dest)
 
 
+def part_ranges(size: int, part: int | None = None) -> list[tuple[int, int, int]]:
+    """(partNumber, offset, length) for each multipart part: equal parts, the remainder last."""
+    part = part or PART_BYTES
+    return [(i // part + 1, i, min(part, size - i)) for i in range(0, size, part)]
+
+
+def _json_req(method: str, path: str, body: bytes, ctype: str = "application/json", timeout=120) -> dict:
+    with _req(method, path, body=body, auth=True, timeout=timeout,
+              headers={"content-type": ctype, "content-length": str(len(body))}) as r:
+        return json.load(r)
+
+
+def _upload_multipart(pid: str, name: str, path: str, size: int) -> dict:
+    base = f"/ingest/{pid}/{name}"
+    uid = _json_req("POST", base + "?uploads", b"")["uploadId"]
+    q = f"{base}?uploadId={urllib.parse.quote(uid, safe='')}"
+    try:
+        parts = []
+        with open(path, "rb") as f:
+            for n, off, length in part_ranges(size):
+                f.seek(off)
+                out = _json_req("PUT", f"{q}&partNumber={n}", f.read(length), "application/octet-stream", timeout=600)
+                parts.append({"partNumber": n, "etag": out["etag"]})
+        return _json_req("POST", f"{q}&complete", json.dumps({"parts": parts}).encode())
+    except BaseException:
+        try:
+            _json_req("DELETE", q, b"")
+        except Exception:
+            pass
+        raise
+
+
 def upload(pid: str, name: str, path: str, ctype: str) -> dict:
     size = os.path.getsize(path)
-    with open(path, "rb") as f:
-        with _req("PUT", f"/ingest/{pid}/{name}", body=f, auth=True, timeout=600,
-                  headers={"content-type": ctype, "content-length": str(size)}) as r:
-            out = json.load(r)
+    if size > SINGLE_PUT_MAX:
+        out = _upload_multipart(pid, name, path, size)
+    else:
+        with open(path, "rb") as f:
+            with _req("PUT", f"/ingest/{pid}/{name}", body=f, auth=True, timeout=600,
+                      headers={"content-type": ctype, "content-length": str(size)}) as r:
+                out = json.load(r)
     if not out.get("ok") or out.get("bytes") != size:
         raise RuntimeError(f"upload {pid}/{name}: {out}")
     return out

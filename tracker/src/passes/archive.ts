@@ -86,6 +86,8 @@ class PassSession {
   lastPredictedAt: number;
   /** Longest lens-stuck reading seen (driver.lensStuckSec), s. */
   lensStuckSec: number | null = null;
+  /** Interleaved A/B arm the loop gave this target (state.target.experiment). */
+  experiment: { name: string; arm: "A" | "B" } | undefined = undefined;
 
   constructor(
     readonly hex: string,
@@ -248,6 +250,7 @@ export class PassArchive {
       this.endPass(`mode ${state.mode}`, now);
       return;
     }
+    if (state.target.experiment && !s.experiment) s.experiment = state.target.experiment;
     if (state.target.predicted) s.lastPredictedAt = now;
     else if (now - s.lastPredictedAt > LOST_TARGET_END_MS) {
       this.endPass("target lost", now);
@@ -454,6 +457,7 @@ export class PassArchive {
         clipOffsetSec,
       },
       lensStuckSec: s.lensStuckSec,
+      experiment: s.experiment,
       notes: clip?.truncated ? ["clip truncated (writer back-pressure)"]
         : clip?.restarted ? ["clip ends early: video stream restarted mid-pass"]
         : [],

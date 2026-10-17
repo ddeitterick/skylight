@@ -183,6 +183,16 @@ describe("PassArchive", () => {
     expect(archive.status()).toMatchObject({ recording: false, passId: null, queued: 1 });
   });
 
+  it("records the interleaved A/B arm the loop gave the target", async () => {
+    state.target.experiment = { name: "mountPrior", arm: "B" };
+    archive.onLoopEvent({ kind: "target", t: clock, hex: "a622bc" });
+    run(12);
+    archive.onLoopEvent({ kind: "target", t: clock, hex: null });
+    await archive.stop();
+    const pass = JSON.parse(await readFile(join(dir, "20261010T235405Z-a622bc", "pass.json"), "utf8")) as PassJson;
+    expect(pass.experiment).toEqual({ name: "mountPrior", arm: "B" });
+  });
+
   it("self-heals from state: starts on a target it was never told about, ends when it vanishes", async () => {
     run(0.3); // state shows a tracked target with a prediction
     expect(archive.status().passId).toBe("20261010T235405Z-a622bc");

@@ -264,6 +264,16 @@ export class TrackTable {
   /** Predicted plane rates from the last select(): how the lock coasts
    *  while unseen (see CandidateTrack.positionAt). */
   private coast: { azRateDps: number; elRateDps: number } | null = null;
+  /** Diagnostics from the last update(): per observation, the track it fed
+   *  (id), and whether that track was spawned by it. */
+  lastAssign: { trackId: number; spawned: boolean }[] = [];
+  /** The lock picks its observation before the greedy pass. Greedy
+   *  nearest-first let a duplicate track of the same plane (spawned by one
+   *  detection outside the gate) win every later detection by being a little
+   *  closer: the lock starved and coasted 0.2-0.4° off the plane — 1.3k of the
+   *  1.3k "candidates elsewhere" tele misses on 2026-10-16 had the nearest
+   *  candidate feeding another track. */
+  lockFirst = false;
 
   all(): CandidateTrack[] {
     return this.tracks;
@@ -311,15 +321,24 @@ export class TrackTable {
     pairs.sort((a, b) => a.d - b.d);
     const trackUsed = new Set<number>();
     const obsUsed = new Set<number>();
-    for (const p of pairs) {
+    this.lastAssign = [];
+    const lockIdx = this.lockFirst && this.lockedId !== null
+      ? this.tracks.findIndex((t) => t.id === this.lockedId)
+      : -1;
+    const first = lockIdx >= 0 ? pairs.find((p) => p.ti === lockIdx) : undefined;
+    for (const p of first ? [first, ...pairs] : pairs) {
       if (trackUsed.has(p.ti) || obsUsed.has(p.oi)) continue;
       trackUsed.add(p.ti);
       obsUsed.add(p.oi);
       this.tracks[p.ti].push(observations[p.oi]);
+      this.lastAssign[p.oi] = { trackId: this.tracks[p.ti].id, spawned: false };
     }
     // Unmatched observations seed new tracks.
     for (let oi = 0; oi < observations.length; oi++) {
-      if (!obsUsed.has(oi)) this.tracks.push(new CandidateTrack(observations[oi]));
+      if (obsUsed.has(oi)) continue;
+      const tr = new CandidateTrack(observations[oi]);
+      this.tracks.push(tr);
+      this.lastAssign[oi] = { trackId: tr.id, spawned: true };
     }
     // Expire stale tracks; cap the population (locked track is immortal
     // within its grace window).

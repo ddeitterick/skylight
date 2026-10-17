@@ -202,6 +202,37 @@ describe("TrackTable", () => {
     }
   });
 
+  it("lock-first: a duplicate track closer to the plane's detection can't starve the lock", () => {
+    // A far, slow plane at tele. Two detections outside the gate (0.6°) start a duplicate track;
+    // every later detection (0.35°) lands nearer the duplicate, still inside the lock's gate. Greedy
+    // nearest-first feeds the duplicate; the lock starves (2026-10-16 "candidates elsewhere").
+    const rate = { az: 0.2, el: 0 };
+    const at = (t: number) => ({ az: 50 + ((t - T0) / 1000) * rate.az, el: 20 });
+    const pred = (t: number): PredictedMotion => ({ azDeg: at(t).az, elDeg: 20, azRateDps: rate.az, elRateDps: 0 });
+    const run = (lockFirst: boolean) => {
+      const table = new TrackTable();
+      table.lockFirst = lockFirst;
+      let t = T0;
+      for (let i = 0; i < 12; i++, t += TICK) {
+        const p = at(t);
+        table.update([obs(t, p.az, p.el)], t, 0.4);
+        table.select(pred(t), t);
+      }
+      const lockId = table.lockedTrack()!.id;
+      let fed = 0;
+      for (let i = 0; i < 12; i++, t += TICK) {
+        const p = at(t);
+        table.update([obs(t, p.az + (i < 2 ? 0.6 : 0.35), p.el)], t, 0.4);
+        table.select(pred(t), t);
+        const lt = table.lockedTrack();
+        if (lt?.id === lockId && lt.latest().t === t) fed++;
+      }
+      return fed;
+    };
+    expect(run(false)).toBeLessThan(3);
+    expect(run(true)).toBeGreaterThan(8);
+  });
+
   it("reset() drops everything (target switch)", () => {
     const table = new TrackTable();
     for (let i = 0; i < 8; i++) {

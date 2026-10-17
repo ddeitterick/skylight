@@ -3,16 +3,24 @@
 // folder — `.pending` until the POST succeeds, then `.uploaded` — so a
 // restart resumes exactly where it stopped. Exponential backoff on failure;
 // a malformed/oversized pass is parked as `.failed` so it cannot block the
-// queue forever.
+// queue forever. A parked pass keeps its `.pending`, so the next start
+// (resume) tries it again. Blobs over MULTIPART_OVER_BYTES go up as R2
+// multipart in PART_BYTES parts (Cloudflare caps a request body at 100 MB).
 
 import { existsSync } from "node:fs";
-import { readdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { open, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 export const DEFAULT_ARCHIVE_URL = "https://passes.skylightceiling.com";
 export const BACKOFF_MIN_MS = 5_000;
 export const BACKOFF_MAX_MS = 300_000;
 export const REQUEST_TIMEOUT_MS = 120_000;
+/** Big bodies get longer than REQUEST_TIMEOUT_MS: at least this uplink rate (2 Mbps) is assumed. */
+const MIN_UPLOAD_BYTES_PER_SEC = 250_000;
+/** Single PUT up to this size; above it, multipart (Cloudflare rejects bodies over 100 MB with 413). */
+export const MULTIPART_OVER_BYTES = 90 * 1024 * 1024;
+/** Multipart part size: R2 wants every part but the last the same size, ≥ 5 MiB. */
+export const PART_BYTES = 50 * 1024 * 1024;
 
 /** Upload order and content types (pass.json goes last, as the POST). */
 const BLOBS: [name: string, type: string][] = [
@@ -30,6 +38,18 @@ export interface UploaderOptions {
   fetchImpl?: typeof fetch;
   /** Test hook: scale/replace the backoff timer. */
   setTimer?: (fn: () => void, ms: number) => void;
+  /** Test hooks: multipart threshold and part size. */
+  multipartOverBytes?: number;
+  partBytes?: number;
+}
+
+/** Byte ranges of the multipart parts: equal `partBytes` parts, the remainder last. */
+export function partRanges(size: number, partBytes = PART_BYTES): { partNumber: number; start: number; length: number }[] {
+  const out: { partNumber: number; start: number; length: number }[] = [];
+  for (let start = 0; start < size; start += partBytes) {
+    out.push({ partNumber: out.length + 1, start, length: Math.min(partBytes, size - start) });
+  }
+  return out;
 }
 
 export interface UploadStatus {
@@ -153,6 +173,7 @@ export class PassUploader {
       const dir = join(this.passesDir, id);
       await writeFile(join(dir, ".uploaded"), `${new Date().toISOString()}\n`);
       await unlink(join(dir, ".pending")).catch(() => {});
+      await unlink(join(dir, ".failed")).catch(() => {}); // parked earlier, retried by resume()
       this.queue.shift();
       this.failures = 0;
       this.lastUploadedId = id;
@@ -171,6 +192,10 @@ export class PassUploader {
         await writeFile(join(this.passesDir, id, ".failed"), `${msg}\n`).catch(() => {});
         console.error(`[passes] upload of ${id} rejected, parked as .failed: ${msg}`);
       } else {
+        // To the back of the line: a pass that fails on its own (one big clip
+        // the archive can't take yet) must not hold up the passes behind it.
+        // A real outage fails them all, and the backoff still applies.
+        this.queue.push(this.queue.shift()!);
         this.failures++;
         delay = Math.min(BACKOFF_MAX_MS, BACKOFF_MIN_MS * 2 ** (this.failures - 1));
         console.error(`[passes] upload of ${id} failed (${msg}); retry in ${Math.round(delay / 1000)}s`);
@@ -187,16 +212,43 @@ export class PassUploader {
     for (const [name, type] of BLOBS) {
       const path = join(dir, name);
       if (!existsSync(path)) continue;
-      const body = await readFile(path);
-      await this.request("PUT", `${this.url}/ingest/${id}/${name}`, body, type);
+      const url = `${this.url}/ingest/${id}/${name}`;
+      if ((await stat(path)).size > (this.opts.multipartOverBytes ?? MULTIPART_OVER_BYTES)) await this.putMultipart(url, path);
+      else await this.request("PUT", url, await readFile(path), type);
     }
     const pass = await readFile(join(dir, "pass.json"));
     await this.request("POST", `${this.url}/ingest/${id}`, pass, "application/json");
   }
 
-  private async request(method: string, url: string, body: Buffer, contentType: string): Promise<void> {
+  /** R2 multipart: create, PUT each part (read from disk one at a time), complete; abort on failure. */
+  private async putMultipart(url: string, path: string): Promise<void> {
+    const created = await this.request("POST", `${url}?uploads`, Buffer.alloc(0), "application/json");
+    const uploadId = String(created?.uploadId ?? "");
+    if (!uploadId) throw new Error(`POST ${new URL(url).pathname}?uploads: no uploadId`);
+    const q = `${url}?uploadId=${encodeURIComponent(uploadId)}`;
+    const fh = await open(path, "r");
+    try {
+      const parts: { partNumber: number; etag: string }[] = [];
+      for (const p of partRanges((await fh.stat()).size, this.opts.partBytes ?? PART_BYTES)) {
+        const buf = Buffer.alloc(p.length);
+        const { bytesRead } = await fh.read(buf, 0, p.length, p.start);
+        if (bytesRead !== p.length) throw new Error(`${path}: short read at ${p.start}`);
+        const r = await this.request("PUT", `${q}&partNumber=${p.partNumber}`, buf, "application/octet-stream");
+        parts.push({ partNumber: p.partNumber, etag: String(r?.etag ?? "") });
+      }
+      await this.request("POST", `${q}&complete`, Buffer.from(JSON.stringify({ parts })), "application/json");
+    } catch (err) {
+      await this.request("DELETE", q, Buffer.alloc(0), "application/json").catch(() => {});
+      throw err;
+    } finally {
+      await fh.close();
+    }
+  }
+
+  /** The response's JSON body (null if it has none). */
+  private async request(method: string, url: string, body: Buffer, contentType: string): Promise<Record<string, unknown> | null> {
     const ctl = new AbortController();
-    const timer = setTimeout(() => ctl.abort(), this.timeoutMs);
+    const timer = setTimeout(() => ctl.abort(), Math.max(this.timeoutMs, (body.byteLength / MIN_UPLOAD_BYTES_PER_SEC) * 1000));
     timer.unref?.();
     try {
       const res = await this.fetchImpl(url, {
@@ -215,6 +267,7 @@ export class PassUploader {
         if (PERMANENT_STATUS.has(res.status)) throw new PermanentError(msg);
         throw new Error(msg);
       }
+      return (await res.json().catch(() => null)) as Record<string, unknown> | null;
     } catch (err) {
       if (err instanceof PermanentError) throw err;
       const e = err as Error & { cause?: { code?: string } };

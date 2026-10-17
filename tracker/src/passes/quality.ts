@@ -26,7 +26,8 @@ export const QUALITY_METHOD_TELEMETRY = "q1-telemetry";
 export type QualityFlag =
   | "soft-focus" | "no-plane" | "short" | "lost-lock" | "jumpy" | "wrap-pinned" | "low-zoom"
   /** The lens ignored zoom/focus commands (hardware wedge) — not a tracking fault. */
-  | "lens-stuck";
+  | "lens-stuck"
+  | "clip-short";
 
 export interface PassQuality {
   score: number;
@@ -51,6 +52,8 @@ export const SIGMA_SHARP_PX = 1.2;
 export const SIGMA_SOFT_PX = 4;
 /** Below this sharpness the best frame is soft. */
 export const SOFT_FOCUS_BELOW = 0.65;
+/** Clip shorter than this fraction of the pass (no note explaining it) = frames were lost. */
+export const CLIP_SHORT_FRAC = 0.9;
 export const SHORT_SEC = 15;
 export const LOST_LOCK_PCT = 40;
 export const LOST_GAP_TELE_SEC = 3;
@@ -544,7 +547,7 @@ export function telemetryStats(rows: Row[], hz = 10): TelemetryStats {
 
 // ------------------------------------------------------------------ pass score
 
-type PassLike = Pick<PassJson, "durationSec" | "pass" | "tracking"> & Partial<Pick<PassJson, "aircraft" | "media">>;
+type PassLike = Pick<PassJson, "durationSec" | "pass" | "tracking"> & Partial<Pick<PassJson, "aircraft" | "media" | "notes">>;
 
 export interface ScoreInput {
   pass: PassLike;
@@ -579,6 +582,13 @@ export function scorePass(inp: ScoreInput): PassQuality {
   if (st.jumpsPerMin > JUMPY_PER_MIN) flags.push("jumpy");
   if (pass.pass?.deadZoneWrap && lockPct < WRAP_PINNED_LOCK_PCT) flags.push("wrap-pinned");
   if ((t.lensStuckSec ?? 0) >= 10) flags.push("lens-stuck");
+  // Frames lost on the way in come out as a SHORTER clip, not a gappy one (the
+  // camera stamps the frames it sends): 2026-10-16 at 8 Mbps over Wi-Fi the
+  // clips held 47-73% of their passes, played fast and jumped — no timestamp
+  // gap anywhere. A clip ended early on purpose carries a note instead.
+  const clipSec = pass.media?.clipDurationSec;
+  if (hasClip && clipSec != null && (pass.durationSec ?? 0) > 0 && !(pass.notes ?? []).length &&
+      clipSec < CLIP_SHORT_FRAC * pass.durationSec) flags.push("clip-short");
   // "Low zoom" means the plane stayed small, not that the lens stayed wide:
   // a close A380 fills the frame at 15° (DLH455 was flagged and looked great).
   const spanM = spanForCategory(pass.aircraft?.category);

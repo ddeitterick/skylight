@@ -1,0 +1,8 @@
+[Unit]
+Description=Skylight: camera exposure compensation by sun elevation
+After=skylight-server.service
+
+[Service]
+Type=oneshot
+User=__USER__
+ExecStart=/usr/bin/python3 __APPDIR__/tracker/scripts/camera-web/exposure-by-sun.py

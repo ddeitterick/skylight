@@ -288,6 +288,8 @@ export interface TrackerState {
     angularSizeDeg: number | null;
     /** Which rule set the zoom (frameLocked/frameOpen/ladderN/speedFloor/zenith; before 2026-10-14 rateFloor/gearFloor; "+held" = debounce). */
     zoomWhy?: string;
+    /** Interleaved A/B arm of this target (config `experiment`); A = control. */
+    experiment?: { name: string; arm: "A" | "B" };
   };
   candidates: Candidate[];
   calibration: CalibrationState;

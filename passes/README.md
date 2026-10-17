@@ -39,6 +39,9 @@ Ingest (`Authorization: Bearer <INGEST_KEY>`):
 
 - `PUT /ingest/<id>/<name>` — raw body streamed into R2; `name` is `clip.mp4`,
   `poster.jpg` or `series.json`; a mismatched `content-type` is a 415. → `{ ok, bytes }`
+- Multipart for blobs over Cloudflare's 100 MB body cap: `POST …/<name>?uploads`,
+  `PUT …?uploadId=&partNumber=`, `POST …?uploadId=&complete`, `DELETE …?uploadId=`
+  (see `docs/pass-archive.md`).
 - `POST /ingest/<id>` — pass.json (schema 1, ≤ 2 MB, `id` must match the URL) →
   upsert; `has_clip` comes from an R2 HEAD of the clip, so upload blobs first.
   Re-POSTing updates everything except `created_at`. → `{ ok }`

@@ -44,7 +44,12 @@ $SSH "$PI_USER@$PI_HOST" "
     -e \"s#__PNPM__#\$PNPM_BIN#g\" \
     '$PI_APPDIR/pi-setup/skylight-tracker.service' \
     | sudo tee /etc/systemd/system/skylight-tracker.service >/dev/null
+  # Exposure compensation by sun elevation (TONGVEO web API), every 5 min.
+  sudo sed -e \"s#__USER__#\$(id -un)#g\" -e \"s#__APPDIR__#$PI_APPDIR#g\" \
+    '$PI_APPDIR/pi-setup/skylight-exposure.service' | sudo tee /etc/systemd/system/skylight-exposure.service >/dev/null
+  sudo cp '$PI_APPDIR/pi-setup/skylight-exposure.timer' /etc/systemd/system/
   sudo systemctl daemon-reload
+  sudo systemctl enable --now skylight-exposure.timer >/dev/null 2>&1 || true
   sudo systemctl enable skylight-tracker.service >/dev/null 2>&1 || true
   sudo systemctl restart $SERVICE
   sudo systemctl restart skylight-tracker.service
@@ -52,24 +57,15 @@ $SSH "$PI_USER@$PI_HOST" "
 
 echo "==> reload kiosk (projector on HDMI-A-1 + TV dashboard on HDMI-A-2)"
 $SSH "$PI_USER@$PI_HOST" '
-  # TV kiosk launcher: second Chromium instance placed on the second output.
-  # Under Xwayland the outputs form one extended X screen, so the window is
-  # positioned at x=1920 and fullscreened there.
+  # TV kiosk launcher: second Chromium instance on the second output. Wayfire puts a
+  # new window on the keyboard-focused output and ignores placement flags, so the
+  # launcher checks where the ceiling window landed (grim) and moves windows with
+  # super+shift+O through a uinput keyboard (pi-setup/skylight-tv-kiosk.sh).
   mkdir -p "$HOME/.local/bin"
-  CHROMIUM=$(command -v chromium-browser || command -v chromium)
-  cat > "$HOME/.local/bin/skylight-tv-kiosk.sh" <<EOF
-#!/usr/bin/env bash
-export DISPLAY=:0
-export XDG_RUNTIME_DIR=/run/user/\$(id -u)
-until curl -fsS http://localhost:3001/api/tracker/health >/dev/null 2>&1; do sleep 1; done
-exec $CHROMIUM \
-  --ozone-platform=x11 --app=http://localhost:3000/tv.html \
-  --user-data-dir=\$HOME/.tv-kiosk-profile --no-first-run --password-store=basic \
-  --noerrdialogs --disable-infobars --disable-session-crashed-bubble \
-  --check-for-update-interval=31536000 \
-  --window-position=1920,0 --start-fullscreen
-EOF
-  chmod +x "$HOME/.local/bin/skylight-tv-kiosk.sh"
+  install -m 755 "'"$PI_APPDIR"'/pi-setup/skylight-tv-kiosk.sh" "$HOME/.local/bin/skylight-tv-kiosk.sh"
+  install -m 755 "'"$PI_APPDIR"'/pi-setup/skylight-keypress.py" "$HOME/.local/bin/skylight-keypress.py"
+  echo "KERNEL==\"uinput\", GROUP=\"input\", MODE=\"0660\"" | sudo tee /etc/udev/rules.d/99-uinput.rules >/dev/null
+  sudo udevadm control --reload && sudo udevadm trigger --name-match=uinput || true
   # Autostart it alongside the projector kiosk (wayfire).
   INI="$HOME/.config/wayfire.ini"
   if [ -f "$INI" ] && ! grep -q skylight-tv-kiosk "$INI"; then

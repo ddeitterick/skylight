@@ -76,6 +76,10 @@ export interface ShowFields {
 export interface TrackerConfig {
   /** Drive the real camera ("visca") or the software simulator ("sim"). */
   driver: "sim" | "visca";
+  /** Interleaved A/B test: the named experiment's change is OFF for every
+   *  other target (arm A, control) and ON for the rest (arm B); each pass
+   *  records its arm (pass.json `experiment`). Null/absent = no test. */
+  experiment?: string | null;
   cameraIp: string;
   viscaPort: number;
   /** RTSP main stream (full quality, passed through untouched to the TV). */

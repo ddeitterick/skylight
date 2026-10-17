@@ -210,6 +210,8 @@ export interface PassJson {
   media: PassMedia;
   /** Schema 1.1: beauty shot + score (quality.ts); null when not scored. */
   quality?: PassQuality | null;
+  /** Interleaved A/B test this pass belonged to (arm A = control). */
+  experiment?: { name: string; arm: "A" | "B" };
   events: PassEvent[];
   notes: string[];
 }
@@ -240,6 +242,7 @@ export interface PassInput {
   notes?: string[];
   /** Longest lens-stuck stretch seen during the pass, s (null = none). */
   lensStuckSec?: number | null;
+  experiment?: { name: string; arm: "A" | "B" };
 }
 
 // --- helpers ---
@@ -529,6 +532,7 @@ export function buildPass(input: PassInput): PassJson {
       clipDurationSec: r2(input.media.clipDurationSec),
       clipOffsetSec: r2(input.media.clipOffsetSec),
     },
+    ...(input.experiment ? { experiment: input.experiment } : {}),
     events: allEvents,
     notes: input.notes ?? [],
   };

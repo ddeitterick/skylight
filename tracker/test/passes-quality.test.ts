@@ -252,6 +252,16 @@ describe("scorePass", () => {
     expect(scorePass({ pass: basePass(), rows: steadyRows(), best: frame(), framesWithPlane: 12 }).flags).not.toContain("lens-stuck");
   });
 
+  it("flags a clip that lost frames (shorter than its pass, no note)", () => {
+    const media = (clipDurationSec: number) => ({ clip: "clip.mp4", poster: null, series: "series.json", clipBytes: 1, clipDurationSec, clipOffsetSec: 0 });
+    const short = { ...basePass(), durationSec: 63, media: media(32.4) } as never;
+    expect(scorePass({ pass: short, rows: steadyRows(), best: frame(), framesWithPlane: 12 }).flags).toContain("clip-short");
+    const whole = { ...basePass(), durationSec: 63, media: media(62.6) } as never;
+    expect(scorePass({ pass: whole, rows: steadyRows(), best: frame(), framesWithPlane: 12 }).flags).not.toContain("clip-short");
+    const noted = { ...basePass(), durationSec: 63, media: media(32.4), notes: ["clip ends early: video stream restarted mid-pass"] } as never;
+    expect(scorePass({ pass: noted, rows: steadyRows(), best: frame(), framesWithPlane: 12 }).flags).not.toContain("clip-short");
+  });
+
   it("caps no-plane passes near the bottom and short passes at 40", () => {
     expect(scorePass({ pass: basePass(), rows: steadyRows(), best: frame({ present: false }), framesWithPlane: 0 }).score).toBeLessThanOrEqual(10);
     expect(scorePass({ pass: { ...basePass(), durationSec: 11 }, rows: steadyRows(), best: frame(), framesWithPlane: 9 }).score).toBeLessThanOrEqual(40);

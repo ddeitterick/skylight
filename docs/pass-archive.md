@@ -100,7 +100,7 @@ Sent by the Pi as `POST /ingest/<id>`; stored verbatim in D1 `meta`; returned by
     "planeSizeFrac": 0.21,             // plane width as a fraction of the frame width in the best frame
     "centredSec": 12.4,                // seconds the plane sat inside the central 50% of the frame
     "bestFrameSec": 23.8,              // CLIP time of the beauty shot (= poster frame)
-    "flags": [],                       // any of: soft-focus no-plane short lost-lock jumpy wrap-pinned low-zoom lens-stuck
+    "flags": [],                       // any of: soft-focus no-plane short lost-lock jumpy wrap-pinned low-zoom lens-stuck clip-short
     "method": "q1"
   },
   "events": [                          // seconds from startedAt, sorted
@@ -113,6 +113,7 @@ Sent by the Pi as `POST /ingest/<id>`; stored verbatim in D1 `meta`; returned by
     { "t": 34.0, "kind": "focus",   "label": "One-push autofocus" },
     { "t": 43.0, "kind": "release", "label": "Target released" }
   ],
+  "experiment": { "name": "mountPrior", "arm": "B" }, // optional: interleaved A/B test (arm A = control)
   "notes": []                          // reserved for human/AI commentary (strings)
 }
 ```
@@ -147,6 +148,15 @@ Event kinds: `target lock lost zoom zenith wrap focus release`.
 
 Ingest (Authorization: `Bearer <INGEST_KEY>`):
 - `PUT /ingest/<id>/<name>` raw body, `content-type` set by the client; name ∈ `clip.mp4 poster.jpg series.json clip.stab.mp4 stab.json`. Overwrites. → `{ ok, bytes }`
+- Multipart (R2), for blobs over Cloudflare's 100 MB request-body cap (a 413 before the Worker
+  runs; a 3.5 min pass at ~4 Mbps is ~110 MB). Clients use the single PUT up to 90 MiB and
+  multipart above it, in 50 MiB parts (R2: every part but the last the same size, ≥ 5 MiB):
+  - `POST /ingest/<id>/<name>?uploads` → `{ ok, uploadId }` (same content-type/cache metadata as the PUT)
+  - `PUT /ingest/<id>/<name>?uploadId=<id>&partNumber=<1..10000>` raw part → `{ ok, partNumber, etag }`
+  - `POST /ingest/<id>/<name>?uploadId=<id>&complete` body `{ "parts": [{ "partNumber", "etag" }] }` → `{ ok, bytes }`
+  - `DELETE /ingest/<id>/<name>?uploadId=<id>` → abort, `{ ok, aborted }` (best effort; R2
+    expires an abandoned upload after 7 days). Clients abort on any failure and restart from
+    `?uploads` on retry. `uploadId` is opaque: URL-encode it.
 - `POST /ingest/<id>` body = pass.json → upsert D1 row (columns below) + `meta`. `has_clip` is
   set from an R2 HEAD of `clip.mp4`, `has_stab` from `media.stab.status` + an R2 HEAD of
   `clip.stab.mp4`. → `{ ok }`. Idempotent: the Pi may re-POST. A pass.json whose
@@ -181,6 +191,9 @@ Public (GET, CORS for https://skylightceiling.com, http://localhost:3000 and `*`
   `PASS_ARCHIVE_URL=https://passes.skylightceiling.com`. Without them the tracker records
   locally but does not upload. `PASS_ARCHIVE_KEEP_LOCAL` (default 20) most recent passes are
   kept on disk under `tracker/data/passes/<id>/`; older ones are deleted after upload.
+  Upload state is marker files in each pass folder: `.pending` → `.uploaded`. A permanent
+  rejection (400/413/415/422) writes `.failed` and moves on but leaves `.pending`, so every
+  tracker start retries it (`.failed` is removed when it finally goes up).
 - Site: `NEXT_PUBLIC_PASSES_API` (default `https://passes.skylightceiling.com`).
 
 ## Privacy

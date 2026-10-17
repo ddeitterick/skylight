@@ -3,6 +3,8 @@
  * Contract shared with the Pi uploader and the site: docs/pass-archive.md.
  *
  *   PUT    /ingest/<id>/<name>   raw blob → R2 `<id>/<name>` (clip.mp4 | poster.jpg | series.json | clip.stab.mp4 | stab.json)
+ *   POST   /ingest/<id>/<name>?uploads, PUT ?uploadId=&partNumber=, POST ?uploadId=&complete, DELETE ?uploadId=
+ *                                 R2 multipart for blobs over Cloudflare's 100 MB request-body cap
  *   POST   /ingest/<id>          pass.json → D1 upsert (index columns + verbatim meta)
  *   DELETE /api/passes/<id>      removes the row and its blobs
  *   GET    /api/passes           filters, sort, keyset cursor → { items, nextCursor, total }
@@ -11,7 +13,7 @@
  *   GET    /media/<id>/<name>    the blob: Range, ETag, immutable cache, CORS *
  *   GET    /health               { ok, passes, license }
  *
- * The three write routes need `Authorization: Bearer <INGEST_KEY>`. Media lives in R2
+ * The write routes need `Authorization: Bearer <INGEST_KEY>`. Media lives in R2
  * (bucket skylight-passes), the index in D1 (schema.sql). Nothing stored locates the
  * camera: pass geometry is az/el only.
  */
@@ -26,7 +28,7 @@ export interface Env {
 }
 
 /** Verbatim from docs/pass-archive.md — returned by /health and /api/facets; every pass's meta carries it too. */
-export const LICENSE =
+const LICENSE =
   "Videos and posters: © Skylight (Cameron Paczek). Free for non-commercial use with credit to skylightceiling.com; NOT covered by the repository's MIT license. Commercial use requires permission — see https://skylightceiling.com/passes#license";
 const MEDIA_LICENSE = "Free for non-commercial use with credit; not MIT. https://skylightceiling.com/passes#license";
 
@@ -115,18 +117,70 @@ async function count(env: Env): Promise<number> {
 
 // ---------------------------------------------------------------- ingest
 
-async function handlePutBlob(req: Request, env: Env, id: string, name: string, h: Hdrs): Promise<Response> {
-  const canonical = MEDIA_TYPES[name];
+const blobMetadata = (name: string) => ({ httpMetadata: { contentType: MEDIA_TYPES[name], cacheControl: cacheFor(name) } });
+
+/** The request body ready for R2, or an error response (wrong content-type, empty). */
+async function blobBody(req: Request, name: string, h: Hdrs): Promise<{ body: ReadableStream | ArrayBuffer } | { error: Response }> {
   const given = (req.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
-  if (given && !UPLOAD_TYPES[name].includes(given)) return json({ ok: false, error: `content-type ${given} is not ${canonical}` }, 415, h);
+  if (given && !UPLOAD_TYPES[name].includes(given)) return { error: json({ ok: false, error: `content-type ${given} is not ${MEDIA_TYPES[name]}` }, 415, h) };
   const length = req.headers.get("content-length");
-  if (!req.body || length === "0") return json({ ok: false, error: "empty body" }, 400, h);
+  if (!req.body || length === "0") return { error: json({ ok: false, error: "empty body" }, 400, h) };
   // R2 needs a known length. Stream the request body straight through when Content-Length is
   // present (the Pi and curl send it); only a chunked upload gets buffered.
-  const body = length !== null ? req.body : await req.arrayBuffer();
-  const obj = await env.MEDIA.put(`${id}/${name}`, body, { httpMetadata: { contentType: canonical, cacheControl: cacheFor(name) } });
+  return { body: length !== null ? req.body : await req.arrayBuffer() };
+}
+
+async function handlePutBlob(req: Request, env: Env, id: string, name: string, h: Hdrs): Promise<Response> {
+  const b = await blobBody(req, name, h);
+  if ("error" in b) return b.error;
+  const obj = await env.MEDIA.put(`${id}/${name}`, b.body, blobMetadata(name));
   if (!obj) return json({ ok: false, error: "store failed" }, 500, h);
   return json({ ok: true, id, name, bytes: obj.size }, 200, h);
+}
+
+/**
+ * R2 multipart, for clips over Cloudflare's 100 MB request-body cap (a 3.5 min pass at 4 Mbps
+ * is ~110 MB). The client sends equal parts (R2: all but the last the same size, ≥ 5 MiB),
+ * then the part list; an abandoned upload is aborted by the client or expires in R2 after 7 days.
+ */
+async function handleMultipart(req: Request, url: URL, env: Env, id: string, name: string, h: Hdrs): Promise<Response | null> {
+  const key = `${id}/${name}`;
+  const q = url.searchParams;
+  if (req.method === "POST" && q.has("uploads")) {
+    const up = await env.MEDIA.createMultipartUpload(key, blobMetadata(name));
+    return json({ ok: true, id, name, uploadId: up.uploadId }, 200, h);
+  }
+  const uploadId = q.get("uploadId");
+  if (uploadId === null) return null;
+  if (!uploadId || uploadId.length > 1024) return json({ ok: false, error: "bad uploadId" }, 400, h);
+  const up = env.MEDIA.resumeMultipartUpload(key, uploadId);
+  if (req.method === "PUT") {
+    const partNumber = Number(q.get("partNumber"));
+    if (!Number.isInteger(partNumber) || partNumber < 1 || partNumber > 10000) return json({ ok: false, error: "partNumber must be 1..10000" }, 400, h);
+    const b = await blobBody(req, name, h);
+    if ("error" in b) return b.error;
+    const part = await up.uploadPart(partNumber, b.body);
+    return json({ ok: true, partNumber: part.partNumber, etag: part.etag }, 200, h);
+  }
+  if (req.method === "POST" && q.has("complete")) {
+    let parts: R2UploadedPart[];
+    try {
+      parts = ((await req.json()) as { parts: R2UploadedPart[] }).parts;
+    } catch {
+      return json({ ok: false, error: "body must be JSON { parts: [{ partNumber, etag }] }" }, 400, h);
+    }
+    if (!Array.isArray(parts) || !parts.length || !parts.every((p) => Number.isInteger(p?.partNumber) && typeof p?.etag === "string")) {
+      return json({ ok: false, error: "parts must be [{ partNumber, etag }]" }, 400, h);
+    }
+    const obj = await up.complete(parts.map(({ partNumber, etag }) => ({ partNumber, etag })));
+    return json({ ok: true, id, name, bytes: obj.size }, 200, h);
+  }
+  if (req.method === "DELETE") {
+    // Best-effort cleanup: an unknown or already-finished upload is not an error to the client.
+    const aborted = await up.abort().then(() => true, () => false);
+    return json({ ok: true, aborted }, 200, h);
+  }
+  return null;
 }
 
 async function handlePostPass(req: Request, env: Env, id: string, h: Hdrs): Promise<Response> {
@@ -333,9 +387,11 @@ export default {
         const id = seg[1] ?? "";
         if (!ID_RE.test(id)) return json({ ok: false, error: "bad id" }, 400, h);
         if (seg.length === 2 && req.method === "POST") return await handlePostPass(req, env, id, h);
-        if (seg.length === 3 && req.method === "PUT") {
+        if (seg.length === 3) {
           if (!isMediaName(seg[2])) return json({ ok: false, error: `name must be one of ${Object.keys(MEDIA_TYPES).join(", ")}` }, 400, h);
-          return await handlePutBlob(req, env, id, seg[2], h);
+          const mp = await handleMultipart(req, url, env, id, seg[2], h);
+          if (mp) return mp;
+          if (req.method === "PUT") return await handlePutBlob(req, env, id, seg[2], h);
         }
         return json({ ok: false, error: "not found" }, 404, h);
       }

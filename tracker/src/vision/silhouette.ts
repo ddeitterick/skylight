@@ -18,6 +18,8 @@ export interface Silhouette {
  * dimension is about `sizePx` pixels. Background = median of the search
  * window's border ring; foreground = pixels deviating from it by more than
  * a robust threshold; the connected component nearest the seed wins.
+ * `reachPx` widens the search to the seed's own uncertainty: a seed from the
+ * pointing model (not from a detection) is routinely 0.2-0.8° off the plane.
  * Returns null when nothing plausible is found (caller keeps the blob).
  */
 export function silhouetteCentroid(
@@ -27,8 +29,12 @@ export function silhouetteCentroid(
   cx: number,
   cy: number,
   sizePx: number,
+  reachPx = 0,
+  /** Optional sky mask (non-zero = above the skyline): ground clutter (roofs,
+   *  trees, the power line by the tree) is neither background nor plane. */
+  sky?: Uint8Array,
 ): Silhouette | null {
-  const R = Math.round(Math.min(100, Math.max(20, 2 * sizePx)));
+  const R = Math.round(Math.min(100, Math.max(20, 2 * sizePx, reachPx + sizePx)));
   const sx = Math.round(cx * w);
   const sy = Math.round(cy * h);
   const x0 = Math.max(0, sx - R), x1 = Math.min(w - 1, sx + R);
@@ -43,10 +49,12 @@ export function silhouetteCentroid(
   for (let y = y0; y <= y1; y++) {
     for (let x = x0; x <= x1; x++) {
       if (x - x0 < 3 || x1 - x < 3 || y - y0 < 3 || y1 - y < 3) {
+        if (sky && !sky[y * w + x]) continue;
         rx.push(x - sx); ry.push(y - sy); rv.push(luma[y * w + x]);
       }
     }
   }
+  if (rv.length < 24) return null; // the window's border is mostly ground
   const bg = fitQuadric(rx, ry, rv, R);
   const res = rv.map((v, i) => Math.abs(v - bg(rx[i], ry[i]))).sort((a, b) => a - b);
   const mad = res[res.length >> 1];
@@ -56,6 +64,7 @@ export function silhouetteCentroid(
   for (let y = 0; y < wh; y++) {
     for (let x = 0; x < ww; x++) {
       const X = x + x0, Y = y + y0;
+      if (sky && !sky[Y * w + X]) continue;
       const b = bg(X - sx, Y - sy);
       if (Math.abs(luma[Y * w + X] - b) > thr) mask[y * ww + x] = 1;
     }
@@ -102,7 +111,7 @@ export function silhouetteCentroid(
   const big = comps.filter((c) => c.n >= 6);
   if (!big.length) return null;
   const best = big.reduce((a, b) => (dist(a) - Math.sqrt(a.n) < dist(b) - Math.sqrt(b.n) ? a : b));
-  if (dist(best) > 0.5 * sizePx + 4) return null;
+  if (dist(best) > Math.max(0.5 * sizePx + 4, reachPx)) return null;
   // Merge islands within reach of the winner's box.
   const reach = 0.3 * sizePx + 3;
   const parts = big.filter((c) =>
@@ -121,9 +130,15 @@ export function silhouetteCentroid(
   const ext = Math.max(maxX - minX + 1, maxY - minY + 1);
   if (ext > 2.5 * sizePx + 10) return null;
   if (n > 0.5 * ext * ext) return null;
+  const touches = minX === 0 || minY === 0 || maxX === ww - 1 || maxY === wh - 1;
+  // A wide search (reachPx) has no detection behind its seed, so it takes only
+  // a whole, plane-like island: live 2026-10-16 it locked a power line across
+  // the view (a thin line covers ~2% of its bounding square; a plane, even
+  // side-on, ≥ 10%) and haze at the frame's bottom edge.
+  if (reachPx > 0 && (touches || n < 0.05 * ext * ext)) return null;
   // Touching the window edge = background flood or a plane bigger than the
   // window; either way the centroid would be wrong.
-  if (minX === 0 || minY === 0 || maxX === ww - 1 || maxY === wh - 1) {
+  if (touches) {
     const atFrameEdge =
       (minX === 0 && x0 === 0) || (minY === 0 && y0 === 0) ||
       (maxX === ww - 1 && x1 === w - 1) || (maxY === wh - 1 && y1 === h - 1);
